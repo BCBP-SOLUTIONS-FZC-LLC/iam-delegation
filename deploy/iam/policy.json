@@ -1,0 +1,58 @@
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "PublishDelegationEvents",
+      "Effect": "Allow",
+      "Action": [
+        "sns:Publish"
+      ],
+      "Resource": "${delegation_events_topic_arn}"
+    },
+    {
+      "Sid": "ConsumeCascadeQueue",
+      "Effect": "Allow",
+      "Action": [
+        "sqs:ReceiveMessage",
+        "sqs:DeleteMessage",
+        "sqs:GetQueueAttributes",
+        "sqs:ChangeMessageVisibility"
+      ],
+      "Resource": "${delegation_cascade_queue_arn}"
+    },
+    {
+      "Sid": "CascadeDLQReadOnlyForOps",
+      "Effect": "Allow",
+      "Action": [
+        "sqs:GetQueueAttributes",
+        "sqs:ReceiveMessage"
+      ],
+      "Resource": "${delegation_cascade_dlq_arn}"
+    },
+    {
+      "Sid": "GlueSchemaRegistryReadOnly",
+      "Effect": "Allow",
+      "Action": [
+        "glue:GetRegistry",
+        "glue:GetSchema",
+        "glue:GetSchemaVersion",
+        "glue:GetSchemaByDefinition",
+        "glue:ListSchemas",
+        "glue:QuerySchemaVersionMetadata"
+      ],
+      "Resource": [
+        "${glue_registry_arn}",
+        "${glue_registry_arn}/*"
+      ]
+    },
+    {
+      "Sid": "CloudWatchLogs",
+      "Effect": "Allow",
+      "Action": [
+        "logs:CreateLogStream",
+        "logs:PutLogEvents"
+      ],
+      "Resource": "arn:aws:logs:${aws_region}:${aws_account_id}:log-group:/aws/eks/*:*"
+    }
+  ]
+}

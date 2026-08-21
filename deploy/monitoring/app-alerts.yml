@@ -1,0 +1,181 @@
+# Prometheus alerting rules for the iam-delegation application.
+#
+# HTTP request metrics (http_request_duration_seconds, http_requests_total) are
+# emitted by platform-gincommon. Business event counters (iam_delegation_*_total)
+# are registered in internal/adapter/outbound/metrics/metrics.go (LLD §14.2).
+#
+# This is a standalone reference copy of the same alerts the chart's own
+# templates/prometheusrule.yaml renders as a PrometheusRule CRD (enabled via
+# prometheusRule.enabled in values.yaml) — use this file directly (e.g. a
+# Prometheus --rule-files directory) in environments not installing this
+# service via the Helm chart; keep both in sync when adding a new alert.
+#
+# Labels on all HTTP metrics (from platform-gincommon):
+#   service  — "iam-delegation"
+#   method   — HTTP method
+#   path     — route pattern (e.g. /api/v1/delegations/:id)
+#   status   — HTTP status code
+
+groups:
+  - name: iam_delegation_availability
+    rules:
+
+      # ── Service down ──────────────────────────────────────────────────────────
+      - alert: IAMDelegationDown
+        expr: |
+          absent(up{job="iam-delegation"} == 1)
+        for: 2m
+        labels:
+          severity: critical
+          team: platform
+        annotations:
+          summary: iam-delegation has no healthy instances
+          description: >-
+            No iam-delegation pods have been scraped as healthy for 2 minutes.
+            Check pod readiness: kubectl get pods -l app.kubernetes.io/name=iam-delegation
+            — this affects DLG-1..7 and DLG-I1..I4, but per DLG-FAIL-2 never
+            affects I-8 or any authorization decision (Option C removed that
+            coupling entirely).
+
+      # ── Pod count below minimum ───────────────────────────────────────────────
+      - alert: IAMDelegationReplicasMissing
+        expr: |
+          sum(up{job="iam-delegation"}) < 2
+        for: 5m
+        labels:
+          severity: warning
+          team: platform
+        annotations:
+          summary: iam-delegation running below minimum replica count
+          description: >-
+            Fewer than 2 replicas are healthy. Current healthy count: {{ $value }}.
+
+  - name: iam_delegation_errors
+    rules:
+
+      # ── HTTP 5xx error rate ───────────────────────────────────────────────────
+      - alert: IAMDelegationHighErrorRate
+        expr: |
+          sum(rate(http_requests_total{job="iam-delegation", status=~"5.."}[5m]))
+            /
+          sum(rate(http_requests_total{job="iam-delegation"}[5m]))
+          > 0.05
+        for: 5m
+        labels:
+          severity: warning
+          team: platform
+        annotations:
+          summary: iam-delegation 5xx error rate above 5%
+          description: >-
+            {{ $value | humanizePercentage }} of requests are returning 5xx errors
+            over the last 5 minutes. Check Postgres/Valkey/Core/User-Profile
+            dependency health and application logs — DLG-2/DLG-5 depend
+            synchronously on both.
+
+      # ── HTTP 5xx error rate — critical ────────────────────────────────────────
+      - alert: IAMDelegationCriticalErrorRate
+        expr: |
+          sum(rate(http_requests_total{job="iam-delegation", status=~"5.."}[5m]))
+            /
+          sum(rate(http_requests_total{job="iam-delegation"}[5m]))
+          > 0.20
+        for: 2m
+        labels:
+          severity: critical
+          team: platform
+        annotations:
+          summary: iam-delegation 5xx error rate above 20%
+          description: >-
+            {{ $value | humanizePercentage }} of requests are returning 5xx errors.
+            This exceeds the critical threshold. Escalate immediately.
+
+  - name: iam_delegation_latency
+    rules:
+
+      # ── p99 request latency ───────────────────────────────────────────────────
+      - alert: IAMDelegationHighLatency
+        expr: |
+          histogram_quantile(0.99,
+            sum by (le) (
+              rate(http_request_duration_seconds_bucket{job="iam-delegation"}[5m])
+            )
+          ) > 0.3
+        for: 10m
+        labels:
+          severity: warning
+          team: platform
+        annotations:
+          summary: iam-delegation p99 latency above 300ms
+          description: >-
+            The p99 request duration is {{ $value | humanizeDuration }}, exceeding
+            the LLD §14.1 per-endpoint budgets (DLG-2's 250ms is the largest).
+            Check membership-check/User-Profile call latency
+            (iam_delegation_membership_check_duration_seconds) and Postgres
+            slow-query logs.
+
+  - name: iam_delegation_lifecycle
+    rules:
+
+      # ── DEL-6 availability-first deferrals sustained ─────────────────────────
+      - alert: IAMDelegationExpiryDeferredSustained
+        expr: |
+          increase(iam_delegation_expiry_deferred_total[30m]) > 0
+        for: 30m
+        labels:
+          severity: warning
+          team: platform
+        annotations:
+          summary: iam-delegation expiry cron is deferring rows (User Profile unreachable)
+          description: >-
+            The delegation-expiry CronJob has been unable to clear the
+            delegate pointer via User Profile for at least 30 minutes
+            (DEL-6 fail-open defer). Rows stay active past their ends_at
+            until this clears. Check iam-user-profile health.
+
+      - alert: IAMDelegationReviewDeferredSustained
+        expr: |
+          increase(iam_delegation_review_deferred_total[30m]) > 0
+        for: 30m
+        labels:
+          severity: warning
+          team: platform
+        annotations:
+          summary: iam-delegation review-sweep auto-end is deferring rows
+          description: >-
+            The delegation-review CronJob's auto-end pass has been deferring
+            (DEL-6) for at least 30 minutes. Check iam-user-profile health.
+
+      # ── Cascade DLQ growing ───────────────────────────────────────────────────
+      - alert: IAMDelegationCascadeDLQGrowing
+        expr: |
+          increase(iam_delegation_cascade_dlq_total[30m]) > 0
+        labels:
+          severity: warning
+          team: platform
+        annotations:
+          summary: iam-delegation cascade consumer is dead-lettering messages
+          description: >-
+            {{ $value | humanize }} MembershipRevoked/TenantOffboarded
+            message(s) landed on delegation-cascade-q-dlq in the last 30
+            minutes (maxReceiveCount=5 exhausted). Inspect the DLQ — a
+            malformed envelope or a persistent handler error needs manual
+            replay/fix (LLD §10.1).
+
+      # ── Membership-check failure rate ─────────────────────────────────────────
+      - alert: IAMDelegationMembershipCheckHighFailureRate
+        expr: |
+          sum(rate(iam_delegation_membership_check_failures_total[5m]))
+            /
+          sum(rate(iam_delegation_membership_check_duration_seconds_count[5m]))
+          > 0.05
+        for: 5m
+        labels:
+          severity: warning
+          team: platform
+        annotations:
+          summary: iam-delegation Core membership-check failure rate above 5%
+          description: >-
+            {{ $value | humanizePercentage }} of DLG-2/DLG-5's grant-time
+            membership-existence checks against Core are failing (LLD
+            §7.6.2). New delegation creates are being rejected with 503
+            org_membership_unavailable. Check iam-org-membership health.
