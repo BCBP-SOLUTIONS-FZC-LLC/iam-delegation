@@ -62,25 +62,19 @@ jobs:
     secrets: inherit
 
   # ── runs in parallel with validate-test + validate-quality ───────────────
-  # Matrix over the two binaries this repo ships. Each leg lints its own
-  # Dockerfile first (hadolint failure exits before the expensive build ever
-  # starts), builds to the GHA/registry cache, runs a Trivy CVE scan +
-  # smoke test, and — on push events only — pushes + signs the image.
+  # One image carries both binaries (repo-root Dockerfile — server is the
+  # default entrypoint, the reconciler smoke-test leg below overrides it).
+  # Lints the Dockerfile first (hadolint failure exits before the expensive
+  # build ever starts), builds to the GHA/registry cache, runs a Trivy CVE
+  # scan + smoke tests for both binaries, and — on push events only —
+  # pushes + signs the image.
   build-image:
-    name: Build image (${{ matrix.binary }})
+    name: Build image
     runs-on: ubuntu-latest
     timeout-minutes: 25
     needs: [validate-test]
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - binary: server
-            dockerfile: Dockerfile.server
-            image: ghcr.io/bcbp-solutions-fzc-llc/iam-delegation-server
-          - binary: reconciler
-            dockerfile: Dockerfile.reconciler
-            image: ghcr.io/bcbp-solutions-fzc-llc/iam-delegation-reconciler
+    env:
+      IMAGE: ghcr.io/bcbp-solutions-fzc-llc/iam-delegation
     permissions:
       contents: read
       packages: write
@@ -95,7 +89,7 @@ jobs:
       - name: Hadolint
         uses: hadolint/hadolint-action@v3.3.0
         with:
-          dockerfile: ${{ matrix.dockerfile }}
+          dockerfile: Dockerfile
 
       - name: Check .dockerignore exists
         run: test -f .dockerignore
@@ -103,7 +97,7 @@ jobs:
       - name: Prepare Docker build
         id: cache
         env:
-          REGISTRY_REF: ${{ matrix.image }}:buildcache
+          REGISTRY_REF: ${{ env.IMAGE }}:buildcache
           CAN_PUSH: ${{ github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository }}
         run: bash .github/scripts/docker-build-prep.sh
 
@@ -121,11 +115,11 @@ jobs:
         uses: docker/build-push-action@v7.3.0
         with:
           context: .
-          file: ./${{ matrix.dockerfile }}
+          file: ./Dockerfile
           platforms: linux/amd64
           push: false
           load: true
-          tags: iam-delegation-${{ matrix.binary }}-ci-test
+          tags: iam-delegation-ci-test
           pull: ${{ github.event_name != 'pull_request' }}
           cache-from: ${{ steps.cache.outputs.from }}
           cache-to: ${{ steps.cache.outputs.to }}
@@ -146,7 +140,7 @@ jobs:
       - name: Trivy scan — CRITICAL / HIGH / UNKNOWN
         uses: aquasecurity/trivy-action@v0.36.0
         with:
-          image-ref: iam-delegation-${{ matrix.binary }}-ci-test
+          image-ref: iam-delegation-ci-test
           format: table
           exit-code: '1'
           severity: CRITICAL,HIGH,UNKNOWN
@@ -156,9 +150,9 @@ jobs:
       - name: Trivy scan — SARIF upload
         uses: aquasecurity/trivy-action@v0.36.0
         with:
-          image-ref: iam-delegation-${{ matrix.binary }}-ci-test
+          image-ref: iam-delegation-ci-test
           format: sarif
-          output: trivy-results-${{ matrix.binary }}.sarif
+          output: trivy-results.sarif
           exit-code: '0'
           ignore-unfixed: true
           cache-dir: /tmp/trivy-cache
@@ -167,13 +161,19 @@ jobs:
         uses: github/codeql-action/upload-sarif@v4.37.0
         continue-on-error: true
         with:
-          sarif_file: trivy-results-${{ matrix.binary }}.sarif
-          category: ${{ matrix.binary }}
+          sarif_file: trivy-results.sarif
 
-      - name: Smoke tests
+      - name: Smoke tests (server)
         env:
-          IMAGE_TAG: iam-delegation-${{ matrix.binary }}-ci-test
-          BINARY: ${{ matrix.binary }}
+          IMAGE_TAG: iam-delegation-ci-test
+          BINARY: server
+        run: bash .github/scripts/smoke-tests.sh
+
+      - name: Smoke tests (reconciler)
+        env:
+          IMAGE_TAG: iam-delegation-ci-test
+          BINARY: reconciler
+          ENTRYPOINT: /iam-delegation-reconciler
         run: bash .github/scripts/smoke-tests.sh
 
       # ── push to GHCR on merge to main (needs validate-quality too) ───────
@@ -182,7 +182,7 @@ jobs:
         if: github.event_name == 'push'
         uses: docker/metadata-action@v6.1.0
         with:
-          images: ${{ matrix.image }}
+          images: ${{ env.IMAGE }}
           tags: |
             type=ref,event=branch
             type=sha,prefix=sha-,format=short
@@ -193,7 +193,7 @@ jobs:
         uses: docker/build-push-action@v7.3.0
         with:
           context: .
-          file: ./${{ matrix.dockerfile }}
+          file: ./Dockerfile
           platforms: linux/amd64
           pull: true
           push: true
@@ -208,10 +208,10 @@ jobs:
             go_private_token=${{ secrets.GO_PRIVATE_TOKEN }}
           cache-from: |
             type=gha
-            type=registry,ref=${{ matrix.image }}:buildcache
+            type=registry,ref=${{ env.IMAGE }}:buildcache
           cache-to: |
             type=gha,mode=max
-            type=registry,ref=${{ matrix.image }}:buildcache,mode=max
+            type=registry,ref=${{ env.IMAGE }}:buildcache,mode=max
 
       - name: Install Cosign
         if: github.event_name == 'push'
@@ -220,7 +220,7 @@ jobs:
       - name: Sign image with Cosign
         if: github.event_name == 'push'
         run: |
-          cosign sign --yes "${{ matrix.image }}@${{ steps.pushed.outputs.digest }}"
+          cosign sign --yes "${{ env.IMAGE }}@${{ steps.pushed.outputs.digest }}"
 
       - name: Verify image signature
         if: github.event_name == 'push'
@@ -228,7 +228,7 @@ jobs:
           cosign verify \
             --certificate-identity-regexp "^https://github\.com/${{ github.repository }}/.github/workflows/.*@refs/heads/(main|master)$" \
             --certificate-oidc-issuer https://token.actions.githubusercontent.com \
-            "${{ matrix.image }}@${{ steps.pushed.outputs.digest }}"
+            "${{ env.IMAGE }}@${{ steps.pushed.outputs.digest }}"
 
       - name: Log image digest
         if: github.event_name == 'push'
@@ -265,12 +265,12 @@ jobs:
             const run = new AsyncFunction('github', 'context', 'core', 'require', 'process', code)
             await run(github, context, core, require, process)
 
-  # ── requires build-image (both legs) + validate-quality to have passed ───
+  # ── requires build-image + validate-quality to have passed ───────────────
   push-gate:
     name: Push gate
     runs-on: ubuntu-latest
     needs: [build-image, validate-quality]
     if: github.event_name == 'push'
     steps:
-      - name: All images pushed and signed
-        run: echo "Both iam-delegation-server and iam-delegation-reconciler images are pushed and verified."
+      - name: Image pushed and signed
+        run: echo "iam-delegation (carrying both server and reconciler binaries) is pushed and verified."

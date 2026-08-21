@@ -42,8 +42,10 @@ RECONCILER_CMD_PKG := ./cmd/reconciler
 BUILD_DIR       := bin
 GOFLAGS         ?=
 LDFLAGS         := -s -w -X main.buildVersion=$(BUILD_VERSION)
-IMAGE_SERVER     ?= iam-delegation-server:latest
-IMAGE_RECONCILER ?= iam-delegation-reconciler:latest
+# One image carries both binaries (single Dockerfile — see its header
+# comment); the Deployment runs it unmodified, each CronJob overrides
+# `command` to invoke /iam-delegation-reconciler against the same image.
+IMAGE ?= iam-delegation:latest
 
 ALL_TEST_TAGS := integration,rls,e2e
 
@@ -110,22 +112,20 @@ godoc:
 	@echo "Starting pkgsite at http://localhost:8080 — press Ctrl-C to stop"
 	$(GO) run golang.org/x/pkgsite/cmd/pkgsite@latest -open .
 
-# pin-base-images: fetch and pin the current SHA digests for both
-# Dockerfiles' base images. Writes the digests both to the Dockerfile FROM
+# pin-base-images: fetch and pin the current SHA digests for the
+# Dockerfile's base images. Writes the digests both to the Dockerfile FROM
 # lines and to .docker-digests (a checked-in provenance record).
 pin-base-images:
 	@echo "Fetching SHA digests for Dockerfile base images..."
 	@GOLANG_DIGEST=$$(docker buildx imagetools inspect golang:1.26.6-bookworm --format '{{.Manifest.Digest}}') && \
 	 DISTROLESS_DIGEST=$$(docker buildx imagetools inspect gcr.io/distroless/static-debian12:nonroot --format '{{.Manifest.Digest}}') && \
-	 for f in Dockerfile.server Dockerfile.reconciler; do \
-	   sed -E -i.bak \
-	     -e "s|FROM golang:1\.26\.6-bookworm(@sha256:[a-f0-9]+)?|FROM golang:1.26.6-bookworm@$$GOLANG_DIGEST|" \
-	     -e "s|FROM gcr\.io/distroless/static-debian12:nonroot(@sha256:[a-f0-9]+)?|FROM gcr.io/distroless/static-debian12:nonroot@$$DISTROLESS_DIGEST|" \
-	     $$f && rm -f $$f.bak; \
-	 done && \
+	 sed -E -i.bak \
+	   -e "s|FROM golang:1\.26\.6-bookworm(@sha256:[a-f0-9]+)?|FROM golang:1.26.6-bookworm@$$GOLANG_DIGEST|" \
+	   -e "s|FROM gcr\.io/distroless/static-debian12:nonroot(@sha256:[a-f0-9]+)?|FROM gcr.io/distroless/static-debian12:nonroot@$$DISTROLESS_DIGEST|" \
+	   Dockerfile && rm -f Dockerfile.bak && \
 	 echo "golang:1.26.6-bookworm $$GOLANG_DIGEST" > .docker-digests && \
 	 echo "gcr.io/distroless/static-debian12:nonroot $$DISTROLESS_DIGEST" >> .docker-digests && \
-	 echo "Digests written to .docker-digests — commit both Dockerfiles and .docker-digests"
+	 echo "Digests written to .docker-digests — commit Dockerfile and .docker-digests"
 
 help:
 	@echo "Available commands:"
@@ -157,8 +157,8 @@ help:
 	@echo "  make swag             - regenerate docs/swagger/ from handler annotations"
 	@echo "  make swag-check       - fail if Swagger regeneration would change docs/swagger/ (CI drift gate)"
 	@echo "  make ci               - tidy + fmt-check + vet + lint + arch-lint + test-ci + build (matches 'make ci' in CI docs)"
-	@echo "  make docker-build     - build both container images (IMAGE_SERVER / IMAGE_RECONCILER to override)"
-	@echo "  make docker-push      - push both container images"
+	@echo "  make docker-build     - build the container image (IMAGE to override, carries both binaries)"
+	@echo "  make docker-push      - push the container image"
 	@echo "  make docker-up        - start local Postgres + Valkey + LocalStack (for \`make run\` against a live stack)"
 	@echo "  make docker-down      - stop containers started by docker-up/compose-up"
 	@echo "  make compose-up       - start the full local dev stack (postgres, valkey, localstack, server — self-migrates at startup)"
@@ -167,7 +167,7 @@ help:
 	@echo "  make migrate-down     - roll back one migration against DATABASE_MIGRATION_URL"
 	@echo "  make migrate-create   - create a new migration pair (NAME=add_foo_table)"
 	@echo "  make godoc            - serve local godoc/pkgsite at http://localhost:8080"
-	@echo "  make pin-base-images  - fetch + pin SHA digests for both Dockerfiles' base images"
+	@echo "  make pin-base-images  - fetch + pin SHA digests for the Dockerfile's base images"
 	@echo "  make generate         - run any go:generate directives (currently none)"
 	@echo "  make clean            - remove build artifacts and coverage output"
 
@@ -319,12 +319,10 @@ cover-func: test-ci
 # -----------------------------
 
 docker-build:
-	docker build -f Dockerfile.server -t $(IMAGE_SERVER) .
-	docker build -f Dockerfile.reconciler -t $(IMAGE_RECONCILER) .
+	docker build -t $(IMAGE) .
 
 docker-push: docker-build
-	docker push $(IMAGE_SERVER)
-	docker push $(IMAGE_RECONCILER)
+	docker push $(IMAGE)
 
 docker-up:
 	docker compose up -d postgres valkey localstack

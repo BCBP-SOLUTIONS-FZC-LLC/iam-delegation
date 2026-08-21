@@ -33,13 +33,15 @@ register.
 
 ## Binaries
 
-This repo ships **two** binaries (`cmd/server`, `cmd/reconciler` — LLD §16.1), each with its own
-Dockerfile and Helm workload:
+This repo ships **two** binaries (`cmd/server`, `cmd/reconciler` — LLD §16.1) built into
+**one** image (`Dockerfile`) — the Deployment runs it unmodified; each CronJob overrides
+`command` to invoke the reconciler binary instead (mirrors `iam-user-profile`'s single-image
+pattern):
 
-| Binary | Image | What it does |
+| Binary | Entrypoint | What it does |
 |---|---|---|
-| `cmd/server` | `iam-delegation-server` (`Dockerfile.server`) | HTTP API (DLG-1..7, DLG-I1..I4) **and** the `delegation-cascade-q` SQS consumer, run in-process via `errgroup` — one Deployment, ports 8080 (HTTP) / 9090 (metrics). |
-| `cmd/reconciler` | `iam-delegation-reconciler` (`Dockerfile.reconciler`) | The three CronJob entry points under `cmd/reconciler/jobs/`, dispatched at invocation time by a `--job=<name>` flag: `delegation-expiry` (`*/5 * * * *`, DLG-I1), `delegation-review` (`0 * * * *`, DLG-I2), `delegation-cleanup` (`0 4 1 * *`, soft-delete purge). No HTTP/metrics server — three separate `CronJob` resources, no ports exposed. |
+| `cmd/server` | `/iam-delegation-server` (the image's default `ENTRYPOINT`) | HTTP API (DLG-1..7, DLG-I1..I4) **and** the `delegation-cascade-q` SQS consumer, run in-process via `errgroup` — one Deployment, ports 8080 (HTTP) / 9090 (metrics). |
+| `cmd/reconciler` | `/iam-delegation-reconciler` (`command` override) | The three CronJob entry points under `cmd/reconciler/jobs/`, dispatched at invocation time by a `--job=<name>` flag: `delegation-expiry` (`*/5 * * * *`, DLG-I1), `delegation-review` (`0 * * * *`, DLG-I2), `delegation-cleanup` (`0 4 1 * *`, soft-delete purge). No HTTP/metrics server — three separate `CronJob` resources, no ports exposed. |
 
 ## API overview
 

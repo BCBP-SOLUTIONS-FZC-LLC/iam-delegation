@@ -58,9 +58,10 @@ spec:
       containers:
         - name: {{ .Chart.Name }}
           # cmd/server (LLD §16.1): serves DLG-1..7/DLG-I1..I4 AND runs the
-          # delegation-cascade-q SQS consumer in-process via errgroup — one
-          # image, one Deployment. The three CronJobs run a SEPARATE image
-          # (reconcilerImage — see templates/cronjob-*.yaml).
+          # delegation-cascade-q SQS consumer in-process via errgroup — the
+          # default entrypoint baked into this image. The three CronJobs
+          # run the SAME image with `command` overridden to the reconciler
+          # binary (see templates/cronjob-*.yaml).
           image: "{{ .Values.image.repository }}:{{ include "iam-delegation.imageTag" . }}"
           imagePullPolicy: {{ .Values.image.pullPolicy }}
           securityContext:

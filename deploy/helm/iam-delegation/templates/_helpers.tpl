@@ -64,18 +64,12 @@ Create the name of the service account to use.
 {{- end }}
 
 {{/*
-Server image tag: prefer .Values.image.tag; fall back to chart appVersion.
+Image tag: prefer .Values.image.tag; fall back to chart appVersion. One
+image carries both binaries (server + reconciler) — the Deployment and all
+three CronJobs share this same tag.
 */}}
 {{- define "iam-delegation.imageTag" -}}
 {{- .Values.image.tag | default .Chart.AppVersion }}
-{{- end }}
-
-{{/*
-Reconciler image tag: prefer .Values.reconcilerImage.tag; fall back to
-chart appVersion — CI publishes both images from the same tag lineage.
-*/}}
-{{- define "iam-delegation.reconcilerImageTag" -}}
-{{- .Values.reconcilerImage.tag | default .Chart.AppVersion }}
 {{- end }}
 
 {{/*

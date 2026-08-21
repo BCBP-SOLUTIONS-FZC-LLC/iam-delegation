@@ -3,26 +3,19 @@
 # Deployment topology (LLD §16.1): a "server" Deployment (2-4 replicas, HPA)
 # serves the HTTP API (DLG-1..7, DLG-I1..I4) AND runs the
 # delegation-cascade-q SQS consumer (§11.5) in-process — same "one process,
-# two responsibilities" pattern as iam-tender-acl. A separate "reconciler"
-# image runs the three CronJobs (delegation-expiry/-review/-cleanup, §16.3)
-# — this is the one structural difference from iam-tender-acl (which ships
-# no reconciler at all) and the reason this chart carries a second image
-# block (reconcilerImage) plus three CronJob templates.
+# two responsibilities" pattern as iam-tender-acl / iam-user-profile. The
+# three CronJobs (delegation-expiry/-review/-cleanup, §16.3) run from the
+# SAME image (it carries both binaries — see the repo-root Dockerfile),
+# with each CronJob template overriding `command` to invoke
+# /iam-delegation-reconciler --job=<name> — mirrors iam-user-profile's
+# one-image pattern (its signature-erasure-cronjob.yaml does the same).
 
 replicaCount: 2
 
 image:
-  repository: ghcr.io/bcbp-solutions-fzc-llc/iam-delegation-server
+  repository: ghcr.io/bcbp-solutions-fzc-llc/iam-delegation
   pullPolicy: IfNotPresent
   tag: ""  # overridden by CI to the git SHA / release version; falls back to Chart.appVersion
-
-# The reconciler ships as an independent image (see Dockerfile.reconciler)
-# built from the same repo/tag lineage — CI publishes both on every
-# push/release. Used only by templates/cronjob-*.yaml.
-reconcilerImage:
-  repository: ghcr.io/bcbp-solutions-fzc-llc/iam-delegation-reconciler
-  pullPolicy: IfNotPresent
-  tag: ""  # overridden by CI; falls back to Chart.appVersion
 
 imagePullSecrets: []
 
@@ -315,8 +308,9 @@ ingress:
   #      - iam-delegation.internal.example.com
 
 # ── Reconciler CronJobs (LLD §15 crons block / §16.1/§16.3) ────────────────
-# Each CronJob runs the SAME iam-delegation-reconciler binary
-# (reconcilerImage above) with a different --job=<name> argument selecting
+# Each CronJob runs the SAME image as the Deployment (image above), with
+# `command` overridden to the iam-delegation-reconciler binary and a
+# different --job=<name> argument selecting
 # which entry point under cmd/reconciler/jobs/ to run — see
 # templates/cronjob-*.yaml for the exact convention (this is this chart's
 # own convention; cmd/reconciler/main.go's actual flag-parsing is owned by

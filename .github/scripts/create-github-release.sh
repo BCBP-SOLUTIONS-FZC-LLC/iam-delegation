@@ -1,12 +1,14 @@
 #!/usr/bin/env bash
-# Creates the GitHub release with versioned assets attached for both
-# binaries/images (server + reconciler).
+# Creates the GitHub release with versioned assets attached: the two
+# release binaries (server + reconciler — still built and checksummed
+# separately, LLD §16.1) and the one image's SBOM/provenance (server +
+# reconciler ship in a single container image, per the repo-root
+# Dockerfile).
 set -euo pipefail
 
 : "${RELEASE_TAG:?RELEASE_TAG is required}"
 : "${GH_TOKEN:?GH_TOKEN is required}"
-: "${SERVER_IMAGE_DIGEST:?SERVER_IMAGE_DIGEST is required}"
-: "${RECONCILER_IMAGE_DIGEST:?RECONCILER_IMAGE_DIGEST is required}"
+: "${IMAGE_DIGEST:?IMAGE_DIGEST is required}"
 
 test -f release-asset-server.name || {
   echo "::error::release-asset-server.name missing — run prepare-release-binary.sh first"
@@ -23,8 +25,8 @@ RECONCILER_ASSET=$(cat release-asset-reconciler.name)
 for f in release-notes.md \
          "$SERVER_ASSET" "${SERVER_ASSET}.sha256" \
          "$RECONCILER_ASSET" "${RECONCILER_ASSET}.sha256" \
-         provenance-server.slsa.json provenance-reconciler.slsa.json \
-         sbom-server.cyclonedx.json sbom-reconciler.cyclonedx.json; do
+         provenance.slsa.json \
+         sbom.cyclonedx.json; do
   test -f "$f" || {
     echo "::error::Release asset missing: ${f}"
     exit 1
@@ -40,9 +42,9 @@ if echo "$RELEASE_TAG" | grep -q -- '-'; then
   PRERELEASE_FLAG="--prerelease"
 fi
 
-DIGEST_SHORT="${SERVER_IMAGE_DIGEST#sha256:}"
+DIGEST_SHORT="${IMAGE_DIGEST#sha256:}"
 DIGEST_SHORT="${DIGEST_SHORT:0:12}"
-RELEASE_TITLE="${RELEASE_TAG} · server sha256:${DIGEST_SHORT}"
+RELEASE_TITLE="${RELEASE_TAG} · sha256:${DIGEST_SHORT}"
 
 gh release create "$RELEASE_TAG" \
   --title "$RELEASE_TITLE" \
@@ -50,6 +52,6 @@ gh release create "$RELEASE_TAG" \
   "$SERVER_ASSET" "${SERVER_ASSET}.sha256" \
   "$RECONCILER_ASSET" "${RECONCILER_ASSET}.sha256" \
   checksums.txt \
-  provenance-server.slsa.json provenance-reconciler.slsa.json \
-  sbom-server.cyclonedx.json sbom-reconciler.cyclonedx.json \
+  provenance.slsa.json \
+  sbom.cyclonedx.json \
   $PRERELEASE_FLAG

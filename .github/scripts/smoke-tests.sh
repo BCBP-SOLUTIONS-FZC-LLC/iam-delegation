@@ -1,12 +1,17 @@
 #!/usr/bin/env bash
-# Image size + startup gate smoke tests for a CI-built Docker image.
-# Invoked by ci.yml once per matrix leg (server / reconciler) with
-# IMAGE_TAG and BINARY set — keeps shell operators out of inline YAML run
-# blocks.
+# Image size + startup gate smoke tests for the CI-built Docker image.
+# Invoked by ci.yml once per binary (server / reconciler — both ship in the
+# SAME image, per the repo-root Dockerfile) with IMAGE_TAG and BINARY set,
+# and ENTRYPOINT set only for the reconciler leg (server uses the image's
+# default entrypoint) — keeps shell operators out of inline YAML run blocks.
 set -euo pipefail
 
 : "${IMAGE_TAG:?IMAGE_TAG is required}"
 : "${BINARY:?BINARY is required}"
+ENTRYPOINT_ARGS=()
+if [ -n "${ENTRYPOINT:-}" ]; then
+  ENTRYPOINT_ARGS=(--entrypoint "${ENTRYPOINT}")
+fi
 
 echo "::group::Image size check (${BINARY}, linux/amd64)"
 # arm64 is typically within ±5 MB of amd64 for a distroless Go binary; the
@@ -22,12 +27,13 @@ P1=$!
 echo "::endgroup::"
 
 echo "::group::Startup gate (${BINARY})"
-# The binary must exit non-zero on missing required env vars, proving its
-# config-loading validation actually fires (DATABASE_URL is required for
-# both binaries; server additionally requires SQS_QUEUE_URL).
+# The binary must exit non-zero on missing required config, proving its
+# config-loading validation actually fires (DATABASE_URL/SNS_TOPIC_ARN/
+# CASCADE_QUEUE_URL for the server; --job for the reconciler, checked
+# before it ever touches DATABASE_URL — see cmd/reconciler/main.go).
 # timeout 10s kills the container if it hangs instead of exiting.
 exit_code=0
-timeout 10s docker run --rm "${IMAGE_TAG}" 2>/dev/null || exit_code=$?
+timeout 10s docker run --rm "${ENTRYPOINT_ARGS[@]}" "${IMAGE_TAG}" 2>/dev/null || exit_code=$?
 echo "Container exit code: ${exit_code} (expected non-zero)"
 [ "${exit_code}" -ne 0 ] &
 P2=$!

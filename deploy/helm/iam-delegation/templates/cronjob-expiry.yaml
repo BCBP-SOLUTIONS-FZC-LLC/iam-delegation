@@ -33,8 +33,12 @@ spec:
             {{- toYaml .Values.podSecurityContext | nindent 12 }}
           containers:
             - name: delegation-expiry
-              image: "{{ .Values.reconcilerImage.repository }}:{{ include "iam-delegation.reconcilerImageTag" . }}"
-              imagePullPolicy: {{ .Values.reconcilerImage.pullPolicy }}
+              image: "{{ .Values.image.repository }}:{{ include "iam-delegation.imageTag" . }}"
+              imagePullPolicy: {{ .Values.image.pullPolicy }}
+              # Same image as the server Deployment (single Dockerfile) —
+              # override the entrypoint to run the reconciler binary
+              # instead of the default /iam-delegation-server.
+              command: ["/iam-delegation-reconciler"]
               securityContext:
                 {{- toYaml .Values.securityContext | nindent 16 }}
               # --job=delegation-expiry selects DLG-I1 (LLD §11.3 — the

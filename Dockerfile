@@ -1,14 +1,25 @@
 # syntax=docker/dockerfile:1.7
 #
-# iam-delegation-server
+# iam-delegation
 #
 # Multi-stage build producing a minimal, non-root, distroless runtime image
-# for the Delegation Service's HTTP server. This binary serves DLG-1..7 /
-# DLG-I1..I4 (LLD §8) AND runs the delegation-cascade-q SQS consumer
-# (LLD §11.5) in one process via errgroup — mirrors iam-tender-acl's single
-# "server does everything except crons" pattern. The three CronJobs
-# (delegation-expiry/-review/-cleanup) run from the separate
-# iam-delegation-reconciler image — see Dockerfile.reconciler.
+# carrying BOTH binaries this service ships (LLD §16.1):
+#   /iam-delegation-server      HTTP API (DLG-1..7, DLG-I1..I4) + the
+#                               delegation-cascade-q SQS consumer, in one
+#                               process via errgroup — the image's default
+#                               ENTRYPOINT.
+#   /iam-delegation-reconciler  the three CronJob entry points
+#                               (delegation-expiry/-review/-cleanup,
+#                               jobs/delegation_*.go), selected at
+#                               invocation time via --job=<name>. No
+#                               long-running HTTP/metrics server, no ports
+#                               exposed for it.
+#
+# One image, mirroring iam-user-profile's Dockerfile: the Deployment runs
+# it unmodified; each CronJob template
+# (deploy/helm/iam-delegation/templates/cronjob-*.yaml) overrides `command`
+# to invoke /iam-delegation-reconciler --job=<name> against the SAME image
+# reference (no separate reconciler image/GHCR repo to build, tag, or scan).
 
 ########################################
 # Stage: builder
@@ -51,23 +62,33 @@ RUN CGO_ENABLED=0 GOOS=linux \
     -trimpath \
     -ldflags="-s -w -X main.buildVersion=${BUILD_VERSION}" \
     -o /out/iam-delegation-server \
-    ./cmd/server
+    ./cmd/server && \
+    go build \
+    -trimpath \
+    -ldflags="-s -w -X main.buildVersion=${BUILD_VERSION}" \
+    -o /out/iam-delegation-reconciler \
+    ./cmd/reconciler
 
 ########################################
 # Stage: runtime
 ########################################
 FROM gcr.io/distroless/static-debian12:nonroot@sha256:1b7b9f0f0e0a1d2155f531db587cc48ec26aaf97ab64364225f5bf18a054e66a AS runtime
 
-LABEL org.opencontainers.image.title="iam-delegation-server" \
-      org.opencontainers.image.description="Delegation Service HTTP API (DLG-1..7, DLG-I1..I4) + cascade SQS consumer — ADR-0008 Wave 4 extraction from iam-org-membership" \
+ARG BUILD_VERSION=dev
+ENV BUILD_VERSION=${BUILD_VERSION}
+
+LABEL org.opencontainers.image.title="iam-delegation" \
+      org.opencontainers.image.description="Delegation Service — HTTP API (DLG-1..7, DLG-I1..I4) + cascade SQS consumer + the three reconciler CronJobs — ADR-0008 Wave 4 extraction from iam-org-membership" \
       org.opencontainers.image.source="https://github.com/BCBP-SOLUTIONS-FZC-LLC/iam-delegation" \
       org.opencontainers.image.vendor="BCBP Solutions" \
       org.opencontainers.image.licenses="Proprietary" \
-      org.opencontainers.image.base.name="gcr.io/distroless/static-debian12:nonroot"
+      org.opencontainers.image.base.name="gcr.io/distroless/static-debian12:nonroot" \
+      org.opencontainers.image.revision="${BUILD_VERSION}"
 
 WORKDIR /
 
 COPY --from=builder /out/iam-delegation-server /iam-delegation-server
+COPY --from=builder /out/iam-delegation-reconciler /iam-delegation-reconciler
 
 USER nonroot:nonroot
 

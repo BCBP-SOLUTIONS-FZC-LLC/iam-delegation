@@ -69,7 +69,7 @@ services:
   iam-delegation:
     build:
       context: .
-      dockerfile: Dockerfile.server
+      dockerfile: Dockerfile
     depends_on:
       postgres:
         condition: service_healthy
