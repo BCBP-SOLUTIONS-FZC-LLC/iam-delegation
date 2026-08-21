@@ -1,0 +1,29 @@
+# Default: every file requires review from the IAM team.
+* @BCBP-SOLUTIONS-FZC-LLC/iam-team
+
+# Workflow and release automation changes require explicit sign-off.
+.github/workflows/ @BCBP-SOLUTIONS-FZC-LLC/iam-team
+.github/dependabot.yml @BCBP-SOLUTIONS-FZC-LLC/iam-team
+
+# Event contract — changes affect all downstream consumers (Workflow,
+# Notification, Audit) on iam.delegation.events, and Core's cascade
+# consumer on delegation-cascade-q. Any modification to the AsyncAPI spec
+# or embedded JSON Schemas must be reviewed by both the IAM team and the
+# platform team.
+api/asyncapi.yaml @BCBP-SOLUTIONS-FZC-LLC/iam-team @BCBP-SOLUTIONS-FZC-LLC/platform-team
+internal/eventschema/ @BCBP-SOLUTIONS-FZC-LLC/iam-team @BCBP-SOLUTIONS-FZC-LLC/platform-team
+
+# Domain model — entities, value objects, domain errors, and event payloads.
+# Structural changes here ripple through every layer.
+internal/core/domain/ @BCBP-SOLUTIONS-FZC-LLC/iam-team
+
+# Database migrations affect all replicas and are irreversible in production,
+# and this table carries the platform's tenant-isolation RLS design.
+internal/adapter/outbound/postgres/migrations/ @BCBP-SOLUTIONS-FZC-LLC/iam-team @BCBP-SOLUTIONS-FZC-LLC/platform-team
+
+# Public HTTP API contract — generated Swagger docs must stay in sync with annotations.
+docs/swagger/ @BCBP-SOLUTIONS-FZC-LLC/iam-team
+cmd/server/swagger_info.go @BCBP-SOLUTIONS-FZC-LLC/iam-team
+
+# Helm chart — deployment configuration changes require infra awareness.
+deploy/ @BCBP-SOLUTIONS-FZC-LLC/iam-team @BCBP-SOLUTIONS-FZC-LLC/platform-team
