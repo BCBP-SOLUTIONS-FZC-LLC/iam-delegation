@@ -1,0 +1,373 @@
+# Default values for iam-delegation.
+#
+# Deployment topology (LLD §16.1): a "server" Deployment (2-4 replicas, HPA)
+# serves the HTTP API (DLG-1..7, DLG-I1..I4) AND runs the
+# delegation-cascade-q SQS consumer (§11.5) in-process — same "one process,
+# two responsibilities" pattern as iam-tender-acl. A separate "reconciler"
+# image runs the three CronJobs (delegation-expiry/-review/-cleanup, §16.3)
+# — this is the one structural difference from iam-tender-acl (which ships
+# no reconciler at all) and the reason this chart carries a second image
+# block (reconcilerImage) plus three CronJob templates.
+
+replicaCount: 2
+
+image:
+  repository: ghcr.io/bcbp-solutions-fzc-llc/iam-delegation-server
+  pullPolicy: IfNotPresent
+  tag: ""  # overridden by CI to the git SHA / release version; falls back to Chart.appVersion
+
+# The reconciler ships as an independent image (see Dockerfile.reconciler)
+# built from the same repo/tag lineage — CI publishes both on every
+# push/release. Used only by templates/cronjob-*.yaml.
+reconcilerImage:
+  repository: ghcr.io/bcbp-solutions-fzc-llc/iam-delegation-reconciler
+  pullPolicy: IfNotPresent
+  tag: ""  # overridden by CI; falls back to Chart.appVersion
+
+imagePullSecrets: []
+
+nameOverride: ""
+fullnameOverride: ""
+
+serviceAccount:
+  create: true
+  name: ""
+  # Annotations added to the ServiceAccount — use for IRSA on EKS:
+  #   eks.amazonaws.com/role-arn: arn:aws:iam::ACCOUNT_ID:role/iam-delegation
+  annotations: {}
+
+service:
+  type: ClusterIP
+  httpPort: 8080
+  metricsPort: 9090
+
+# HPA — CPU/memory always on; the cascade-queue-depth-based scaling note in
+# LLD §16.3 ("HPA on delegation-cascade-q depth") requires an SQS-queue
+# custom-metrics adapter (e.g. KEDA or the same prometheus-adapter pattern
+# iam-tender-acl documents for RPS) that is out of scope for this initial
+# scaffold — targetRPSPerReplica is kept as the same opt-in mechanism
+# iam-tender-acl exposes, left at 0 (disabled) until that adapter exists.
+autoscaling:
+  enabled: true
+  minReplicas: 2
+  maxReplicas: 4
+  targetCPUUtilizationPercentage: 70
+  targetMemoryUtilizationPercentage: 80
+  targetRPSPerReplica: 0  # set > 0 to enable RPS-based scaling once prometheus-adapter is configured
+
+resources:
+  requests:
+    cpu: 250m
+    memory: 256Mi
+  limits:
+    cpu: "1"
+    memory: 512Mi
+
+# Non-secret env, rendered directly onto the server container (see
+# templates/deployment.yaml). Anything with a credential (DATABASE_URL,
+# VALKEY_PASSWORD) lives in envFromSecret below. Mirrors LLD §15's
+# values-prod.yaml excerpt verbatim, flattened to env-var form.
+env:
+  LOG_LEVEL: "info"
+  ENVIRONMENT: "production"
+  HTTP_PORT: "8080"
+  METRICS_PORT: "9090"
+
+  # ElastiCache Valkey — "del:" keyspace (LLD §9/§15). No auth token is
+  # embedded in this URL form; VALKEY_PASSWORD (if any) is in
+  # envFromSecret.
+  VALKEY_ADDR: "valkey.iam-delegation.svc.cluster.local:6379"
+  CACHE_KEYSPACE: "del:"
+  CACHE_LIST_TTL_SECONDS: "60"
+  CACHE_IDEMPOTENCY_TTL_SECONDS: "86400"
+
+  # DEL-6 availability-first coordination — User Profile is the
+  # authoritative owner of user_availability (LLD §1, §6.3).
+  USER_PROFILE_BASE_URL: "http://iam-user-profile.iam.svc.cluster.local"
+  USER_PROFILE_TIMEOUT_MS: "3000"
+
+  # The two lost composite membership FKs -> two synchronous grant-time
+  # checks against Core (DLG-D3, §7.6.2). ≤50ms p99 expected; 3000ms is the
+  # LLD §15 client timeout ceiling (not the per-call SLO target — see
+  # LLD §14.1 for the 50ms figure).
+  ORG_MEMBERSHIP_BASE_URL: "http://iam-org-membership.iam.svc.cluster.local"
+  ORG_MEMBERSHIP_MEMBERSHIP_CHECK_TIMEOUT_MS: "3000"
+
+  # Tenant delegation policy defaults (DLG-D2) — used only when a tenant has
+  # no delegation_tenant_settings row (LLD §15).
+  POLICY_DEFAULT_MAX_DURATION_DAYS: "90"
+  POLICY_DEFAULT_REVIEW_WINDOW_DAYS: "90"
+
+  # Dual review-warning bucket (DLG-D7/DLG-Q6, §11.4).
+  REVIEW_WARN_EARLY_DAYS: "7"
+  REVIEW_WARN_LATE_DAYS: "3"
+
+  # Dedicated event topic (DLG-D5/DLG-Q1) — Core's AsyncAPI drops these
+  # events entirely; this service is both producer and consumer (§6.3).
+  EVENTS_TOPIC: "iam-delegation-events"
+  EVENTS_SOURCE: "iam-delegation"
+
+  # AWS SNS/SQS — the delegation-cascade-q consumer (MembershipRevoked /
+  # TenantOffboarded, §11.5/§11.6) runs in-process inside this same server
+  # binary, not a separate consumer process.
+  SQS_QUEUE_URL: ""
+  SQS_DLQ_URL: ""
+  SQS_CONCURRENCY: "4"
+  AWS_REGION: "us-east-1"
+
+  # OpenTelemetry — OTLP/gRPC via platform-gincommon's
+  # ObservabilityMiddlewares (port 4317, not the legacy OTLP/HTTP 4318).
+  OTEL_EXPORTER_OTLP_ENDPOINT: "otel-collector.observability.svc.cluster.local:4317"
+
+  # Postgres pool sizing (pgcommon.ConfigFromEnv()) — logical database
+  # "delegation" (LLD §7, Owner database table).
+  DATABASE_LOGICAL_NAME: "delegation"
+  PG_MAX_CONNS: "10"
+  PG_MIN_CONNS: "2"
+  PG_SLOW_QUERY_THRESHOLD: "200ms"
+
+  # Docs surface (optional) — Swagger UI is always mounted outside
+  # production; DOCS_ENABLED opts it into production too, and
+  # DOCS_AUTH_TOKEN (envFromSecret below) additionally bearer-auth-gates it
+  # there.
+  DOCS_ENABLED: "false"
+
+# Env vars whose value comes from a Kubernetes Secret. Keys must be present
+# in either .Values.existingSecret or .Values.secretValues. Shared by both
+# the server Deployment and the three reconciler CronJobs (they all need
+# DATABASE_URL/VALKEY_PASSWORD; the reconciler additionally reads
+# MIGRATION_DATABASE_URL only if it self-migrates, which it does not — the
+# server owns migrations at startup, LLD §16.4).
+envFromSecret:
+  - DATABASE_URL
+  - MIGRATION_DATABASE_URL
+  - VALKEY_PASSWORD
+  - DOCS_AUTH_TOKEN
+
+# existingSecret — preferred for production. Set to the name of a
+# pre-existing Kubernetes Secret whose keys match envFromSecret. When set,
+# the chart creates no Secret resource and secretValues is ignored.
+#
+# DATABASE_URL here MUST be the runtime app role (delegation_app), which has
+# no BYPASSRLS. MIGRATION_DATABASE_URL MUST be the BYPASSRLS
+# delegation_migrator role — the server pod applies migrations itself at
+# startup (LLD §7.4/§16.4, additive-only for rolling-deploy safety); there
+# is no separate migrate Job in this chart.
+existingSecret: ""
+
+# rotationEpoch — used only when existingSecret is set. Bump this value to
+# trigger a rolling restart after an external secret is rotated:
+#   helm upgrade ... --set rotationEpoch=$(date +%s)
+rotationEpoch: "0"
+
+# Secret values — used ONLY when existingSecret is empty.
+# Pass via --set or a Helm secrets plugin (never commit real values).
+secretValues:
+  DATABASE_URL: ""
+  MIGRATION_DATABASE_URL: ""
+  VALKEY_PASSWORD: ""
+  DOCS_AUTH_TOKEN: ""
+
+# 30s HTTP+metrics server graceful shutdown budget + buffer for the SQS
+# cascade consumer to finish its in-flight message (LLD §16.4: "at-least-
+# once + processed_events" dedup makes a redelivery safe if this is
+# exceeded).
+terminationGracePeriodSeconds: 30
+
+# podDisruptionBudget — ensures at least 1 pod survives voluntary
+# disruptions (node drains, cluster upgrades). With minReplicas: 2 keep
+# minAvailable=1 so a single node drain doesn't take the service to zero.
+podDisruptionBudget:
+  enabled: true
+  minAvailable: 1
+
+podAnnotations: {}
+podLabels: {}
+
+podSecurityContext:
+  runAsNonRoot: true
+  runAsUser: 65532      # distroless nonroot UID
+  runAsGroup: 65532
+  fsGroup: 65532
+  seccompProfile:
+    type: RuntimeDefault
+
+securityContext:
+  allowPrivilegeEscalation: false
+  readOnlyRootFilesystem: true
+  capabilities:
+    drop:
+      - ALL
+
+nodeSelector: {}
+tolerations: []
+
+# startupProbe covers a slow cold start (Postgres pool warmup, AWS SDK
+# config resolution) before liveness/readiness take over.
+startupProbe:
+  httpGet:
+    path: /healthz
+    port: http
+  initialDelaySeconds: 2
+  periodSeconds: 5
+  failureThreshold: 12   # 12 x 5s = 60s startup budget
+  timeoutSeconds: 3
+
+livenessProbe:
+  httpGet:
+    path: /healthz
+    port: http
+  initialDelaySeconds: 0  # startupProbe handles the initial delay
+  periodSeconds: 15
+  failureThreshold: 3
+  timeoutSeconds: 3
+
+readinessProbe:
+  httpGet:
+    path: /readyz
+    port: http
+  initialDelaySeconds: 0
+  periodSeconds: 10
+  failureThreshold: 3
+  timeoutSeconds: 3
+
+# NetworkPolicy — enabled by default (LLD §13.2). Public API traffic
+# (DLG-1..7) reaches the "http" port via the gateway/mesh; /internal/*
+# (DLG-I1..I4) is mesh-only mTLS, reached only from same-namespace callers
+# (Core, Workflow) via the internal-route guard at the application layer —
+# both share the same "http" port at the network layer, exactly like
+# iam-tender-acl's TAC-1..3 (public) / TAC-4 (internal) split. :9090/metrics
+# is restricted to the monitoring namespace only.
+networkPolicy:
+  enabled: true
+  ingressControllerNamespaceSelector:
+    kubernetes.io/metadata.name: envoy-gateway-system
+  ingressControllerPodSelector: {}
+  metricsIngress:
+    enabled: true
+    namespaceSelector:
+      kubernetes.io/metadata.name: monitoring
+    podSelector:
+      app.kubernetes.io/name: prometheus
+  additionalIngressRules: []
+  additionalEgressRules: []
+
+# ServiceMonitor — requires kube-prometheus-stack (monitoring.coreos.com/v1
+# CRD). PrometheusRule (alerting rules) is also gated on this flag — no
+# scrape means no metrics, which means every alert stays permanently
+# inactive.
+serviceMonitor:
+  enabled: true
+  interval: "30s"
+  scrapeTimeout: "10s"
+  additionalLabels: {}
+  relabelings: []
+  namespaceSelector: {}
+
+# Ingress — disabled by default; this service is normally reached only
+# through the shared Envoy gateway/mesh (LLD §16.1: "one Envoy upstream for
+# /api/v1/delegations*"). Enable only if a caller sits outside the cluster.
+ingress:
+  enabled: false
+  type: HTTPRoute
+
+  hosts:
+    - host: iam-delegation.internal.example.com
+      paths:
+        - path: /api/v1
+          pathType: PathPrefix
+
+  gateway:
+    name: ""              # required — name of the Gateway resource
+    namespace: ""         # optional — defaults to the release namespace
+    sectionName: ""       # optional — target a specific listener (e.g. "https")
+
+  securityPolicy:
+    enabled: false
+    cors:
+      enabled: false
+      allowOrigins: []
+      allowMethods:
+        - GET
+        - POST
+        - PATCH
+        - DELETE
+        - OPTIONS
+      allowHeaders:
+        - Authorization
+        - Content-Type
+        - Idempotency-Key
+        - X-Tenant-Id
+        - X-User-Id
+        - X-User-Roles
+      maxAge: "86400"
+    rateLimit:
+      enabled: false
+      requestsPerUnit: 1000
+      unit: Second          # Second | Minute | Hour
+
+  className: ""
+  annotations: {}
+    # cert-manager.io/cluster-issuer: letsencrypt-prod
+  tls: []
+  #  - secretName: iam-delegation-tls
+  #    hosts:
+  #      - iam-delegation.internal.example.com
+
+# ── Reconciler CronJobs (LLD §15 crons block / §16.1/§16.3) ────────────────
+# Each CronJob runs the SAME iam-delegation-reconciler binary
+# (reconcilerImage above) with a different --job=<name> argument selecting
+# which entry point under cmd/reconciler/jobs/ to run — see
+# templates/cronjob-*.yaml for the exact convention (this is this chart's
+# own convention; cmd/reconciler/main.go's actual flag-parsing is owned by
+# whichever agent wires cmd/, kept consistent with it here).
+cronJobs:
+  expiry:
+    enabled: true
+    schedule: "*/5 * * * *"      # DLG-I1 (LLD §11.3) — availability-first, self-retrying
+    jobName: delegation-expiry
+    concurrencyPolicy: Forbid
+    successfulJobsHistoryLimit: 3
+    failedJobsHistoryLimit: 3
+    activeDeadlineSeconds: 240
+    resources:
+      requests:
+        cpu: 100m
+        memory: 128Mi
+      limits:
+        cpu: 500m
+        memory: 256Mi
+  review:
+    enabled: true
+    schedule: "0 * * * *"        # DLG-I2 (LLD §11.4) — dual 7d/3d warn, then auto-end
+    jobName: delegation-review
+    concurrencyPolicy: Forbid
+    successfulJobsHistoryLimit: 3
+    failedJobsHistoryLimit: 3
+    activeDeadlineSeconds: 540
+    resources:
+      requests:
+        cpu: 100m
+        memory: 128Mi
+      limits:
+        cpu: 500m
+        memory: 256Mi
+  cleanup:
+    enabled: true
+    schedule: "0 4 1 * *"        # soft-delete hard-purge (LLD §11.6/§18.4), monthly
+    jobName: delegation-cleanup
+    concurrencyPolicy: Forbid
+    successfulJobsHistoryLimit: 3
+    failedJobsHistoryLimit: 3
+    activeDeadlineSeconds: 1800
+    resources:
+      requests:
+        cpu: 100m
+        memory: 128Mi
+      limits:
+        cpu: 500m
+        memory: 256Mi
+  # Rows-per-tick cap shared by all three jobs (LLD §15 crons.batchLimit) —
+  # raise this or shorten a job's schedule if it starts saturating
+  # (LLD §16.3).
+  batchLimit: 50

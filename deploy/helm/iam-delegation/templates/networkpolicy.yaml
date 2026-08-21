@@ -1,0 +1,121 @@
+{{- if .Values.networkPolicy.enabled }}
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ include "iam-delegation.fullname" . }}
+  labels:
+    {{- include "iam-delegation.labels" . | nindent 4 }}
+spec:
+  podSelector:
+    matchLabels:
+      {{- include "iam-delegation.selectorLabels" . | nindent 6 }}
+  policyTypes:
+    - Ingress
+    - Egress
+
+  ingress:
+    # Allow public API traffic (DLG-1..7) from the ingress controller /
+    # gateway namespace. /internal/* (DLG-I1..I4, LLD §13.2) is served on
+    # this SAME "http" port at the network layer — exactly like
+    # iam-tender-acl's TAC-1..3 (public) / TAC-4 (internal) split — so it is
+    # NOT reachable through this rule (the gateway only routes /api/v1/*);
+    # the mesh-only mTLS boundary for /internal/* is enforced by the second
+    # rule below plus the application-layer internal-route guard, not by a
+    # separate NetworkPolicy port.
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              {{- toYaml .Values.networkPolicy.ingressControllerNamespaceSelector | nindent 14 }}
+          {{- with .Values.networkPolicy.ingressControllerPodSelector }}
+          podSelector:
+            matchLabels:
+              {{- toYaml . | nindent 14 }}
+          {{- end }}
+      ports:
+        - port: {{ .Values.service.httpPort }}
+          protocol: TCP
+
+    # Allow same-namespace, mesh-internal traffic on the "http" port — the
+    # DLG-I1..I4 mesh-only mTLS routes (LLD §13.2) are reached only by
+    # same-namespace callers (Core/iam-org-membership, Workflow) via the
+    # internal-route guard at the application layer; mTLS itself is enforced
+    # by the service mesh sidecar, not this NetworkPolicy.
+    - from:
+        - podSelector: {}
+      ports:
+        - port: {{ .Values.service.httpPort }}
+          protocol: TCP
+
+    # Allow Prometheus to scrape :9090/metrics — restricted to the
+    # monitoring namespace. Metrics live on a SEPARATE port from the API,
+    # so this rule (unlike the two above) grants no API access.
+    {{- if .Values.networkPolicy.metricsIngress.enabled }}
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              {{- toYaml .Values.networkPolicy.metricsIngress.namespaceSelector | nindent 14 }}
+          podSelector:
+            matchLabels:
+              {{- toYaml .Values.networkPolicy.metricsIngress.podSelector | nindent 14 }}
+      ports:
+        - port: {{ .Values.service.metricsPort }}
+          protocol: TCP
+    {{- end }}
+
+    {{- with .Values.networkPolicy.additionalIngressRules }}
+    {{- toYaml . | nindent 4 }}
+    {{- end }}
+
+  egress:
+    # Allow DNS resolution (required for all outbound connections, including
+    # cluster-DNS lookups of Postgres/Valkey/iam-user-profile/
+    # iam-org-membership).
+    - ports:
+        - port: 53
+          protocol: UDP
+        - port: 53
+          protocol: TCP
+
+    # Allow HTTPS to AWS regional endpoints — SNS (the iam-delegation-events
+    # outbox publish, LLD §10.4) AND SQS (the delegation-cascade-q consumer,
+    # §11.5/§11.6). Unlike iam-tender-acl (SQS-only, zero outbound events),
+    # this service is both producer and consumer (LLD §6.3).
+    - ports:
+        - port: 443
+          protocol: TCP
+
+    # Allow PostgreSQL connections. Container-internal port 5432.
+    - ports:
+        - port: 5432
+          protocol: TCP
+
+    # Allow Valkey (Redis-protocol) connections — the del: cache keyspace
+    # and the create-idempotency-key store (DLG-Q3).
+    - ports:
+        - port: 6379
+          protocol: TCP
+
+    # Allow HTTP to iam-user-profile — DEL-6 availability-first
+    # SetAvailability/pointer-clear calls (LLD §6.3, port.UserProfileClient).
+    - ports:
+        - port: 8080
+          protocol: TCP
+
+    # Allow HTTP to iam-org-membership — the two synchronous grant-time
+    # membership-existence checks (DLG-D3, LLD §7.6.2) that replaced the
+    # lost composite membership FKs.
+    - ports:
+        - port: 8080
+          protocol: TCP
+
+    # Allow OpenTelemetry OTLP/gRPC to the collector (platform-gincommon's
+    # ObservabilityMiddlewares uses gRPC on 4317, not the legacy OTLP/HTTP
+    # port 4318 some sibling services use).
+    - ports:
+        - port: 4317
+          protocol: TCP
+
+    {{- with .Values.networkPolicy.additionalEgressRules }}
+    {{- toYaml . | nindent 4 }}
+    {{- end }}
+{{- end }}

@@ -1,0 +1,133 @@
+{{- if .Values.serviceMonitor.enabled }}
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: {{ include "iam-delegation.fullname" . }}
+  labels:
+    {{- include "iam-delegation.labels" . | nindent 4 }}
+    {{- with .Values.serviceMonitor.additionalLabels }}
+    {{- toYaml . | nindent 4 }}
+    {{- end }}
+spec:
+  groups:
+    # ── Availability ─────────────────────────────────────────────────────
+    # Not itself one of the three LLD §14.5 alerts, but mirrors
+    # iam-tender-acl's identical availability group — cheap, standard
+    # coverage for the case none of the business-metric alerts below would
+    # catch (the process is simply not up/ready at all).
+    - name: iam_delegation_availability
+      rules:
+        - alert: IamDelegationDown
+          expr: |
+            absent(up{job={{ include "iam-delegation.fullname" . | quote }}} == 1)
+          for: 5m
+          labels:
+            severity: critical
+            team: platform
+          annotations:
+            summary: iam-delegation has no healthy/ready instances
+            description: >-
+              No iam-delegation pods have been scraped as healthy for 5
+              minutes. Check pod readiness:
+              kubectl get pods -l app.kubernetes.io/name=iam-delegation
+
+        - alert: IamDelegationReplicasMissing
+          expr: |
+            sum(up{job={{ include "iam-delegation.fullname" . | quote }}}) < {{ .Values.autoscaling.minReplicas }}
+          for: 5m
+          labels:
+            severity: warning
+            team: platform
+          annotations:
+            summary: iam-delegation running below minimum replica count
+            description: >-
+              Fewer than {{ .Values.autoscaling.minReplicas }} replicas are
+              healthy. A further disruption may block node drains or leave
+              the delegation-cascade-q consumer under-provisioned.
+              Current healthy count: {{ "{{ $value }}" }}.
+
+    # ── DEL-6 availability-first expiry deferrals — LLD §14.5
+    #    "expiry_deferred > 0 sustained 30 m (warning, UP dependency)" ──────
+    - name: iam_delegation_expiry
+      rules:
+        - alert: IamDelegationExpiryDeferred
+          # iam_delegation_expiry_deferred_total is a monotonically
+          # increasing counter (incremented once per DLG-I1 cron pass that
+          # had to defer because iam-user-profile was unavailable), so
+          # alerting on the raw counter value ("> 0") the way the LLD's §14.5
+          # prose states it literally would fire forever after the very
+          # first deferral. Expressed instead as increase()-over-a-window —
+          # the same anti-flap pattern iam-tender-acl's cascade-failing
+          # alerts use — so this clears once iam-user-profile recovers and
+          # 30 minutes pass with no further deferrals.
+          expr: |
+            sum(increase(iam_delegation_expiry_deferred_total{job={{ include "iam-delegation.fullname" . | quote }}}[30m])) > 0
+          for: 30m
+          labels:
+            severity: warning
+            team: platform
+          annotations:
+            summary: iam-delegation DLG-I1 expiry cron is deferring (iam-user-profile unavailable)
+            description: >-
+              The delegation-expiry cron (DLG-I1, availability-first
+              ordering, LLD §11.3) has been deferring auto-end passes for 30+
+              minutes because iam-user-profile's SetAvailability/pointer-clear
+              call is failing. Delegations past ends_at are NOT yet ended —
+              the cron self-retries every tick, no data is lost, but this is
+              a real freshness gap. Check iam-user-profile's health.
+
+    # ── delegation-cascade-q DLQ — LLD §14.5 "cascade_dlq > 0 (warning)" ───
+    - name: iam_delegation_cascade
+      rules:
+        - alert: IamDelegationCascadeDLQGrowing
+          # Same counter-vs-increase() reasoning as IamDelegationExpiryDeferred
+          # above: iam_delegation_cascade_dlq_total only ever goes up, so
+          # increase()-over-a-window is used instead of the raw value.
+          expr: |
+            sum(increase(iam_delegation_cascade_dlq_total{job={{ include "iam-delegation.fullname" . | quote }}}[30m])) > 0
+          for: 5m
+          labels:
+            severity: warning
+            team: platform
+          annotations:
+            summary: iam-delegation delegation-cascade-q DLQ is receiving messages
+            description: >-
+              One or more MembershipRevoked/TenantOffboarded cascade
+              deliveries (LLD §11.5/§11.6) were routed to
+              delegation-cascade-q-dlq after exhausting retries (or failing
+              schema decode). Inspect the DLQ payloads and consumer logs;
+              once fixed, redrive them back to delegation-cascade-q.
+
+    # ── Grant-time membership-check dependency — LLD §14.5
+    #    "membership-check failure rate > 5% for 5 m (warning)" ────────────
+    - name: iam_delegation_membershipcheck
+      rules:
+        - alert: IamDelegationMembershipCheckHighFailureRate
+          # Ratio-alert style mirrors iam-tender-acl's
+          # TenderAclHighErrorRate/TenderAclTAC4HighErrorRate: failures
+          # (a Counter) divided by total calls attempted, approximated by
+          # the _count series of the paired latency Histogram
+          # (iam_delegation_membership_check_duration_seconds_count) —
+          # every attempted check observes a duration regardless of outcome,
+          # so its _count is the natural "total calls" denominator.
+          # clamp_min guards against division by zero when the checker has
+          # not been called at all in the window.
+          expr: |
+            sum(rate(iam_delegation_membership_check_failures_total{job={{ include "iam-delegation.fullname" . | quote }}}[5m]))
+              /
+            clamp_min(sum(rate(iam_delegation_membership_check_duration_seconds_count{job={{ include "iam-delegation.fullname" . | quote }}}[5m])), 0.001)
+            > 0.05
+          for: 5m
+          labels:
+            severity: warning
+            team: platform
+          annotations:
+            summary: iam-delegation grant-time membership-check failure rate above 5%
+            description: >-
+              {{ "{{ $value | humanizePercentage }}" }} of DLG-2 create's
+              synchronous grant-time membership-existence checks against
+              iam-org-membership (DLG-D3, LLD §7.6.2) have failed over the
+              last 5 minutes. New delegation creates are being rejected with
+              422/503 — check iam-org-membership's health and the mesh path
+              between the two services.
+{{- end }}

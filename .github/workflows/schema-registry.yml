@@ -1,0 +1,154 @@
+# Event schema validation for iam-delegation.
+#
+# Per this project's resolved decision (DLG-D15 — do NOT use
+# platform-schemagov/AWS Glue Schema Registry for this service): the
+# eventbus/eventschema layer validates the three DelegationStarted /
+# DelegationEnded / (review-warning) payloads against embedded JSON Schemas
+# using an in-house `jsonschema/v6`-based validating codec
+# (internal/adapter/outbound/eventbus + internal/eventschema), not a Glue
+# registry diff/register pipeline. This workflow is therefore a much
+# lighter structural gate than iam-user-profile's schema-registry.yml
+# (which drives `platform-schemagov` against a live Glue registry and needs
+# AWS credentials) — it validates shape only, with no registry to diff
+# against and no AWS credentials required.
+#
+# DOCUMENTED SIMPLIFICATIONS (no live AWS creds / no real asyncapi CLI
+# needed for this to be useful pre-implementation):
+#   1. JSON Schema syntax check uses Python's `jsonschema` package's
+#      Draft 2020-12 meta-schema validator (`check_schema`) as a
+#      dependency-light proxy for "does this compile as a schema" — the
+#      same structural question the in-house Go `jsonschema/v6` validating
+#      codec asks at runtime, without requiring that Go code to exist/build
+#      yet (this repo's adapters are still being written — see the repo
+#      README).
+#   2. AsyncAPI structure check is a plain YAML parse + required-top-level-
+#      key check (asyncapi/info/channels), not a real `asyncapi` CLI
+#      validate — no such CLI is wired into this org's tooling. Swap in a
+#      real `@asyncapi/cli validate` step later if/when that tool is
+#      adopted; until then this catches the common breakage (malformed
+#      YAML, a missing required section).
+#
+# Triggers only on changes to the schema/contract paths.
+name: Event Schema Validation
+
+"on":
+  pull_request:
+    branches: [main, master]
+    paths:
+      - 'internal/eventschema/*.json'
+      - 'api/asyncapi.yaml'
+  push:
+    branches: [main, master]
+    paths:
+      - 'internal/eventschema/*.json'
+      - 'api/asyncapi.yaml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: 'true'
+
+jobs:
+  validate:
+    name: Validate event schemas
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7.0.0
+        with:
+          token: ${{ secrets.CI_REPO_READ_TOKEN || github.token }}
+
+      - name: Set up Python
+        uses: actions/setup-python@v6.0.0
+        with:
+          python-version: '3.12'
+
+      - name: Install validators
+        run: pip install --quiet jsonschema pyyaml
+
+      # Pass 1: each internal/eventschema/*.json file must be valid JSON
+      # AND a structurally valid JSON Schema (Draft 2020-12 meta-schema
+      # check) — the same two properties the in-house jsonschema/v6
+      # validating codec requires to load a schema at startup.
+      - name: Validate JSON Schema syntax (internal/eventschema/*.json)
+        run: |
+          python3 - <<'PYEOF'
+          import glob, json, sys
+          from jsonschema import Draft202012Validator
+
+          files = sorted(glob.glob("internal/eventschema/*.json"))
+          if not files:
+              print("::warning::No schema files found under internal/eventschema/ — nothing to validate.")
+              sys.exit(0)
+
+          failed = False
+          for path in files:
+              try:
+                  with open(path, encoding="utf-8") as f:
+                      schema = json.load(f)
+              except json.JSONDecodeError as e:
+                  print(f"::error file={path}::Invalid JSON: {e}")
+                  failed = True
+                  continue
+
+              try:
+                  Draft202012Validator.check_schema(schema)
+              except Exception as e:
+                  print(f"::error file={path}::Not a structurally valid JSON Schema: {e}")
+                  failed = True
+                  continue
+
+              print(f"  ✔  {path}")
+
+          if failed:
+              sys.exit(1)
+          PYEOF
+
+      # Pass 2: api/asyncapi.yaml must parse as YAML and carry the required
+      # top-level AsyncAPI sections. See the "documented simplifications"
+      # note at the top of this file for why this is not a real
+      # `asyncapi validate` call.
+      - name: Validate AsyncAPI structure (api/asyncapi.yaml)
+        run: |
+          python3 - <<'PYEOF'
+          import sys, yaml
+
+          path = "api/asyncapi.yaml"
+          try:
+              with open(path, encoding="utf-8") as f:
+                  doc = yaml.safe_load(f)
+          except FileNotFoundError:
+              print(f"::error file={path}::File not found — this service's LLD (§10.3) specifies a hand-authored api/asyncapi.yaml.")
+              sys.exit(1)
+          except yaml.YAMLError as e:
+              print(f"::error file={path}::Invalid YAML: {e}")
+              sys.exit(1)
+
+          if not isinstance(doc, dict):
+              print(f"::error file={path}::Top-level document must be a mapping.")
+              sys.exit(1)
+
+          required = ["asyncapi", "info", "channels"]
+          missing = [k for k in required if k not in doc]
+          if missing:
+              print(f"::error file={path}::Missing required top-level key(s): {', '.join(missing)}")
+              sys.exit(1)
+
+          version = str(doc.get("asyncapi", ""))
+          if not version.startswith("3."):
+              print(f"::warning file={path}::asyncapi version is '{version}' — LLD §10.3 specifies a 3.0.0 skeleton.")
+
+          print(f"  ✔  {path} — asyncapi {version}, {len(doc.get('channels') or {})} channel(s)")
+          PYEOF
+
+      - name: Summary
+        if: always()
+        run: |
+          echo "### Event schema validation" >> "$GITHUB_STEP_SUMMARY"
+          echo "- JSON Schema syntax: internal/eventschema/*.json" >> "$GITHUB_STEP_SUMMARY"
+          echo "- AsyncAPI structure: api/asyncapi.yaml" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "_No AWS Glue Schema Registry step — this service uses an in-house jsonschema/v6 validating codec, not platform-schemagov (DLG-D15)._" >> "$GITHUB_STEP_SUMMARY"

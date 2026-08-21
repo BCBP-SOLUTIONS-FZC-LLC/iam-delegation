@@ -1,0 +1,86 @@
+{{- if .Values.cronJobs.cleanup.enabled }}
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: {{ include "iam-delegation.fullname" . }}-cleanup
+  labels:
+    {{- include "iam-delegation.labels" . | nindent 4 }}
+    app.kubernetes.io/component: cronjob-cleanup
+spec:
+  schedule: {{ .Values.cronJobs.cleanup.schedule | quote }}
+  concurrencyPolicy: {{ .Values.cronJobs.cleanup.concurrencyPolicy }}
+  successfulJobsHistoryLimit: {{ .Values.cronJobs.cleanup.successfulJobsHistoryLimit }}
+  failedJobsHistoryLimit: {{ .Values.cronJobs.cleanup.failedJobsHistoryLimit }}
+  jobTemplate:
+    spec:
+      activeDeadlineSeconds: {{ .Values.cronJobs.cleanup.activeDeadlineSeconds }}
+      backoffLimit: 2
+      template:
+        metadata:
+          labels:
+            {{- include "iam-delegation.selectorLabels" . | nindent 12 }}
+            app.kubernetes.io/component: cronjob-cleanup
+          annotations:
+            {{- if .Values.existingSecret }}
+            rotationEpoch: {{ .Values.rotationEpoch | default "0" | quote }}
+            {{- else }}
+            checksum/secret: {{ include (print $.Template.BasePath "/secret.yaml") . | sha256sum }}
+            {{- end }}
+        spec:
+          serviceAccountName: {{ include "iam-delegation.serviceAccountName" . }}
+          restartPolicy: OnFailure
+          securityContext:
+            {{- toYaml .Values.podSecurityContext | nindent 12 }}
+          containers:
+            - name: delegation-cleanup
+              image: "{{ .Values.reconcilerImage.repository }}:{{ include "iam-delegation.reconcilerImageTag" . }}"
+              imagePullPolicy: {{ .Values.reconcilerImage.pullPolicy }}
+              securityContext:
+                {{- toYaml .Values.securityContext | nindent 16 }}
+              # --job=delegation-cleanup selects the monthly soft-delete
+              # hard-purge sweep (LLD §11.6/§18.4) out of the single
+              # iam-delegation-reconciler binary, which also hosts the
+              # expiry and review entry points (cronjob-expiry.yaml /
+              # cronjob-review.yaml). cmd/reconciler/main.go MUST parse a
+              # `--job` flag accepting exactly these three values
+              # (delegation-expiry | delegation-review | delegation-cleanup)
+              # — this is this chart's own convention, kept in one place
+              # (.Values.cronJobs.*.jobName) so it can't drift between the
+              # three CronJob templates.
+              args:
+                - "--job={{ .Values.cronJobs.cleanup.jobName }}"
+              env:
+                {{- range $key, $val := .Values.env }}
+                - name: {{ $key }}
+                  value: {{ $val | quote }}
+                {{- end }}
+                # Rows-per-tick cap shared by all three jobs (LLD §16.3) —
+                # raise this or shorten a job's schedule if a job starts
+                # saturating.
+                - name: CRON_BATCH_LIMIT
+                  value: {{ .Values.cronJobs.batchLimit | quote }}
+                {{- $secretName := include "iam-delegation.secretName" . }}
+                {{- range .Values.envFromSecret }}
+                - name: {{ . }}
+                  valueFrom:
+                    secretKeyRef:
+                      name: {{ $secretName }}
+                      key: {{ . }}
+                {{- end }}
+              resources:
+                {{- toYaml .Values.cronJobs.cleanup.resources | nindent 16 }}
+              volumeMounts:
+                - name: tmp
+                  mountPath: /tmp
+          volumes:
+            - name: tmp
+              emptyDir: {}
+          {{- with .Values.nodeSelector }}
+          nodeSelector:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          {{- with .Values.tolerations }}
+          tolerations:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+{{- end }}

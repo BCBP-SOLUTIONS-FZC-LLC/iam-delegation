@@ -1,0 +1,231 @@
+// Package metrics registers every iam-delegation-specific Prometheus
+// instrument this service emits, named per iam-lld-delegation-service.md
+// §14.2. Uses prometheus/client_golang directly, registered onto
+// gincommon.MetricsRegisterer() — the same registry platform-gincommon's
+// own HTTP metrics and this process's /metrics endpoint already share —
+// mirroring every sibling IAM service's convention (iam-tender-acl,
+// iam-catalog-admin, iam-org-membership, iam-user-profile).
+//
+// Generic per-request HTTP metrics (count/duration/status by method+route)
+// are deliberately NOT reimplemented here: gincommon's own
+// ObservabilityMiddlewares already records those (http_requests_total/
+// http_request_duration_seconds), and platform-events' consumer likewise
+// emits its own events_*/sqs_* metrics — §14.2's "plus passthrough
+// http_*/events_*/sqs_*". Everything below is a metric neither of those
+// has an equivalent for: business-level create/end/review/cascade
+// outcomes.
+package metrics
+
+import (
+	"github.com/prometheus/client_golang/prometheus"
+)
+
+// Metrics holds every iam_delegation_* instrument this service emits.
+type Metrics struct {
+	createdTotal                 *prometheus.CounterVec
+	endedTotal                   *prometheus.CounterVec
+	activeGauge                  *prometheus.GaugeVec
+	expiryDeferredTotal          prometheus.Counter
+	reviewDeferredTotal          prometheus.Counter
+	reviewWarnedTotal            *prometheus.CounterVec
+	reviewExpiredTotal           prometheus.Counter
+	membershipCheckDuration      prometheus.Histogram
+	membershipCheckFailuresTotal prometheus.Counter
+	upAvailabilityFailuresTotal  *prometheus.CounterVec
+	idempotencyHitsTotal         prometheus.Counter
+	cascadeProcessedTotal        prometheus.Counter
+	cascadeDLQTotal              prometheus.Counter
+}
+
+// Register builds and registers every iam_delegation_* instrument onto reg.
+// Call once at startup, before /metrics is served, passing
+// gincommon.MetricsRegisterer() so these collectors land in the same
+// registry as platform-gincommon's own HTTP metrics rather than assuming
+// prometheus.DefaultRegisterer.
+func Register(reg prometheus.Registerer) (*Metrics, error) {
+	m := &Metrics{
+		createdTotal: prometheus.NewCounterVec(
+			prometheus.CounterOpts{
+				Name: "iam_delegation_created_total",
+				Help: "Total delegations created (DLG-2), labeled by scope (all/department/tender).",
+			},
+			[]string{"scope"},
+		),
+		endedTotal: prometheus.NewCounterVec(
+			prometheus.CounterOpts{
+				Name: "iam_delegation_ended_total",
+				Help: "Total delegations ended, labeled by ended_reason (expired/cancelled/delegate_removed/review_expired).",
+			},
+			[]string{"ended_reason"},
+		),
+		activeGauge: prometheus.NewGaugeVec(
+			prometheus.GaugeOpts{
+				Name: "iam_delegation_active_gauge",
+				Help: "Current count of active delegations, labeled by tenant.",
+			},
+			[]string{"tenant"},
+		),
+		expiryDeferredTotal: prometheus.NewCounter(
+			prometheus.CounterOpts{
+				Name: "iam_delegation_expiry_deferred_total",
+				Help: "Total DEL-6 expiry auto-end cron passes deferred because iam-user-profile was unavailable.",
+			},
+		),
+		reviewDeferredTotal: prometheus.NewCounter(
+			prometheus.CounterOpts{
+				Name: "iam_delegation_review_deferred_total",
+				Help: "Total DLG-Q5/DLG-D6 review auto-end cron passes deferred because iam-user-profile was unavailable.",
+			},
+		),
+		reviewWarnedTotal: prometheus.NewCounterVec(
+			prometheus.CounterOpts{
+				Name: "iam_delegation_review_warned_total",
+				Help: "Total DLG-Q6 dual-warning review notices fired, labeled by days_remaining (7 or 3).",
+			},
+			[]string{"days_remaining"},
+		),
+		reviewExpiredTotal: prometheus.NewCounter(
+			prometheus.CounterOpts{
+				Name: "iam_delegation_review_expired_total",
+				Help: "Total delegations auto-ended by the review-window cron (DLG-D6/DLG-Q5, ended_reason=review_expired).",
+			},
+		),
+		membershipCheckDuration: prometheus.NewHistogram(
+			prometheus.HistogramOpts{
+				Name:    "iam_delegation_membership_check_duration_seconds",
+				Help:    "Latency of Core's grant-time membership-existence check (LLD §7.6.2).",
+				Buckets: prometheus.DefBuckets,
+			},
+		),
+		membershipCheckFailuresTotal: prometheus.NewCounter(
+			prometheus.CounterOpts{
+				Name: "iam_delegation_membership_check_failures_total",
+				Help: "Total grant-time membership-existence checks that failed (network/timeout/5xx).",
+			},
+		),
+		upAvailabilityFailuresTotal: prometheus.NewCounterVec(
+			prometheus.CounterOpts{
+				Name: "iam_delegation_up_availability_failures_total",
+				Help: "Total iam-user-profile SetAvailability call failures, labeled by path (create/cancel/extend/reassign/cascade/expiry-cron/review-cron).",
+			},
+			[]string{"path"},
+		),
+		idempotencyHitsTotal: prometheus.NewCounter(
+			prometheus.CounterOpts{
+				Name: "iam_delegation_idempotency_hits_total",
+				Help: "Total DLG-2 create calls short-circuited by a create-idempotency-key replay (DLG-Q3).",
+			},
+		),
+		cascadeProcessedTotal: prometheus.NewCounter(
+			prometheus.CounterOpts{
+				Name: "iam_delegation_cascade_processed_total",
+				Help: "Total inbound MembershipRevoked/TenantOffboarded cascade messages processed successfully.",
+			},
+		),
+		cascadeDLQTotal: prometheus.NewCounter(
+			prometheus.CounterOpts{
+				Name: "iam_delegation_cascade_dlq_total",
+				Help: "Total inbound cascade messages routed to the DLQ (schema-decode failure or exhausted retries).",
+			},
+		),
+	}
+
+	collectors := []prometheus.Collector{
+		m.createdTotal, m.endedTotal, m.activeGauge,
+		m.expiryDeferredTotal, m.reviewDeferredTotal, m.reviewWarnedTotal, m.reviewExpiredTotal,
+		m.membershipCheckDuration, m.membershipCheckFailuresTotal,
+		m.upAvailabilityFailuresTotal, m.idempotencyHitsTotal,
+		m.cascadeProcessedTotal, m.cascadeDLQTotal,
+	}
+	for _, c := range collectors {
+		if err := reg.Register(c); err != nil {
+			return nil, err
+		}
+	}
+
+	// Pre-initialize known label values so dashboards show 0 rather than
+	// "no data" before the first event (mirrors iam-catalog-admin/
+	// iam-tender-acl's identical convention).
+	for _, scope := range []string{"all", "department", "tender"} {
+		m.createdTotal.WithLabelValues(scope)
+	}
+	for _, reason := range []string{"expired", "cancelled", "delegate_removed", "review_expired"} {
+		m.endedTotal.WithLabelValues(reason)
+	}
+	for _, days := range []string{"7", "3"} {
+		m.reviewWarnedTotal.WithLabelValues(days)
+	}
+
+	return m, nil
+}
+
+// RecordCreated increments iam_delegation_created_total for a DLG-2 create,
+// tagged by scope.
+func (m *Metrics) RecordCreated(scope string) {
+	m.createdTotal.WithLabelValues(scope).Inc()
+}
+
+// RecordEnded increments iam_delegation_ended_total, tagged by ended_reason.
+func (m *Metrics) RecordEnded(reason string) {
+	m.endedTotal.WithLabelValues(reason).Inc()
+}
+
+// SetActiveGauge sets iam_delegation_active_gauge for tenant to count.
+func (m *Metrics) SetActiveGauge(tenant string, count float64) {
+	m.activeGauge.WithLabelValues(tenant).Set(count)
+}
+
+// RecordExpiryDeferred increments iam_delegation_expiry_deferred_total.
+func (m *Metrics) RecordExpiryDeferred() {
+	m.expiryDeferredTotal.Inc()
+}
+
+// RecordReviewDeferred increments iam_delegation_review_deferred_total.
+func (m *Metrics) RecordReviewDeferred() {
+	m.reviewDeferredTotal.Inc()
+}
+
+// RecordReviewWarned increments iam_delegation_review_warned_total, tagged
+// by daysRemaining ("7" or "3").
+func (m *Metrics) RecordReviewWarned(daysRemaining string) {
+	m.reviewWarnedTotal.WithLabelValues(daysRemaining).Inc()
+}
+
+// RecordReviewExpired increments iam_delegation_review_expired_total.
+func (m *Metrics) RecordReviewExpired() {
+	m.reviewExpiredTotal.Inc()
+}
+
+// ObserveMembershipCheckDuration records
+// iam_delegation_membership_check_duration_seconds for one Core
+// membership-existence check.
+func (m *Metrics) ObserveMembershipCheckDuration(seconds float64) {
+	m.membershipCheckDuration.Observe(seconds)
+}
+
+// RecordMembershipCheckFailure increments
+// iam_delegation_membership_check_failures_total.
+func (m *Metrics) RecordMembershipCheckFailure() {
+	m.membershipCheckFailuresTotal.Inc()
+}
+
+// RecordUPAvailabilityFailure increments
+// iam_delegation_up_availability_failures_total, tagged by path.
+func (m *Metrics) RecordUPAvailabilityFailure(path string) {
+	m.upAvailabilityFailuresTotal.WithLabelValues(path).Inc()
+}
+
+// RecordIdempotencyHit increments iam_delegation_idempotency_hits_total.
+func (m *Metrics) RecordIdempotencyHit() {
+	m.idempotencyHitsTotal.Inc()
+}
+
+// RecordCascadeProcessed increments iam_delegation_cascade_processed_total.
+func (m *Metrics) RecordCascadeProcessed() {
+	m.cascadeProcessedTotal.Inc()
+}
+
+// RecordCascadeDLQ increments iam_delegation_cascade_dlq_total.
+func (m *Metrics) RecordCascadeDLQ() {
+	m.cascadeDLQTotal.Inc()
+}

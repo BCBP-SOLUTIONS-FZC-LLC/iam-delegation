@@ -1,0 +1,61 @@
+iam-delegation {{ .Chart.Version }} deployed.
+
+This service is the fourth and last O&M extraction (ADR-0008, Option C) —
+owns delegations + delegation_tenant_settings, the DLG-1..7/DLG-I1..I4 API,
+the delegation-expiry/-review/-cleanup CronJobs, and the
+iam.delegation.events topic.
+
+━━ REQUIRED ACTIONS ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+{{ if not .Values.existingSecret -}}
+⚠  Credentials are stored in Helm release history (base64, not encrypted).
+   Migrate to External Secrets Operator or AWS Secrets Manager CSI:
+     existingSecret: "iam-delegation-secrets"
+   Then remove secretValues from your values file.
+
+{{ end -}}
+{{ if not .Values.networkPolicy.enabled -}}
+⚠  networkPolicy.enabled is false. :9090/metrics is unauthenticated and
+   reachable by any pod in the cluster. Enable in production:
+     networkPolicy.enabled: true
+   Ensure the ingress controller namespace label matches:
+     ingressControllerNamespaceSelector: {{ .Values.networkPolicy.ingressControllerNamespaceSelector | toJson }}
+
+{{ end -}}
+{{ if .Values.ingress.enabled -}}
+⚠  Ingress is enabled. Only /api/v1/delegations (DLG-1..7) is routed — the
+   internal DLG-I1..I4 routes must never be exposed this way; they are
+   mesh-only mTLS and reached solely from same-namespace callers (Core,
+   Workflow). :9090/metrics is not referenced by this Ingress, but remains
+   reachable cluster-wide unless networkPolicy.enabled=true.
+
+{{ end -}}
+{{ if eq (int .Values.autoscaling.targetRPSPerReplica) 0 -}}
+ℹ  autoscaling.targetRPSPerReplica is 0 — HPA is scaling on CPU/memory only.
+   LLD §16.3 also calls for HPA on delegation-cascade-q queue depth, which
+   needs a queue-depth-based scaler (e.g. KEDA) not wired by this chart —
+   see values.yaml's autoscaling block for the current scaffold.
+
+{{ end -}}
+━━ CRONJOBS ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+{{ if .Values.cronJobs.expiry.enabled -}}
+  delegation-expiry   {{ .Values.cronJobs.expiry.schedule }}   (DLG-I1, LLD §11.3)
+{{ end -}}
+{{ if .Values.cronJobs.review.enabled -}}
+  delegation-review   {{ .Values.cronJobs.review.schedule }}   (DLG-I2, LLD §11.4)
+{{ end -}}
+{{ if .Values.cronJobs.cleanup.enabled -}}
+  delegation-cleanup  {{ .Values.cronJobs.cleanup.schedule }}   (soft-delete purge, LLD §11.6/§18.4)
+{{ end -}}
+
+Check CronJob status:
+  kubectl get cronjobs -l app.kubernetes.io/name={{ include "iam-delegation.name" . }} -n {{ .Release.Namespace }}
+
+━━ VERIFY DEPLOYMENT ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+  kubectl rollout status deployment/{{ include "iam-delegation.fullname" . }} -n {{ .Release.Namespace }}
+  kubectl get pods -l {{ include "iam-delegation.selectorLabels" . | replace ": " "=" | replace "\n" "," }}
+
+Readiness: https://{{ if .Values.ingress.hosts }}{{ (first .Values.ingress.hosts).host }}{{ else }}<host>{{ end }}/readyz
+Metrics:   (cluster-internal only) http://<pod-ip>:{{ .Values.service.metricsPort }}/metrics

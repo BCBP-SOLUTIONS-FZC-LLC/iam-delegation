@@ -1,0 +1,193 @@
+version: 3
+workdir: .
+
+allow:
+  depOnAnyVendor: true
+  # Deep-scan follows method calls through the composition root and flags every
+  # DI wire (e.g. cmd passing an outbound adapter to a service constructor) as
+  # a cross-layer dependency. That's how Clean Architecture is supposed to work
+  # in main.go — keep import-level checks only. Matches iam-tender-acl and
+  # iam-user-profile's identical rationale.
+  deepScan: false
+
+# Tests, dev scripts, and deploy manifests are not part of the runtime
+# architecture. Excluding them keeps the linter focused on production code.
+exclude:
+  - test
+  - scripts
+  - deploy
+
+excludeFiles:
+  - '.*_test\.go$'
+
+# Clean Architecture / Ports-and-Adapters layering for iam-delegation
+# (LLD §6/§6.2). Package layout is fixed by the LLD's own tree (§6):
+#   internal/core/{domain,port,service}
+#   internal/adapter/inbound/{http,consumer}
+#   internal/adapter/outbound/{postgres,valkey,eventbus,userprofile,orgmembership,metrics}
+#   pkg/requestctx, internal/eventschema, api/, cmd/{server,reconciler}
+components:
+  domain:
+    in: internal/core/domain
+
+  port:
+    in: internal/core/port
+
+  service:
+    in: internal/core/service
+
+  # Gateway-identity / tenant-actor extraction helpers shared by inbound
+  # adapters and the composition root — not part of core, not an adapter.
+  requestctx:
+    in: pkg/requestctx
+
+  # Embedded JSON Schemas for the iam-delegation-events payloads (used by
+  # the eventbus outbound adapter's validating codec, and by CI's
+  # jsonschema/v6 validation — see .github/workflows/schema-registry.yml).
+  eventschema:
+    in: internal/eventschema
+
+  # api/asyncapi.yaml + embed.go — the hand-authored AsyncAPI contract,
+  # embedded so it can be served (e.g. a docs route) or read at startup.
+  # Declared as its own component (rather than folded into eventschema)
+  # because it is a design-time contract artifact, not a runtime payload
+  # schema.
+  api:
+    in: api
+
+  # Cross-cutting Prometheus counters/histograms (iam_delegation_* — §14.2).
+  # Imported by both the inbound HTTP router (request metrics) and the
+  # inbound SQS cascade consumer (iam_delegation_cascade_processed_total /
+  # iam_delegation_cascade_dlq_total) — mirrors iam-tender-acl's and
+  # iam-user-profile's identical "observability" component, split out of
+  # adapters_outbound for exactly this reason even though the LLD's package
+  # tree nests it under internal/adapter/outbound/metrics.
+  observability:
+    in: internal/adapter/outbound/metrics
+
+  adapters_inbound:
+    in:
+      - internal/adapter/inbound/http
+      - internal/adapter/inbound/consumer
+
+  adapters_outbound:
+    in:
+      - internal/adapter/outbound/postgres
+      - internal/adapter/outbound/valkey
+      - internal/adapter/outbound/eventbus
+      - internal/adapter/outbound/userprofile
+      - internal/adapter/outbound/orgmembership
+
+  # Generated Swagger docs — output of `make swag` (swaggo/swag) for
+  # cmd/server's HTTP handlers (DLG-1..7, DLG-I1..I4). Declared as a
+  # component so arch-lint doesn't fail on the blank import in
+  # cmd/server/main.go — mirrors iam-tender-acl's / iam-user-profile's
+  # identical "docs_swagger" component.
+  docs_swagger:
+    in: docs/swagger
+
+  # The three CronJob entry points (delegation-expiry/-review/-cleanup, LLD
+  # §11.3/§11.4/§18.4), shared by cmd/reconciler's binary and cmd/server's
+  # DLG-I1/I2 HTTP handlers (DLG-D17 — both call the same implementation
+  # rather than one shelling out over HTTP to the other). Declared as its
+  # own component, not folded into `cmd`, because cmd/server also imports
+  # it (a cross-binary import arch-lint's directory-based `cmd` component
+  # can't express as "internal to cmd").
+  jobs:
+    in: cmd/reconciler/jobs
+
+  cmd:
+    in:
+      - cmd/server
+      - cmd/reconciler
+
+deps:
+  # domain: no internal imports at all — pure value types only (Delegation,
+  # DelegationTenantSettings, EndReason, delegation_* error taxonomy).
+  domain:
+    anyVendorDeps: true
+
+  # port: only domain — every outbound dependency (Postgres, Valkey,
+  # UserProfileClient, MembershipCheckClient, EventPublisher, IdempotencyStore,
+  # TxRunner) is declared here as an interface over domain types only.
+  port:
+    mayDependOn:
+      - domain
+
+  # service: domain + port + requestctx (delegation_service.go /
+  # settings_service.go read the gateway-identity actor/tenant off requestctx).
+  service:
+    mayDependOn:
+      - domain
+      - port
+      - requestctx
+
+  # requestctx: no internal deps.
+  requestctx:
+    anyVendorDeps: true
+
+  # eventschema: pure embedded assets, no internal deps.
+  eventschema:
+    anyVendorDeps: true
+
+  # api: pure embedded assets (asyncapi.yaml) + embed.go, no internal deps.
+  api:
+    anyVendorDeps: true
+
+  # observability: instrumentation only.
+  observability:
+    anyVendorDeps: true
+
+  # inbound adapters: service + port + domain + requestctx + eventschema +
+  # api + observability — never an outbound adapter directly (wired only
+  # from cmd).
+  adapters_inbound:
+    mayDependOn:
+      - service
+      - port
+      - domain
+      - requestctx
+      - eventschema
+      - api
+      - observability
+
+  # outbound adapters: port + domain + eventschema (+ observability for
+  # instrumenting outbound call latency, e.g.
+  # iam_delegation_membership_check_duration_seconds) — never service, never
+  # inbound.
+  adapters_outbound:
+    mayDependOn:
+      - port
+      - domain
+      - eventschema
+      - observability
+
+  # docs_swagger: pure generated assets, no internal deps.
+  docs_swagger:
+    anyVendorDeps: true
+
+  # jobs: domain + port only — plain functions over already-constructed
+  # dependencies (port.DelegationRepository/UserProfileClient/TxRunner),
+  # framework-free like service (LLD §6.2), just not folded into `service`
+  # because the LLD's own package tree places it under cmd/reconciler/jobs.
+  jobs:
+    mayDependOn:
+      - domain
+      - port
+
+  # composition root: wires everything together (both cmd/server — HTTP API
+  # + cascade SQS consumer — and cmd/reconciler — the three CronJob entry
+  # points under cmd/reconciler/jobs).
+  cmd:
+    mayDependOn:
+      - domain
+      - port
+      - service
+      - requestctx
+      - eventschema
+      - api
+      - observability
+      - adapters_inbound
+      - adapters_outbound
+      - docs_swagger
+      - jobs

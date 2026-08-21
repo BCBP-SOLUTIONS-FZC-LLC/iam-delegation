@@ -1,0 +1,87 @@
+{{- if .Values.cronJobs.expiry.enabled }}
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: {{ include "iam-delegation.fullname" . }}-expiry
+  labels:
+    {{- include "iam-delegation.labels" . | nindent 4 }}
+    app.kubernetes.io/component: cronjob-expiry
+spec:
+  schedule: {{ .Values.cronJobs.expiry.schedule | quote }}
+  concurrencyPolicy: {{ .Values.cronJobs.expiry.concurrencyPolicy }}
+  successfulJobsHistoryLimit: {{ .Values.cronJobs.expiry.successfulJobsHistoryLimit }}
+  failedJobsHistoryLimit: {{ .Values.cronJobs.expiry.failedJobsHistoryLimit }}
+  jobTemplate:
+    spec:
+      activeDeadlineSeconds: {{ .Values.cronJobs.expiry.activeDeadlineSeconds }}
+      backoffLimit: 2
+      template:
+        metadata:
+          labels:
+            {{- include "iam-delegation.selectorLabels" . | nindent 12 }}
+            app.kubernetes.io/component: cronjob-expiry
+          annotations:
+            {{- if .Values.existingSecret }}
+            rotationEpoch: {{ .Values.rotationEpoch | default "0" | quote }}
+            {{- else }}
+            checksum/secret: {{ include (print $.Template.BasePath "/secret.yaml") . | sha256sum }}
+            {{- end }}
+        spec:
+          serviceAccountName: {{ include "iam-delegation.serviceAccountName" . }}
+          restartPolicy: OnFailure
+          securityContext:
+            {{- toYaml .Values.podSecurityContext | nindent 12 }}
+          containers:
+            - name: delegation-expiry
+              image: "{{ .Values.reconcilerImage.repository }}:{{ include "iam-delegation.reconcilerImageTag" . }}"
+              imagePullPolicy: {{ .Values.reconcilerImage.pullPolicy }}
+              securityContext:
+                {{- toYaml .Values.securityContext | nindent 16 }}
+              # --job=delegation-expiry selects DLG-I1 (LLD §11.3 — the
+              # availability-first, self-retrying expiry sweep) out of the
+              # single iam-delegation-reconciler binary, which also hosts
+              # the review and cleanup entry points (cronjob-review.yaml /
+              # cronjob-cleanup.yaml). cmd/reconciler/main.go MUST parse a
+              # `--job` flag accepting exactly these three values
+              # (delegation-expiry | delegation-review | delegation-cleanup)
+              # — this is this chart's own convention (LLD §16.1 leaves the
+              # dispatch mechanism unspecified), kept in one place
+              # (.Values.cronJobs.*.jobName) so it can't drift between the
+              # three CronJob templates.
+              args:
+                - "--job={{ .Values.cronJobs.expiry.jobName }}"
+              env:
+                {{- range $key, $val := .Values.env }}
+                - name: {{ $key }}
+                  value: {{ $val | quote }}
+                {{- end }}
+                # Rows-per-tick cap shared by all three jobs (LLD §16.3) —
+                # raise this or shorten a job's schedule if a job starts
+                # saturating.
+                - name: CRON_BATCH_LIMIT
+                  value: {{ .Values.cronJobs.batchLimit | quote }}
+                {{- $secretName := include "iam-delegation.secretName" . }}
+                {{- range .Values.envFromSecret }}
+                - name: {{ . }}
+                  valueFrom:
+                    secretKeyRef:
+                      name: {{ $secretName }}
+                      key: {{ . }}
+                {{- end }}
+              resources:
+                {{- toYaml .Values.cronJobs.expiry.resources | nindent 16 }}
+              volumeMounts:
+                - name: tmp
+                  mountPath: /tmp
+          volumes:
+            - name: tmp
+              emptyDir: {}
+          {{- with .Values.nodeSelector }}
+          nodeSelector:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          {{- with .Values.tolerations }}
+          tolerations:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+{{- end }}

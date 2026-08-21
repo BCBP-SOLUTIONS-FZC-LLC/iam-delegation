@@ -1,0 +1,410 @@
+asyncapi: 3.0.0
+
+info:
+  title: iam-delegation events
+  version: 1.0.0
+  description: |
+    Outbound events published to iam.delegation.events (SNS → SQS fan-out),
+    plus the two Core-origin signals this service consumes on
+    delegation-cascade-q (LLD §10).
+
+    Wire format: each SNS message body is prefixed with an 18-byte AWS Glue
+    Schema Registry header before the EventEnvelope JSON:
+      byte 0     : header version (0x03)
+      byte 1     : compression    (0x00 = none)
+      bytes 2-17 : schema version UUID (big-endian)
+
+    Glue registry : iam-delegation-events (ap-south-1, JSON data format).
+    Schemas       : one per PUBLISHED event type, named identically to the
+                    event `type` (PascalCase) — DelegationStarted,
+                    DelegationEnded, DelegationReviewRequested (LLD §10.3.1).
+                    MembershipRevoked / TenantOffboarded are registered under
+                    their producing services' own Glue registries, not
+                    iam-delegation-events — they are documented below purely
+                    as this service's consumer-side contract.
+
+    Encoding is split between enqueue time (plain JSON written to the
+    outbox, validated against the JSON Schemas in internal/eventschema/) and
+    publish time (a Glue codec resolves and stamps the schema-version UUID
+    into `dataschema` immediately before the SNS publish call) — see LLD
+    §10.3.1.
+
+    Ordering: events for one delegation are NOT strictly ordered across
+    types (standard SNS gives no ordering guarantee). Payloads are
+    self-contained snapshots (DLG-EVT-7) so a consumer applying them out of
+    order converges to the correct latest state regardless of arrival order.
+
+  license:
+    name: Proprietary
+
+defaultContentType: application/json
+
+tags:
+  - $ref: '#/components/tags/published'
+  - $ref: '#/components/tags/consumed'
+
+servers:
+  production:
+    host: sns.ap-south-1.amazonaws.com
+    protocol: sns
+    description: |
+      AWS SNS in ap-south-1. Topic ARN configured via the SNS_TOPIC_ARN env
+      var. Pod IAM role requires, scoped to the iam-delegation-events Glue
+      registry: glue:GetRegistry, glue:GetSchema, glue:GetSchemaVersion,
+      glue:QuerySchemaVersionMetadata. Schema registration
+      (glue:CreateSchema, glue:RegisterSchemaVersion) is CD-only.
+    security:
+      - $ref: '#/components/securitySchemes/iamRole'
+
+  sqsDelegationCascade:
+    host: sqs.ap-south-1.amazonaws.com
+    protocol: sqs
+    description: |
+      SQS queue owned and managed by this service — delegation-cascade-q
+      (DLQ: delegation-cascade-q-dlq, maxReceiveCount=5) — fed by two
+      upstream SNS topics this service does not own, via cross-topic
+      subscriptions (LLD §10.1):
+        iam.membership.events -> MembershipRevoked (filter: EventType IN [MembershipRevoked])
+        iam.tenant.events     -> TenantOffboarded   (filter: EventType IN [TenantOffboarded])
+      Drives the delegate-side removal cascade (§11.5) and tenant-lifecycle
+      cleanup (§11.6). Idempotent via processed_events keyed on the envelope
+      id (UUID v7); a redelivery is a no-op. A message whose payload fails
+      schema-decode is routed to the DLQ rather than retried indefinitely.
+    security:
+      - $ref: '#/components/securitySchemes/iamRole'
+
+channels:
+  iam/delegation/events:
+    address: iam.delegation.events
+    description: |
+      Single dedicated SNS topic this service publishes to (DLG-Q1) — one
+      topic, three event types, no RoutingPublisher.
+    bindings:
+      sns:
+        name: iam-delegation-events
+    messages:
+      DelegationStarted:         { $ref: '#/components/messages/DelegationStarted' }
+      DelegationEnded:           { $ref: '#/components/messages/DelegationEnded' }
+      DelegationReviewRequested: { $ref: '#/components/messages/DelegationReviewRequested' }
+
+  iam/delegation/cascade:
+    address: delegation-cascade-q
+    description: |
+      This service's own SQS queue (delegation-cascade-q), not a topic it
+      owns — subscribed to two upstream producers' SNS topics
+      (iam.membership.events, iam.tenant.events) per LLD §10.1. DLQ:
+      delegation-cascade-q-dlq, maxReceiveCount=5.
+    bindings:
+      sqs:
+        queue:
+          name: delegation-cascade-q
+          fifoQueue: false
+    messages:
+      MembershipRevoked: { $ref: '#/components/messages/MembershipRevoked' }
+      TenantOffboarded:  { $ref: '#/components/messages/TenantOffboarded' }
+
+operations:
+  publishDelegationEvents:
+    action: send
+    channel:
+      $ref: '#/channels/iam~1delegation~1events'
+    tags:
+      - $ref: '#/components/tags/published'
+    summary: Publish delegation lifecycle events to iam.delegation.events
+    messages:
+      - $ref: '#/channels/iam~1delegation~1events/messages/DelegationStarted'
+      - $ref: '#/channels/iam~1delegation~1events/messages/DelegationEnded'
+      - $ref: '#/channels/iam~1delegation~1events/messages/DelegationReviewRequested'
+
+  # ── Inbound operation — Core's removal/offboarding signals (LLD §10.1) ────
+  consumeDelegationCascade:
+    action: receive
+    channel:
+      $ref: '#/channels/iam~1delegation~1cascade'
+    tags:
+      - $ref: '#/components/tags/consumed'
+    summary: Consume Core's removal/offboarding signals driving the delegate-side cascade
+    description: |
+      Consumer: this service (iam-delegation).
+      Producers: Core / Org & Membership (MembershipRevoked on
+        iam.membership.events) and the tenant-lifecycle owner
+        (TenantOffboarded on iam.tenant.events) — NOT this service.
+      Queue: delegation-cascade-q | DLQ: delegation-cascade-q-dlq
+        (maxReceiveCount=5).
+
+      On MembershipRevoked: CascadeService.EndForUser ends every delegation
+        row (as delegator or delegate) tied to the removed membership,
+        emitting DelegationEnded(ended_reason=delegate_removed) for
+        delegate-side rows only — delegator-side removal ends silently
+        (DEL-7/DLG-EVT-4, §11.5).
+      On TenantOffboarded: CascadeService.ScrubTenant ends/cleans up every
+        delegation row scoped to the tenant (§11.6).
+
+      Idempotent via processed_events keyed on the envelope id (UUID v7); a
+      redelivery is a no-op. A message whose payload fails schema-decode is
+      routed to the DLQ rather than retried indefinitely.
+    messages:
+      - $ref: '#/channels/iam~1delegation~1cascade/messages/MembershipRevoked'
+      - $ref: '#/channels/iam~1delegation~1cascade/messages/TenantOffboarded'
+
+components:
+  securitySchemes:
+    iamRole:
+      type: httpApiKey
+      name: Authorization
+      in: header
+      description: AWS IAM role attached to the pod via IRSA (IAM Roles for Service Accounts).
+
+  tags:
+    published:
+      name: published
+      description: |
+        This service is the producer. Emitted onto the iam.delegation.events
+        SNS topic via the transactional outbox (DLG-EVT-1): DelegationStarted,
+        DelegationEnded, DelegationReviewRequested, and the publishDelegationEvents
+        send operation all carry this tag.
+    consumed:
+      name: consumed
+      description: |
+        This service is the consumer, not the producer, of MembershipRevoked
+        (iam.membership.events) and TenantOffboarded (iam.tenant.events).
+        Canonical schema ownership for anything tagged consumed sits with the
+        producing service, not this file — treat these definitions as this
+        service's consumer-side documentation (LLD §10.1), kept in sync with
+        upstream, not as the source of truth.
+
+  messageTraits:
+    glueWireFormat:
+      description: |
+        Message body is prefixed with the 18-byte Glue Schema Registry
+        wire-format header: [0x03][0x00][16-byte schema version UUID
+        (big-endian)] followed by the JSON payload. Consumers must strip
+        this header before parsing the EventEnvelope JSON.
+
+  messages:
+    DelegationStarted:
+      name: DelegationStarted
+      title: Delegation created (routing begins)
+      summary: Emitted by DLG-2 create and the create leg of DLG-5 reassign.
+      tags:
+        - $ref: '#/components/tags/published'
+      contentType: application/json
+      traits:
+        - $ref: '#/components/messageTraits/glueWireFormat'
+      payload:
+        $ref: '#/components/schemas/DelegationStartedPayload'
+      bindings:
+        sns:
+          messageAttributes:
+            EventType:
+              dataType: String
+              value: DelegationStarted
+              description: PascalCase event type — used by consumer SNS filter policies.
+            TenantID:
+              dataType: String
+              description: Dynamic — set from envelope.tenant_id at publish time.
+            Source:
+              dataType: String
+              value: iam-delegation
+            EventID:
+              dataType: String
+              description: Dynamic — RFC 4122 UUID v7 echoed from envelope.id.
+            Subject:
+              dataType: String
+              description: Dynamic — set from envelope.subject (the delegation_id).
+
+    DelegationEnded:
+      name: DelegationEnded
+      title: Delegation ended (routing restored)
+      summary: |
+        Fires on every end path — cancel, ends_at expiry, review auto-end,
+        delegate-removed cascade (DLG-EVT-3) — never path-dependent.
+        Delegator-side removal ends silently, no event (DEL-7/DLG-EVT-4).
+      tags:
+        - $ref: '#/components/tags/published'
+      contentType: application/json
+      traits:
+        - $ref: '#/components/messageTraits/glueWireFormat'
+      payload:
+        $ref: '#/components/schemas/DelegationEndedPayload'
+      bindings:
+        sns:
+          messageAttributes:
+            EventType:
+              dataType: String
+              value: DelegationEnded
+              description: PascalCase event type — used by consumer SNS filter policies.
+            TenantID:
+              dataType: String
+              description: Dynamic — set from envelope.tenant_id at publish time.
+            Source:
+              dataType: String
+              value: iam-delegation
+            EventID:
+              dataType: String
+              description: Dynamic — RFC 4122 UUID v7 echoed from envelope.id.
+            Subject:
+              dataType: String
+              description: Dynamic — set from envelope.subject (the delegation_id).
+
+    DelegationReviewRequested:
+      name: DelegationReviewRequested
+      title: Open-ended delegation approaching its review deadline
+      summary: Emitted by the delegation-review sweep at the 7-day and 3-day marks (DLG-I2, DLG-D7).
+      tags:
+        - $ref: '#/components/tags/published'
+      contentType: application/json
+      traits:
+        - $ref: '#/components/messageTraits/glueWireFormat'
+      payload:
+        $ref: '#/components/schemas/DelegationReviewRequestedPayload'
+      bindings:
+        sns:
+          messageAttributes:
+            EventType:
+              dataType: String
+              value: DelegationReviewRequested
+              description: PascalCase event type — used by consumer SNS filter policies.
+            TenantID:
+              dataType: String
+              description: Dynamic — set from envelope.tenant_id at publish time.
+            Source:
+              dataType: String
+              value: iam-delegation
+            EventID:
+              dataType: String
+              description: Dynamic — RFC 4122 UUID v7 echoed from envelope.id.
+            Subject:
+              dataType: String
+              description: Dynamic — set from envelope.subject (the delegation_id).
+
+    # ── Consumed messages (LLD §10.1) — producer is Core, not this service ──
+    MembershipRevoked:
+      name: MembershipRevoked
+      title: Tenant membership revoked
+      summary: |
+        Consumed by this service (not published). Produced by Core / Org &
+        Membership on iam.membership.events; drives
+        CascadeService.EndForUser (§11.5, DLG-Q4/DLG-D14).
+      tags:
+        - $ref: '#/components/tags/consumed'
+      contentType: application/json
+      payload:
+        $ref: '#/components/schemas/MembershipRevokedPayload'
+      bindings:
+        sns:
+          messageAttributes:
+            EventType:
+              dataType: String
+              value: MembershipRevoked
+              description: Set by the producer. Matches this queue's SNS filter policy.
+            TenantID:
+              dataType: String
+              description: Dynamic — envelope.tenant_id.
+            Source:
+              dataType: String
+              description: Producing service identifier (Core / Org & Membership).
+            EventID:
+              dataType: String
+              description: Dynamic — envelope id, used as the processed_events dedup key.
+
+    TenantOffboarded:
+      name: TenantOffboarded
+      title: Tenant offboarded
+      summary: |
+        Consumed by this service (not published). Produced once a tenant's
+        realm export+delete is verified; drives
+        CascadeService.ScrubTenant (§11.6, DLG-Q4/DLG-D14).
+      tags:
+        - $ref: '#/components/tags/consumed'
+      contentType: application/json
+      payload:
+        $ref: '#/components/schemas/TenantOffboardedPayload'
+      bindings:
+        sns:
+          messageAttributes:
+            EventType:
+              dataType: String
+              value: TenantOffboarded
+              description: Set by the producer. Matches this queue's SNS filter policy.
+            TenantID:
+              dataType: String
+              description: Dynamic — envelope.tenant_id (the tenant being offboarded).
+            Source:
+              dataType: String
+              description: Producing service identifier (tenant-lifecycle owner).
+            EventID:
+              dataType: String
+              description: Dynamic — envelope id, used as the processed_events dedup key.
+
+  schemas:
+    # Shared envelope fields (embedded in every published message)
+    EventEnvelope:
+      type: object
+      required: [id, source, tenant_id, trace_id, specversion, time, data]
+      properties:
+        id:          { type: string, format: uuid, description: UUID v7 — consumer dedup key }
+        source:      { type: string, const: iam-delegation }
+        specversion: { type: string, const: "1.0" }
+        time:        { type: string, format: date-time }
+        tenant_id:   { type: string, format: uuid }
+        trace_id:    { type: string }
+        subject:     { type: string, description: resource id (the delegation_id) }
+        actor:       { type: string, format: uuid, description: who caused the event (audit) }
+        dataschema:  { type: string, description: Glue Schema Registry version UUID }
+        ip_address:  { type: string, description: "\"system\" on cron-origin events" }
+        user_agent:  { type: string, description: iam-delegation/<cron>-cron on cron-origin events }
+
+    DelegationStartedPayload:
+      allOf:
+        - $ref: '#/components/schemas/EventEnvelope'
+        - type: object
+          required: [delegation_id, delegator_id, delegate_id, scope, starts_at]
+          properties:
+            delegation_id: { type: string, format: uuid }
+            delegator_id:  { type: string, format: uuid }
+            delegate_id:   { type: string, format: uuid }
+            scope:         { type: string, enum: [all, department, tender] }
+            scope_id:      { type: string, format: uuid, nullable: true }
+            starts_at:     { type: string, format: date-time }
+            ends_at:       { type: string, format: date-time, nullable: true }
+
+    DelegationEndedPayload:
+      allOf:
+        - $ref: '#/components/schemas/EventEnvelope'
+        - type: object
+          required: [delegation_id, delegator_id, delegate_id, ended_reason]
+          properties:
+            delegation_id: { type: string, format: uuid }
+            delegator_id:  { type: string, format: uuid }
+            delegate_id:   { type: string, format: uuid }
+            ended_reason:  { type: string, enum: [expired, cancelled, delegate_removed, review_expired] }  # review_expired added (DLG-Q5)
+
+    DelegationReviewRequestedPayload:
+      allOf:
+        - $ref: '#/components/schemas/EventEnvelope'
+        - type: object
+          required: [delegation_id, delegator_id, delegate_id, days_remaining]
+          properties:
+            delegation_id: { type: string, format: uuid }
+            delegator_id:  { type: string, format: uuid }
+            delegate_id:   { type: string, format: uuid }
+            days_remaining: { type: integer, enum: [7, 3] }   # the two fixed notice points (DLG-Q6)
+
+    # ── Consumed payload schemas (LLD §10.1) — flat, no EventEnvelope allOf;
+    # these mirror MembershipRevokedPayload/TenantOffboardedPayload exactly
+    # as produced upstream (internal/core/domain/event_payloads.go).
+    MembershipRevokedPayload:
+      type: object
+      required: [tenant_id, user_id, actor_id]
+      properties:
+        tenant_id: { type: string, format: uuid }
+        user_id:   { type: string, format: uuid, description: The member whose tenant membership was revoked. }
+        actor_id:  { type: string, format: uuid, description: Who performed the revocation. }
+
+    TenantOffboardedPayload:
+      type: object
+      required: [tenant_id, actor_id]
+      properties:
+        tenant_id: { type: string, format: uuid }
+        actor_id:  { type: string, format: uuid, description: Who performed the offboarding. }

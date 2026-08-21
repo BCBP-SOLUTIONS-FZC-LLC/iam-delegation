@@ -1,0 +1,16 @@
+apiVersion: v2
+name: iam-delegation
+description: Delegation Service (out-of-office delegations) for the IAM stack — the fourth and last O&M extraction (ADR-0008, Option C); owns delegations + delegation_tenant_settings, the DLG-1..7/DLG-I1..I4 API, the delegation-expiry/-review/-cleanup CronJobs, and the iam.delegation.events topic
+type: application
+version: 0.1.0
+appVersion: "1.0.0"
+keywords:
+  - iam
+  - delegation
+  - out-of-office
+  - authorization
+home: https://github.com/BCBP-SOLUTIONS-FZC-LLC/iam-delegation
+sources:
+  - https://github.com/BCBP-SOLUTIONS-FZC-LLC/iam-delegation
+maintainers:
+  - name: BCBP Solutions IAM Team

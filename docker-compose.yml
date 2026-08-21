@@ -1,0 +1,155 @@
+# docker-compose.yml
+#
+# NOTE: This file is for LOCAL DEVELOPMENT ONLY. It is not used in any
+# staging/production deployment path (see deploy/helm/iam-delegation for
+# that). Credentials and connection strings below are dev-only defaults
+# and must never be reused outside a developer's machine.
+#
+# Host ports are chosen to avoid colliding with the sibling IAM services'
+# own docker-compose.yml stacks (iam-user-profile: 5433/5434/6379/4566,
+# iam-org-membership: 5533/5534/6380/4567, iam-group-mapping: 5432/6379/4568,
+# iam-catalog-admin: 5535/6381, iam-tender-acl: 5536/6382/4569) so all can
+# run side-by-side on one host.
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      # Dev-only credentials. Production uses externally managed secrets.
+      POSTGRES_DB: delegation
+      POSTGRES_USER: delegation
+      POSTGRES_PASSWORD: delegation
+    ports:
+      - "5537:5432"
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U delegation -d delegation"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+      start_period: 5s
+
+  valkey:
+    image: valkey/valkey:8-alpine
+    ports:
+      - "6383:6379"
+    healthcheck:
+      test: ["CMD", "valkey-cli", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+      start_period: 5s
+
+  localstack:
+    # Community edition — SQS only. This service both publishes
+    # (iam-delegation-events via the outbox → SNS, LLD §10.4) and consumes
+    # (delegation-cascade-q, §11.5/§11.6), unlike iam-tender-acl which is
+    # SQS-only. Glue Schema Registry (Pro-only) is unused locally — the
+    # eventbus adapter falls back to plain-JSON when no registry is
+    # reachable (see internal/adapter/outbound/eventbus).
+    image: localstack/localstack:4.4.0
+    ports:
+      # Host 4570 → container 4566.
+      - "4570:4566"
+    environment:
+      SERVICES: sqs,sns
+      DEBUG: 0
+      AWS_DEFAULT_REGION: us-east-1
+    volumes:
+      - localstack-data:/var/lib/localstack
+      - ./scripts/init-localstack.sh:/etc/localstack/init/ready.d/init-localstack.sh
+    healthcheck:
+      test: ["CMD", "awslocal", "sqs", "list-queues"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+      start_period: 5s
+
+  iam-delegation:
+    build:
+      context: .
+      dockerfile: Dockerfile.server
+    depends_on:
+      postgres:
+        condition: service_healthy
+      valkey:
+        condition: service_healthy
+      localstack:
+        condition: service_healthy
+    ports:
+      - "8080:8080"
+      - "9090:9090"
+    environment:
+      HTTP_PORT: "8080"
+      METRICS_PORT: "9090"
+      LOG_LEVEL: debug
+      ENVIRONMENT: development
+
+      # The runtime app role — delegation_app has no BYPASSRLS, so Row-
+      # Level Security is actually enforced even in this dev stack. The
+      # binary self-migrates at startup (postgres.Migrate, LLD §7.4/§16.4)
+      # using MIGRATION_DATABASE_URL below, then opens its runtime pool
+      # against DATABASE_URL — there is no separate migrate service/Job
+      # here, matching how it runs in production.
+      DATABASE_URL: postgres://delegation_app:delegation_app_dev_password@postgres:5432/delegation?sslmode=disable
+      # BYPASSRLS role used ONLY for the startup migration run.
+      MIGRATION_DATABASE_URL: postgres://delegation:delegation@postgres:5432/delegation?sslmode=disable
+      DATABASE_LOGICAL_NAME: delegation
+      PG_MAX_CONNS: "10"
+      PG_MIN_CONNS: "2"
+      PG_SLOW_QUERY_THRESHOLD: 200ms
+
+      VALKEY_ADDR: valkey:6379
+      VALKEY_PASSWORD: ""
+      CACHE_KEYSPACE: "del:"
+      CACHE_LIST_TTL_SECONDS: "60"
+      CACHE_IDEMPOTENCY_TTL_SECONDS: "86400"
+
+      # DEL-6 availability-first coordination — not part of this compose
+      # stack; run iam-user-profile separately and point this at it, or a
+      # stub, or accept DEL-6's deferred-and-retry degraded path.
+      USER_PROFILE_BASE_URL: http://host.docker.internal:8080
+      USER_PROFILE_TIMEOUT_MS: "3000"
+
+      # The two synchronous grant-time membership-existence checks (DLG-D3,
+      # LLD §7.6.2) — not part of this compose stack either; run
+      # iam-org-membership separately and point this at it.
+      ORG_MEMBERSHIP_BASE_URL: http://host.docker.internal:8081
+      ORG_MEMBERSHIP_MEMBERSHIP_CHECK_TIMEOUT_MS: "3000"
+
+      POLICY_DEFAULT_MAX_DURATION_DAYS: "90"
+      POLICY_DEFAULT_REVIEW_WINDOW_DAYS: "90"
+      REVIEW_WARN_EARLY_DAYS: "7"
+      REVIEW_WARN_LATE_DAYS: "3"
+
+      EVENTS_TOPIC: iam-delegation-events
+      EVENTS_SOURCE: iam-delegation
+
+      # LocalStack — container-internal port is always 4566 regardless of
+      # the host-side mapping above. AWS_ENDPOINT_URL is honored
+      # automatically by aws-sdk-go-v2's default config loader; no code
+      # change is needed to redirect SNS/SQS calls here instead of real AWS.
+      SQS_QUEUE_URL: http://localstack:4566/000000000000/delegation-cascade-q
+      SQS_DLQ_URL: http://localstack:4566/000000000000/delegation-cascade-q-dlq
+      SQS_CONCURRENCY: "4"
+      AWS_REGION: us-east-1
+      AWS_ENDPOINT_URL: http://localstack:4566
+      # Dummy static credentials — required so the SDK's credential chain
+      # resolves from these env vars instead of falling through to the
+      # EC2 IMDS provider, which would otherwise retry against
+      # 169.254.169.254 (unreachable outside EC2) and fail with
+      # "no EC2 IMDS role found ... host is down".
+      AWS_ACCESS_KEY_ID: localstack
+      AWS_SECRET_ACCESS_KEY: localstack
+
+      # OTLP/gRPC (platform-gincommon's ObservabilityMiddlewares) — not the
+      # legacy OTLP/HTTP port 4318 some sibling services' compose files use.
+      OTEL_EXPORTER_OTLP_ENDPOINT: otel-collector:4317
+
+      DOCS_ENABLED: "false"
+    restart: unless-stopped
+
+volumes:
+  postgres-data:
+  localstack-data:

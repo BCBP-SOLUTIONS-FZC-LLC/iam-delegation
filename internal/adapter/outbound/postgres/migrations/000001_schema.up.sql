@@ -1,0 +1,264 @@
+-- Delegation Service schema (LLD §7.1-§7.6). One consolidated migration:
+-- extensions, enums, both tenant tables, processed_events, the three-function
+-- fail-closed RLS design (mirroring iam-user-profile's
+-- app_tenant_id()/rls_check_tenant()/log_rls_violation()/rls_violation_log
+-- pattern, NOT iam-tender-acl's simpler plain-policy pattern), the touch_row()
+-- trigger, and the delegation_app / delegation_migrator roles.
+
+-- ── Extensions ────────────────────────────────────────────────────────────
+CREATE EXTENSION IF NOT EXISTS pgcrypto WITH SCHEMA public;
+
+-- ── Enum types (LLD §7.1) ─────────────────────────────────────────────────
+CREATE TYPE public.delegation_scope  AS ENUM ('all', 'department', 'tender');
+CREATE TYPE public.delegation_status AS ENUM ('active', 'ended', 'cancelled');
+
+-- ── app_tenant_id() ───────────────────────────────────────────────────────
+-- Reads the tenant GUC set by the pgcommon GUC bridge. STABLE (evaluates
+-- once per statement), SECURITY DEFINER (invoker cannot poison the search
+-- path), fail-closed (returns NULL on any error so RLS blocks rather than
+-- silently opens).
+CREATE OR REPLACE FUNCTION public.app_tenant_id() RETURNS uuid
+    LANGUAGE plpgsql STABLE SECURITY DEFINER AS $$
+DECLARE v text;
+BEGIN
+    v := current_setting('app.tenant_id', true);
+    IF v IS NULL OR v = '' THEN RETURN NULL; END IF;
+    RETURN v::uuid;
+EXCEPTION WHEN OTHERS THEN RETURN NULL;
+END;
+$$;
+
+-- ── delegations (LLD §7.2.1) ──────────────────────────────────────────────
+-- From O&M, with the three cross-database FKs removed and
+-- review_notice_sent_at replaced by review_last_warned_bucket (DLG-Q6): an
+-- int (7|3|NULL) rather than a timestamp — which review notice fired this
+-- cycle, reset to NULL on extend/reassign to re-arm both warnings.
+CREATE TABLE public.delegations (
+    id                        uuid NOT NULL DEFAULT gen_random_uuid(),
+    tenant_id                 uuid NOT NULL,
+    delegator_id              uuid NOT NULL,
+    delegate_id               uuid NOT NULL,
+    delegator_membership_id   uuid NOT NULL, -- composite-FK anchor (delegator); FK dropped on split (LLD §7.6.1)
+    delegate_membership_id    uuid NOT NULL, -- composite-FK anchor (delegate);  FK dropped on split (LLD §7.6.1)
+    scope                     public.delegation_scope NOT NULL DEFAULT 'all',
+    scope_id                  uuid,
+    reason                    text,
+    starts_at                 timestamp with time zone NOT NULL DEFAULT now(),
+    ends_at                   timestamp with time zone,          -- NULL = open-ended (DEL-8)
+    review_due_at             timestamp with time zone,          -- open-ended only (DEL-13)
+    review_last_warned_bucket int,                                -- 7 | 3 | NULL — which review notice fired this cycle (DLG-Q6)
+    review_window_days        int,                                -- per-delegation override (DEL-14)
+    status                    public.delegation_status NOT NULL DEFAULT 'active',
+    record_version            bigint NOT NULL DEFAULT 1,
+    created_at                timestamp with time zone NOT NULL DEFAULT now(),
+    updated_at                timestamp with time zone NOT NULL DEFAULT now(),
+    deleted_at                timestamp with time zone,
+    CONSTRAINT delegations_pkey                     PRIMARY KEY (id),
+    CONSTRAINT delegations_record_version_check     CHECK (record_version > 0),
+    CONSTRAINT chk_review_last_warned_bucket         CHECK (review_last_warned_bucket IS NULL OR review_last_warned_bucket IN (7, 3)),
+    CONSTRAINT chk_review_window_days                CHECK (review_window_days IS NULL OR review_window_days BETWEEN 1 AND 180),
+    CONSTRAINT chk_scope_id CHECK (
+        (scope = 'all' AND scope_id IS NULL)
+        OR (scope IN ('department', 'tender') AND scope_id IS NOT NULL)
+    ),
+    CONSTRAINT chk_no_self_delegate  CHECK (delegator_id <> delegate_id),
+    CONSTRAINT chk_ends_after_starts CHECK (ends_at IS NULL OR ends_at > starts_at)
+);
+
+-- Five partial indexes exactly per LLD §7.2.1.
+CREATE INDEX idx_delegations_tenant     ON public.delegations (tenant_id)               WHERE deleted_at IS NULL AND status = 'active';
+CREATE INDEX idx_delegations_delegator  ON public.delegations (tenant_id, delegator_id) WHERE deleted_at IS NULL AND status = 'active';
+CREATE INDEX idx_delegations_delegate   ON public.delegations (tenant_id, delegate_id)  WHERE deleted_at IS NULL AND status = 'active';
+CREATE INDEX idx_delegations_ends_at    ON public.delegations (ends_at)                 WHERE deleted_at IS NULL AND status = 'active' AND ends_at IS NOT NULL;
+CREATE INDEX idx_delegations_review_due ON public.delegations (review_due_at)           WHERE ends_at IS NULL AND status = 'active';
+
+-- ── delegation_tenant_settings (LLD §7.2.2, DLG-D2) ──────────────────────
+-- Relocated from Core's tenants.delegation_max_duration_days /
+-- delegation_review_window_days columns. A tenant with no row uses the
+-- 90/90 defaults (lazily created on first DLG-7 write).
+CREATE TABLE public.delegation_tenant_settings (
+    tenant_id          uuid NOT NULL,
+    max_duration_days  int NOT NULL DEFAULT 90,
+    review_window_days int NOT NULL DEFAULT 90,
+    record_version     bigint NOT NULL DEFAULT 1,
+    created_at         timestamp with time zone NOT NULL DEFAULT now(),
+    updated_at         timestamp with time zone NOT NULL DEFAULT now(),
+    CONSTRAINT delegation_tenant_settings_pkey                 PRIMARY KEY (tenant_id),
+    CONSTRAINT delegation_tenant_settings_record_version_check CHECK (record_version > 0),
+    CONSTRAINT chk_dts_max_duration_days                       CHECK (max_duration_days BETWEEN 1 AND 180),
+    CONSTRAINT chk_dts_review_window_days                      CHECK (review_window_days BETWEEN 1 AND 180)
+);
+
+-- ── processed_events (LLD §7.2.3) ─────────────────────────────────────────
+-- Idempotency ledger for the inbound cascade consumer
+-- (consumer ∈ {cascade, offboarding}). Exempt from RLS (operational).
+-- Monthly-pruned (LLD §18.4).
+CREATE TABLE public.processed_events (
+    event_id     text NOT NULL,
+    consumer     text NOT NULL,
+    processed_at timestamp with time zone NOT NULL DEFAULT now(),
+    CONSTRAINT processed_events_pkey PRIMARY KEY (event_id, consumer)
+);
+
+-- ── rls_violation_log (sampled audit trail) ───────────────────────────────
+-- RLS is DISABLED on this table (below) so log_rls_violation() — which
+-- fires inside an RLS-check context — cannot recurse into itself.
+CREATE TABLE public.rls_violation_log (
+    id                bigserial PRIMARY KEY,
+    table_name        text NOT NULL,
+    row_tenant_id     uuid,
+    app_tenant_id     uuid,
+    violation_type    text NOT NULL,
+    user_id           uuid,
+    session_role      text DEFAULT SESSION_USER,
+    client_addr       inet DEFAULT inet_client_addr(),
+    application_name  text DEFAULT current_setting('application_name', true),
+    query_text        text,
+    occurred_at       timestamp with time zone NOT NULL DEFAULT now()
+);
+
+-- ── touch_row() trigger (LLD §7.5, TRG-1…3) ──────────────────────────────
+-- The trigger — not application code — owns both updated_at and
+-- record_version; the WHEN guard means a no-op UPDATE does not churn the
+-- version (TRG-3).
+CREATE OR REPLACE FUNCTION public.touch_row() RETURNS trigger
+    LANGUAGE plpgsql AS $$
+BEGIN
+    NEW.updated_at     := now();
+    NEW.record_version := OLD.record_version + 1;
+    RETURN NEW;
+END;
+$$;
+
+CREATE TRIGGER trg_touch_delegations
+    BEFORE UPDATE ON public.delegations
+    FOR EACH ROW WHEN (OLD.* IS DISTINCT FROM NEW.*)
+    EXECUTE FUNCTION public.touch_row();
+
+CREATE TRIGGER trg_touch_delegation_tenant_settings
+    BEFORE UPDATE ON public.delegation_tenant_settings
+    FOR EACH ROW WHEN (OLD.* IS DISTINCT FROM NEW.*)
+    EXECUTE FUNCTION public.touch_row();
+
+-- ── Row-Level Security (LLD §7.3) ─────────────────────────────────────────
+--
+-- Two functions:
+--   log_rls_violation — SECURITY DEFINER, 1% sampled INSERT into
+--       rls_violation_log. Silently swallows its own errors so a logging
+--       failure can never abort the caller's transaction.
+--   rls_check_tenant — STABLE STRICT SECURITY DEFINER, returns true when the
+--       row's tenant_id matches app.tenant_id GUC. Logs one of two violation
+--       types on failure:
+--         • missing_or_invalid_guc — no GUC set / malformed UUID
+--         • cross_tenant_access    — GUC present but points at a different tenant
+--
+-- Policies use rls_check_tenant in USING (reads gated + logged) and a plain
+-- tenant_id = app_tenant_id() comparison in WITH CHECK (writes gated,
+-- LLD §7.3) so a row can never be written into another tenant. ENABLE +
+-- FORCE means even the table owner cannot bypass RLS without an explicit
+-- BYPASSRLS role.
+--
+-- rls_violation_log itself has RLS DISABLED — required so log_rls_violation
+-- (invoked from an RLS-check context) cannot recurse into itself.
+
+CREATE OR REPLACE FUNCTION public.log_rls_violation(
+    p_table_name     text,
+    p_row_tenant_id  uuid,
+    p_violation_type text
+) RETURNS void
+    LANGUAGE plpgsql SECURITY DEFINER
+    SET search_path = public AS $$
+BEGIN
+    IF random() > 0.01 THEN RETURN; END IF;
+    INSERT INTO rls_violation_log (
+        table_name, row_tenant_id, app_tenant_id, violation_type, query_text
+    ) VALUES (
+        p_table_name, p_row_tenant_id, app_tenant_id(), p_violation_type, current_query()
+    );
+EXCEPTION WHEN OTHERS THEN
+    NULL; -- logging failure must never abort the caller's transaction
+END;
+$$;
+
+CREATE OR REPLACE FUNCTION public.rls_check_tenant(
+    p_tenant_id  uuid,
+    p_table_name text
+) RETURNS boolean
+    LANGUAGE plpgsql STABLE STRICT SECURITY DEFINER
+    SET search_path = public AS $$
+DECLARE
+    v_app uuid;
+BEGIN
+    v_app := app_tenant_id();
+    IF v_app IS NULL THEN
+        PERFORM log_rls_violation(p_table_name, p_tenant_id, 'missing_or_invalid_guc');
+        RETURN false;
+    END IF;
+    IF p_tenant_id <> v_app THEN
+        PERFORM log_rls_violation(p_table_name, p_tenant_id, 'cross_tenant_access');
+        RETURN false;
+    END IF;
+    RETURN true;
+END;
+$$;
+
+-- ── ENABLE + FORCE RLS on both tenant-scoped tables ───────────────────────
+ALTER TABLE public.delegations                 ENABLE ROW LEVEL SECURITY;
+ALTER TABLE public.delegations                 FORCE  ROW LEVEL SECURITY;
+ALTER TABLE public.delegation_tenant_settings  ENABLE ROW LEVEL SECURITY;
+ALTER TABLE public.delegation_tenant_settings  FORCE  ROW LEVEL SECURITY;
+
+-- Explicitly REVOKE from PUBLIC so a mis-provisioned role cannot silently
+-- read tenant tables without going through the policy.
+REVOKE ALL ON public.delegations, public.delegation_tenant_settings FROM PUBLIC;
+
+-- ── Policies ─────────────────────────────────────────────────────────────
+CREATE POLICY delegations_rls ON public.delegations
+    USING      (rls_check_tenant(tenant_id, 'delegations'))
+    WITH CHECK (tenant_id = app_tenant_id());
+
+CREATE POLICY delegation_tenant_settings_rls ON public.delegation_tenant_settings
+    USING      (rls_check_tenant(tenant_id, 'delegation_tenant_settings'))
+    WITH CHECK (tenant_id = app_tenant_id());
+
+-- ── rls_violation_log: RLS DISABLED to prevent recursion ─────────────────
+ALTER TABLE public.rls_violation_log DISABLE ROW LEVEL SECURITY;
+ALTER TABLE public.rls_violation_log NO FORCE ROW LEVEL SECURITY;
+
+-- ── Roles (LLD §7.3/§7.4) ─────────────────────────────────────────────────
+-- delegation_app: the runtime role. Never holds BYPASSRLS (RLS-4) — every
+-- statement it issues is subject to FORCE ROW LEVEL SECURITY.
+DO $$
+BEGIN
+    IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'delegation_app') THEN
+        -- Dev-only password; production deployments rotate this out of band,
+        -- never by editing this checked-in migration.
+        CREATE ROLE delegation_app LOGIN PASSWORD 'delegation_app_dev_password' NOBYPASSRLS;
+    END IF;
+END
+$$;
+
+GRANT USAGE ON SCHEMA public TO delegation_app;
+GRANT SELECT, INSERT, UPDATE, DELETE ON
+    public.delegations,
+    public.delegation_tenant_settings,
+    public.processed_events
+    TO delegation_app;
+GRANT EXECUTE ON FUNCTION public.app_tenant_id()                     TO delegation_app;
+GRANT EXECUTE ON FUNCTION public.log_rls_violation(text, uuid, text) TO delegation_app;
+GRANT EXECUTE ON FUNCTION public.rls_check_tenant(uuid, text)        TO delegation_app;
+
+-- delegation_migrator: applies schema migrations and backs the reconciler
+-- jobs / cascade consumer's cross-tenant reads (LLD §7.4). Holds BYPASSRLS.
+DO $$
+BEGIN
+    IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'delegation_migrator') THEN
+        CREATE ROLE delegation_migrator LOGIN PASSWORD 'delegation_migrator_dev_password';
+    END IF;
+END
+$$;
+
+ALTER ROLE delegation_migrator BYPASSRLS;
+GRANT ALL PRIVILEGES ON SCHEMA public TO delegation_migrator;
+GRANT ALL PRIVILEGES ON ALL TABLES IN SCHEMA public TO delegation_migrator;
+GRANT ALL PRIVILEGES ON ALL SEQUENCES IN SCHEMA public TO delegation_migrator;

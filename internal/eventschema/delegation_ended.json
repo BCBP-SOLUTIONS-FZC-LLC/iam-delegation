@@ -1,0 +1,47 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "DelegationEndedPayload",
+  "description": "Payload of the DelegationEnded event (LLD §10.3/§10.5). Fires on every end path — cancel, ends_at expiry, review auto-end, delegate-removed cascade (DLG-EVT-3) — never path-dependent. The delegator-side removal ends silently, no event (DEL-7/DLG-EVT-4).",
+  "type": "object",
+  "required": [
+    "delegation_id",
+    "delegator_id",
+    "delegate_id",
+    "ended_reason"
+  ],
+  "additionalProperties": true,
+  "properties": {
+    "delegation_id": {
+      "type": "string",
+      "format": "uuid"
+    },
+    "tenant_id": {
+      "type": "string",
+      "format": "uuid"
+    },
+    "delegator_id": {
+      "type": "string",
+      "format": "uuid"
+    },
+    "delegate_id": {
+      "type": "string",
+      "format": "uuid"
+    },
+    "scope": {
+      "type": "string",
+      "enum": ["all", "department", "tender"]
+    },
+    "scope_id": {
+      "type": "string",
+      "format": "uuid"
+    },
+    "ended_reason": {
+      "type": "string",
+      "enum": ["expired", "cancelled", "delegate_removed", "review_expired"]
+    },
+    "actor_id": {
+      "type": "string",
+      "format": "uuid"
+    }
+  }
+}

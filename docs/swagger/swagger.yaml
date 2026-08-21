@@ -1,0 +1,616 @@
+definitions:
+  gincommon.ErrorResponse:
+    properties:
+      error:
+        type: string
+      request_id:
+        type: string
+      status:
+        type: integer
+      trace_id:
+        type: string
+    type: object
+  http.ActiveDelegationView:
+    properties:
+      delegate_id:
+        type: string
+      delegation_id:
+        type: string
+      delegator_id:
+        type: string
+      ends_at:
+        type: string
+      scope:
+        type: string
+      scope_id:
+        format: uuid
+        type: string
+    type: object
+  http.ActiveDelegationsResponse:
+    properties:
+      active_delegations:
+        items:
+          $ref: '#/definitions/http.ActiveDelegationView'
+        type: array
+    type: object
+  http.DelegationCreateRequest:
+    properties:
+      delegate_id:
+        type: string
+      ends_at:
+        type: string
+      ooo_note:
+        type: string
+      scope:
+        type: string
+      scope_id:
+        format: uuid
+        type: string
+      starts_at:
+        type: string
+    type: object
+  http.DelegationExtendRequest:
+    properties:
+      extend_days:
+        type: integer
+      record_version:
+        type: integer
+    type: object
+  http.DelegationExtendResponse:
+    properties:
+      delegation_id:
+        type: string
+      review_due_at:
+        type: string
+      review_last_warned_bucket:
+        type: integer
+    type: object
+  http.DelegationListResponse:
+    properties:
+      items:
+        items:
+          $ref: '#/definitions/http.DelegationResponse'
+        type: array
+    type: object
+  http.DelegationReassignRequest:
+    properties:
+      ends_at:
+        type: string
+      new_delegate_id:
+        format: uuid
+        type: string
+      reason:
+        type: string
+      record_version:
+        type: integer
+      scope:
+        type: string
+      scope_id:
+        format: uuid
+        type: string
+    type: object
+  http.DelegationResponse:
+    properties:
+      delegate_id:
+        type: string
+      delegation_id:
+        type: string
+      delegator_id:
+        type: string
+      ends_at:
+        type: string
+      record_version:
+        type: integer
+      review_due_at:
+        type: string
+      review_last_warned_bucket:
+        type: integer
+      review_window_days:
+        type: integer
+      scope:
+        type: string
+      scope_id:
+        format: uuid
+        type: string
+      starts_at:
+        type: string
+      status:
+        type: string
+    type: object
+  http.DeptDelegateResponse:
+    properties:
+      delegate_id:
+        format: uuid
+        type: string
+      delegation_id:
+        format: uuid
+        type: string
+      delegator_id:
+        format: uuid
+        type: string
+      found:
+        type: boolean
+    type: object
+  http.ExpiryRunResponse:
+    properties:
+      attempted:
+        type: integer
+      failed:
+        type: integer
+      succeeded:
+        type: integer
+    type: object
+  http.ReviewSweepRunResponse:
+    properties:
+      deferred:
+        type: integer
+      expired:
+        type: integer
+      warned_3d:
+        type: integer
+      warned_7d:
+        type: integer
+    type: object
+  http.SettingsResponse:
+    properties:
+      max_duration_days:
+        type: integer
+      record_version:
+        type: integer
+      review_window_days:
+        type: integer
+    type: object
+  http.SettingsSetRequest:
+    properties:
+      max_duration_days:
+        type: integer
+      review_window_days:
+        type: integer
+    type: object
+info:
+  contact:
+    name: BCBP Solutions
+  description: |-
+    The system of record for out-of-office (OOO) delegations — time-bounded grants that drive workflow rerouting. Extracted from iam-org-membership per ADR-0008 (Option C), the fourth and last O&M decomposition wave.
+
+    **Route prefixes.**  `/api/v1/delegations*` — tenant callers (self or `tenant_admin`/`tenant_owner` via `x-tenant-roles`, gateway-injected identity).  `/internal/*` — in-mesh service-to-service, mTLS trust boundary only, no RBAC/JWT check at all (LLD §8.2/§13.2).
+
+    DLG-2 (create) requires an `Idempotency-Key` header; a repeated key within 24h returns the original 201 rather than creating a second delegation (DLG-D8).
+  license:
+    name: Proprietary
+  title: Delegation Service API
+  version: "1.0"
+paths:
+  /api/v1/delegations:
+    get:
+      description: Returns the caller's own active delegations (RLS-scoped, LLD §9.1).
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            $ref: '#/definitions/http.DelegationListResponse'
+        "401":
+          description: Unauthorized
+          schema:
+            $ref: '#/definitions/gincommon.ErrorResponse'
+      security:
+      - UserID: []
+      - TenantID: []
+      - TenantRoles: []
+      summary: DLG-1 — List active delegations
+      tags:
+      - delegations
+    post:
+      consumes:
+      - application/json
+      description: 'Availability-first (LLD §11.1): calls User Profile SetAvailability
+        BEFORE inserting the delegations row. Requires the Idempotency-Key header
+        (DLG-Q3) — a repeat within 24h returns the original 201.'
+      parameters:
+      - description: Idempotency key, required
+        in: header
+        name: Idempotency-Key
+        required: true
+        type: string
+      - description: Delegation payload
+        in: body
+        name: request
+        required: true
+        schema:
+          $ref: '#/definitions/http.DelegationCreateRequest'
+      produces:
+      - application/json
+      responses:
+        "201":
+          description: Created
+          schema:
+            $ref: '#/definitions/http.DelegationResponse'
+        "400":
+          description: Bad Request
+          schema:
+            $ref: '#/definitions/gincommon.ErrorResponse'
+        "422":
+          description: self_delegation | invalid_delegate | delegate_unavailable |
+            scope_id_required | invalid_scope_id | reason_too_long | delegation_window_inverted
+            | delegation_window_too_long | delegation_start_in_past | delegation_start_too_far_future
+          schema:
+            $ref: '#/definitions/gincommon.ErrorResponse'
+        "503":
+          description: org_membership_unavailable | user_profile_unavailable
+          schema:
+            $ref: '#/definitions/gincommon.ErrorResponse'
+      security:
+      - UserID: []
+      - TenantID: []
+      - TenantRoles: []
+      summary: DLG-2 — Create OOO delegation
+      tags:
+      - delegations
+  /api/v1/delegations/{id}:
+    delete:
+      description: 'Pointer-clear-only, fail-open on User Profile (LLD §11.2): calls
+        UP {delegate_id:null} first, then flips status to ''cancelled''. Self-service;
+        tenant_admin/tenant_owner can cancel any.'
+      parameters:
+      - description: Delegation UUID
+        format: uuid
+        in: path
+        name: id
+        required: true
+        type: string
+      - description: Optimistic-lock version
+        in: query
+        name: record_version
+        type: integer
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            $ref: '#/definitions/http.DelegationResponse'
+        "403":
+          description: Forbidden
+          schema:
+            $ref: '#/definitions/gincommon.ErrorResponse'
+        "404":
+          description: Not Found
+          schema:
+            $ref: '#/definitions/gincommon.ErrorResponse'
+        "409":
+          description: optimistic_lock_conflict
+          schema:
+            $ref: '#/definitions/gincommon.ErrorResponse'
+      security:
+      - UserID: []
+      - TenantID: []
+      - TenantRoles: []
+      summary: DLG-3 — Cancel delegation
+      tags:
+      - delegations
+  /api/v1/delegations/{id}/extend:
+    post:
+      consumes:
+      - application/json
+      description: Pushes review_due_at forward and resets review_last_warned_bucket
+        to NULL, re-arming both 7d/3d warnings. Open-ended delegations only (422 not_review_tracked
+        otherwise).
+      parameters:
+      - description: Delegation UUID
+        format: uuid
+        in: path
+        name: id
+        required: true
+        type: string
+      - description: extend_days + record_version
+        in: body
+        name: request
+        required: true
+        schema:
+          $ref: '#/definitions/http.DelegationExtendRequest'
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            $ref: '#/definitions/http.DelegationExtendResponse'
+        "403":
+          description: Forbidden
+          schema:
+            $ref: '#/definitions/gincommon.ErrorResponse'
+        "404":
+          description: Not Found
+          schema:
+            $ref: '#/definitions/gincommon.ErrorResponse'
+        "409":
+          description: optimistic_lock_conflict
+          schema:
+            $ref: '#/definitions/gincommon.ErrorResponse'
+        "422":
+          description: not_review_tracked | extend_days_out_of_range
+          schema:
+            $ref: '#/definitions/gincommon.ErrorResponse'
+      security:
+      - UserID: []
+      - TenantID: []
+      - TenantRoles: []
+      summary: DLG-4 — Extend delegation review window
+      tags:
+      - delegations
+  /api/v1/delegations/{id}/reassign:
+    post:
+      consumes:
+      - application/json
+      description: Ends the current delegation (DelegationEnded{cancelled}) then creates
+        a new one via the full DLG-2 pre-flight, including both membership checks.
+        All body fields optional, each defaulting to the current delegation's value.
+        On a Create failure after the old one is ended, the old delegation is NOT
+        resurrected.
+      parameters:
+      - description: Delegation UUID
+        format: uuid
+        in: path
+        name: id
+        required: true
+        type: string
+      - description: Reassignment payload
+        in: body
+        name: request
+        required: true
+        schema:
+          $ref: '#/definitions/http.DelegationReassignRequest'
+      produces:
+      - application/json
+      responses:
+        "201":
+          description: Created
+          schema:
+            $ref: '#/definitions/http.DelegationResponse'
+        "400":
+          description: Bad Request
+          schema:
+            $ref: '#/definitions/gincommon.ErrorResponse'
+        "403":
+          description: Forbidden
+          schema:
+            $ref: '#/definitions/gincommon.ErrorResponse'
+        "404":
+          description: Not Found
+          schema:
+            $ref: '#/definitions/gincommon.ErrorResponse'
+        "422":
+          description: invalid_delegate | delegate_unavailable | self_delegation |
+            scope_id_required | invalid_scope_id
+          schema:
+            $ref: '#/definitions/gincommon.ErrorResponse'
+      security:
+      - UserID: []
+      - TenantID: []
+      - TenantRoles: []
+      summary: DLG-5 — Reassign delegation to a new delegate
+      tags:
+      - delegations
+  /api/v1/delegations/settings:
+    get:
+      description: Returns the 90/90 default when the tenant has no persisted delegation_tenant_settings
+        row.
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            $ref: '#/definitions/http.SettingsResponse'
+        "401":
+          description: Unauthorized
+          schema:
+            $ref: '#/definitions/gincommon.ErrorResponse'
+      security:
+      - UserID: []
+      - TenantID: []
+      - TenantRoles: []
+      summary: DLG-6 — Get tenant delegation policy
+      tags:
+      - delegations
+    put:
+      consumes:
+      - application/json
+      description: Both fields required, each in [1,180]. Upserts the tenant's delegation_tenant_settings
+        row.
+      parameters:
+      - description: Policy payload
+        in: body
+        name: request
+        required: true
+        schema:
+          $ref: '#/definitions/http.SettingsSetRequest'
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            $ref: '#/definitions/http.SettingsResponse'
+        "400":
+          description: invalid_delegation_max_duration_days | invalid_delegation_review_window_days
+          schema:
+            $ref: '#/definitions/gincommon.ErrorResponse'
+        "403":
+          description: Forbidden
+          schema:
+            $ref: '#/definitions/gincommon.ErrorResponse'
+      security:
+      - UserID: []
+      - TenantID: []
+      - TenantRoles: []
+      summary: DLG-7 — Set tenant delegation policy
+      tags:
+      - delegations
+  /asyncapi:
+    get:
+      produces:
+      - text/html
+      responses:
+        "200":
+          description: HTML page
+          schema:
+            type: string
+      summary: AsyncAPI catalog viewer
+      tags:
+      - infra
+  /asyncapi.yaml:
+    get:
+      produces:
+      - application/yaml
+      responses:
+        "200":
+          description: AsyncAPI YAML
+          schema:
+            type: string
+      summary: Raw AsyncAPI spec
+      tags:
+      - infra
+  /internal/delegations/dept-delegate:
+    get:
+      description: Mesh-only. Backs Core's synchronous removal-gate call (LLD §11.5)
+        — never 404; found:false is the valid "no active department delegation" answer.
+      parameters:
+      - description: Tenant UUID
+        format: uuid
+        in: query
+        name: tenant_id
+        required: true
+        type: string
+      - description: User UUID
+        format: uuid
+        in: query
+        name: user_id
+        required: true
+        type: string
+      - description: Department UUID
+        format: uuid
+        in: query
+        name: dept_id
+        required: true
+        type: string
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            $ref: '#/definitions/http.DeptDelegateResponse'
+        "400":
+          description: Bad Request
+          schema:
+            $ref: '#/definitions/gincommon.ErrorResponse'
+      summary: DLG-I3 — Find the active department-scope delegate for a user
+      tags:
+      - internal
+  /internal/delegations/expire:
+    post:
+      description: Mesh-only. Ends every active fixed-ends_at delegation whose window
+        has passed, UP pointer-clear first (fail-open per-row, DEL-6).
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            $ref: '#/definitions/http.ExpiryRunResponse'
+        "500":
+          description: Internal Server Error
+          schema:
+            $ref: '#/definitions/gincommon.ErrorResponse'
+      summary: DLG-I1 — Run the delegation-expiry sweep
+      tags:
+      - internal
+  /internal/delegations/review-sweep:
+    post:
+      description: Mesh-only. Dual 7d/3d warn passes over open-ended delegations,
+        then an auto-end pass for those whose review_due_at has passed.
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            $ref: '#/definitions/http.ReviewSweepRunResponse'
+        "500":
+          description: Internal Server Error
+          schema:
+            $ref: '#/definitions/gincommon.ErrorResponse'
+      summary: DLG-I2 — Run the delegation review-window sweep
+      tags:
+      - internal
+  /internal/users/{id}/active-delegations:
+    get:
+      description: Mesh-only. Returns the delegations the given user has handed out
+        (delegator side, active).
+      parameters:
+      - description: User UUID
+        format: uuid
+        in: path
+        name: id
+        required: true
+        type: string
+      - description: Tenant UUID
+        format: uuid
+        in: query
+        name: tenant_id
+        required: true
+        type: string
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            $ref: '#/definitions/http.ActiveDelegationsResponse'
+        "400":
+          description: Bad Request
+          schema:
+            $ref: '#/definitions/gincommon.ErrorResponse'
+      summary: DLG-I4 — List a user's active outbound delegations
+      tags:
+      - internal
+  /readyz:
+    get:
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            additionalProperties: true
+            type: object
+        "503":
+          description: Service Unavailable
+          schema:
+            additionalProperties: true
+            type: object
+      summary: Readiness check
+      tags:
+      - infra
+securityDefinitions:
+  TenantID:
+    description: Tenant UUID injected by the API gateway.
+    in: header
+    name: x-tenant-id
+    type: apiKey
+  TenantRoles:
+    description: Comma-separated tenant-role list injected by the API gateway. DLG-3/4/5
+      accept self or tenant_admin/tenant_owner; DLG-7 requires tenant_admin/tenant_owner.
+    in: header
+    name: x-tenant-roles
+    type: apiKey
+  UserID:
+    description: Authenticated user UUID injected by the API gateway. Required on
+      /api/v1/* routes only — /internal/* is mesh-only and carries no identity headers.
+    in: header
+    name: x-user-id
+    type: apiKey
+swagger: "2.0"

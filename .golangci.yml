@@ -1,0 +1,160 @@
+# golangci-lint v2 config (run via `go tool golangci-lint`, see go.mod's
+# tool directive and Makefile's `lint` target). Auto-migrated from the
+# v1 schema with `golangci-lint migrate`; see .golangci.v1.yml.bak for the
+# original if any settings need re-checking.
+version: "2"
+run:
+  timeout: 5m
+  modules-download-mode: readonly
+  tests: true
+output:
+  formats:
+    text:
+      path: stdout
+      print-linter-name: true
+      print-issued-lines: true
+linters:
+  default: none
+  enable:
+    - bodyclose
+    - contextcheck
+    - errcheck
+    - exhaustive
+    - gocritic
+    - gosec
+    - govet
+    - ineffassign
+    - misspell
+    - noctx
+    - nolintlint
+    - revive
+    - sqlclosecheck
+    - staticcheck
+    - unconvert
+    - unparam
+    - unused
+  settings:
+    errcheck:
+      check-type-assertions: true
+      check-blank: true
+    exhaustive:
+      check:
+        - switch
+        - map
+      default-signifies-exhaustive: true
+    gocritic:
+      disabled-checks:
+        - hugeParam
+        - rangeValCopy
+      enabled-tags:
+        - diagnostic
+        - style
+        - performance
+    gosec:
+      excludes:
+        - G601
+      config:
+        G101:
+          ignore_entropy: false
+    govet:
+      disable:
+        - fieldalignment
+        # `err := ...` re-declared in a new `if`/`for` scope after an outer
+        # `err` already exists is idiomatic, pervasive Go (main.go's linear
+        # sequence of `x, err := f()` steps; handlers' per-branch error
+        # checks) — shadow's signal-to-noise ratio here is poor enough that
+        # even the Go team's own x/tools vet analyzers ship it disabled by
+        # default. Not disabling this would mean renaming ~17 well-scoped,
+        # correctly-checked-immediately `err` locals purely to satisfy the
+        # linter, which would reduce readability, not improve correctness.
+        - shadow
+      enable-all: true
+    misspell:
+      locale: US
+      ignore-rules:
+        # "cancelled" (double-L) is the LLD-mandated wire spelling for
+        # domain.DelegationCancelled / EndReasonCancelled and is used
+        # consistently in comments/tests describing that contract value
+        # across the codebase (see iam-lld-delegation-service.md §7.1/§20).
+        - cancelled
+    nolintlint:
+      require-explanation: true
+      require-specific: true
+      allow-unused: false
+    revive:
+      confidence: 0.8
+      severity: warning
+      rules:
+        - name: blank-imports
+        - name: context-as-argument
+        - name: error-return
+        - name: error-strings
+        - name: error-naming
+        - name: exported
+        - name: if-return
+        - name: increment-decrement
+        - name: var-naming
+        - name: var-declaration
+        - name: package-comments
+        - name: range
+        - name: receiver-naming
+        - name: time-naming
+        - name: unexported-return
+        - name: indent-error-flow
+        - name: errorf
+        - name: empty-block
+        - name: superfluous-else
+        - name: unused-parameter
+        - name: unreachable-code
+        - name: redefines-builtin-id
+    staticcheck:
+      checks:
+        - all
+    unparam:
+      check-exported: false
+  exclusions:
+    generated: lax
+    rules:
+      - linters:
+          - errcheck
+          - gosec
+          - unparam
+          - noctx
+          # unused-parameter (revive) fires ~70 times on table-driven test
+          # fakes/stubs whose interface-satisfying methods take a named
+          # `ctx`/`tenantID`/etc. they don't need to reference — naming
+          # them for readability at the call site is more valuable than
+          # renaming every one to `_`. httpNoBody/unnamedResult (gocritic)
+          # are pure style nits on httptest.NewRequest(..., nil) bodies and
+          # test-local multi-value helpers.
+          - revive
+          - gocritic
+        path: _test\.go
+      - linters:
+          - gosec
+        path: _test\.go
+        text: G104
+      - linters:
+          - gocritic
+          - revive
+          - staticcheck
+          - unused
+        path: (.+)_mock\.go|mocks/
+      - linters:
+          - revive
+        path: cmd/
+        text: package-comments
+    paths:
+      - migrations
+      - builtin$
+      - examples$
+issues:
+  max-issues-per-linter: 0
+  max-same-issues: 0
+  new: false
+formatters:
+  exclusions:
+    generated: lax
+    paths:
+      - builtin$
+      - examples$

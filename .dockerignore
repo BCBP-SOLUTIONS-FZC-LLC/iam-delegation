@@ -1,0 +1,14 @@
+.git
+.github
+.githooks
+.claude
+bin/
+.coverage/
+coverage.out
+coverage.html
+*.md
+docs/
+deploy/
+test/
+.env
+.env.example

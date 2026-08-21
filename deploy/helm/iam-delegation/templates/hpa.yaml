@@ -1,0 +1,54 @@
+{{- if .Values.autoscaling.enabled }}
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: {{ include "iam-delegation.fullname" . }}
+  labels:
+    {{- include "iam-delegation.labels" . | nindent 4 }}
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: {{ include "iam-delegation.fullname" . }}
+  minReplicas: {{ .Values.autoscaling.minReplicas }}
+  maxReplicas: {{ .Values.autoscaling.maxReplicas }}
+  metrics:
+    {{- if .Values.autoscaling.targetCPUUtilizationPercentage }}
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          averageUtilization: {{ .Values.autoscaling.targetCPUUtilizationPercentage }}
+    {{- end }}
+    {{- if .Values.autoscaling.targetMemoryUtilizationPercentage }}
+    - type: Resource
+      resource:
+        name: memory
+        target:
+          type: Utilization
+          averageUtilization: {{ .Values.autoscaling.targetMemoryUtilizationPercentage }}
+    {{- end }}
+    {{- if .Values.autoscaling.targetRPSPerReplica }}
+    # RPS-based scaling — mirrors iam-tender-acl's identical opt-in
+    # mechanism. PREREQUISITE: a prometheus-adapter rule exposing
+    # http_requests_per_second must be installed (see
+    # iam-tender-acl/deploy/monitoring/prometheus-adapter-rule.yaml for the
+    # reference ConfigMap this repo would need an equivalent of). Without
+    # it this metric is silently absent from the custom metrics API and HPA
+    # falls back to CPU/memory only.
+    #
+    # LLD §16.3 additionally calls for "HPA on delegation-cascade-q depth" —
+    # that requires a queue-depth-based scaler (e.g. KEDA) not modeled here;
+    # this scaffold only wires the CPU/memory/RPS mechanism iam-tender-acl
+    # already proved out. Layer in a ScaledObject/queue-depth trigger
+    # separately once that tooling is chosen.
+    - type: Pods
+      pods:
+        metric:
+          name: http_requests_per_second
+        target:
+          type: AverageValue
+          averageValue: {{ .Values.autoscaling.targetRPSPerReplica }}
+    {{- end }}
+{{- end }}
