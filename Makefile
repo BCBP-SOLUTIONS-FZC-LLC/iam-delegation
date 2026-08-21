@@ -170,6 +170,14 @@ help:
 	@echo "  make pin-base-images  - fetch + pin SHA digests for the Dockerfile's base images"
 	@echo "  make generate         - run any go:generate directives (currently none)"
 	@echo "  make clean            - remove build artifacts and coverage output"
+	@echo ""
+	@echo "Schema governance (platform-schemagov 0.4):"
+	@echo "  make schema-pull      - pull the schema-gov Docker image"
+	@echo "  make schema-validate  - validate AsyncAPI + event schemas — 8 passes (no AWS required)"
+	@echo "  make schema-diff      - diff two schema files: CURRENT=<path> PROPOSED=<path>"
+	@echo "  make schema-register  - register event schemas to Glue (requires AWS/LocalStack)"
+	@echo "  make schema-verify    - pre-deploy check: fail if PascalCase schemas are missing (requires AWS)"
+	@echo "  make schema-prune     - dry-run: list orphaned Glue schemas (requires AWS)"
 
 # -----------------------------
 # GO BASICS
@@ -362,8 +370,10 @@ migrate-create:
 #     handler functions via `make swag` — never hand-edited.
 #   - AsyncAPI (api/asyncapi.yaml) IS hand-maintained (LLD §10.3) — embedded
 #     via api/embed.go; keep it in sync with the actual event contract by
-#     hand when it changes. Validated structurally (not against a live
-#     registry — DLG-D15) by .github/workflows/schema-registry.yml.
+#     hand when it changes. Validated by platform-schemagov against a live
+#     Glue registry (DLG-D20, supersedes DLG-D15's CI-governance scope) by
+#     .github/workflows/schema-registry.yml — see the SCHEMA GOVERNANCE
+#     targets below.
 .PHONY: swag
 swag:
 	@echo "Generating Swagger docs..."
@@ -378,6 +388,112 @@ swag:
 .PHONY: swag-check
 swag-check:
 	bash .github/scripts/check-swagger-stale.sh
+
+# -----------------------------
+# SCHEMA GOVERNANCE
+# -----------------------------
+# Unlike iam-user-profile, api/asyncapi.yaml and internal/eventschema/*.json
+# are BOTH hand-maintained here (no extract-schemas step) — asyncapi.yaml is
+# not the generative source for the JSON files, so schema-validate does not
+# regenerate them first.
+SCHEMA_GOV_IMAGE ?= ghcr.io/bcbp-solutions-fzc-llc/platform-schemagov:0.4
+
+# schema-pull: pull the platform-schemagov Docker image.
+.PHONY: schema-pull
+schema-pull:
+	docker pull "$(SCHEMA_GOV_IMAGE)"
+
+# schema-validate: validate AsyncAPI spec + event schemas — 8 passes:
+# (1) structure, (2) draft-07, (3) enum drift, (4) lifecycle annotations,
+# (5) open-schema guard, (6) consumer strict-mode, (7) coverage, (8) AsyncAPI structure.
+# No AWS credentials needed.
+.PHONY: schema-validate
+schema-validate:
+	docker run --rm \
+	  -v "$(CURDIR)":/workspace \
+	  "$(SCHEMA_GOV_IMAGE)" validate \
+	  --asyncapi   api/asyncapi.yaml \
+	  --schema-dir internal/eventschema
+
+# schema-diff: show compatibility diff between two schema files.
+# Usage: make schema-diff CURRENT=<path-to-current.json> PROPOSED=<path-to-proposed.json>
+#        Optionally: SCHEMA_NAME=<name> (defaults to the PROPOSED filename stem)
+.PHONY: schema-diff
+schema-diff:
+	@test -n "$(CURRENT)" && test -n "$(PROPOSED)" || { \
+	  echo "Usage: make schema-diff CURRENT=<current.json> PROPOSED=<proposed.json> [SCHEMA_NAME=<name>]"; \
+	  exit 1; \
+	}
+	docker run --rm \
+	  -v "$(CURDIR)":/workspace \
+	  "$(SCHEMA_GOV_IMAGE)" diff \
+	  --current     "$(CURRENT)" \
+	  --proposed    "$(PROPOSED)" \
+	  --schema-name "$(or $(SCHEMA_NAME),$(notdir $(basename $(PROPOSED))))"
+
+# schema-prune: dry-run scan for orphaned Glue schemas (exist in Glue, not in repo).
+# Pass EXECUTE=true to archive and delete: make schema-prune EXECUTE=true
+# Requires GLUE_REGISTRY_NAME and AWS credentials.
+.PHONY: schema-prune
+schema-prune:
+	@test -n "$(GLUE_REGISTRY_NAME)" || { \
+	  echo "GLUE_REGISTRY_NAME is not set — add it to .env or pass on the command line"; \
+	  exit 1; \
+	}
+	docker run --rm \
+	  -v "$(CURDIR)":/workspace \
+	  -e AWS_ACCESS_KEY_ID \
+	  -e AWS_SECRET_ACCESS_KEY \
+	  -e AWS_SESSION_TOKEN \
+	  -e AWS_REGION="$(AWS_REGION)" \
+	  "$(SCHEMA_GOV_IMAGE)" prune \
+	  --registry   "$(GLUE_REGISTRY_NAME)" \
+	  $(if $(filter true,$(EXECUTE)),--execute,)
+
+# schema-register: register event schemas to Glue (requires AWS credentials or LocalStack).
+# Set AWS_ENDPOINT_URL=http://localhost:4566 in .env for LocalStack.
+.PHONY: schema-register
+schema-register:
+	@test -n "$(GLUE_REGISTRY_NAME)" || { \
+	  echo "GLUE_REGISTRY_NAME is not set — add it to .env or pass on the command line"; \
+	  exit 1; \
+	}
+	docker run --rm \
+	  -v "$(CURDIR)":/workspace \
+	  -e AWS_ACCESS_KEY_ID \
+	  -e AWS_SECRET_ACCESS_KEY \
+	  -e AWS_SESSION_TOKEN \
+	  -e AWS_REGION="$(AWS_REGION)" \
+	  -e AWS_ENDPOINT_URL="$(AWS_ENDPOINT_URL)" \
+	  "$(SCHEMA_GOV_IMAGE)" register \
+	  --registry   "$(GLUE_REGISTRY_NAME)" \
+	  --schema-dir internal/eventschema
+
+# schema-verify: fail if any of the three expected PascalCase schema names is
+# missing from the Glue registry. Names match the domain.EventDelegation*
+# constants (already PascalCase — no translation table needed, unlike
+# iam-user-profile). Surfaces a mismatch pre-deploy rather than at first-event
+# publish. Requires GLUE_REGISTRY_NAME and AWS credentials.
+.PHONY: schema-verify
+schema-verify:
+	@test -n "$(GLUE_REGISTRY_NAME)" || { \
+	  echo "GLUE_REGISTRY_NAME is not set — add it to .env or pass on the command line"; \
+	  exit 1; \
+	}
+	@missing=""; \
+	for name in DelegationStarted DelegationEnded DelegationReviewRequested; do \
+	  if ! aws glue get-schema \
+	      --schema-id "RegistryName=$(GLUE_REGISTRY_NAME),SchemaName=$$name" \
+	      --region "$(AWS_REGION)" >/dev/null 2>&1; then \
+	    missing="$$missing $$name"; \
+	  fi; \
+	done; \
+	if [ -n "$$missing" ]; then \
+	  echo "FAIL: missing Glue schemas in registry '$(GLUE_REGISTRY_NAME)':$$missing"; \
+	  echo "     run 'make schema-register' to create them"; \
+	  exit 1; \
+	fi; \
+	echo "OK: all three schemas present in registry '$(GLUE_REGISTRY_NAME)'"
 
 # -----------------------------
 # CI

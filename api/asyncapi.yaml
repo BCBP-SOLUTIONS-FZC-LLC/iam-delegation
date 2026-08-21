@@ -34,6 +34,88 @@ info:
     self-contained snapshots (DLG-EVT-7) so a consumer applying them out of
     order converges to the correct latest state regardless of arrival order.
 
+    ── Schema Evolution Rules ───────────────────────────────────────────────
+    Backward-compatible changes (NEW Glue schema version UUID, SAME type):
+      • Adding optional fields to a payload — consumers ignore unknown fields.
+      • Widening an enum (e.g. a new `ended_reason` value).
+      • Making a required field optional.
+
+    Breaking changes (MUST bump type to <name>.v2, e.g. DelegationEnded.v2):
+      • Removing or renaming a field.
+      • Changing a field's type or format.
+      • Narrowing an enum (removing a value).
+      • Making an optional field required.
+
+    When introducing a v2: publish BOTH the old and new type for one release
+    cycle so consumers can migrate, then retire the old type — see
+    x-version-governance.compaction-protocol below.
+
+  x-forward-compatibility:
+    summary: >-
+      Non-breaking schema updates (added fields, widened enums) are
+      registered in Glue and deployed WITHOUT requiring a consumer migration
+      cycle. Consumers MUST be forward-compatible or they will silently drop
+      or crash on new fields. schema-registry.yml's diff step emits ⚠
+      warnings when such changes are detected.
+    required-settings:
+      go-encoding-json: "Do NOT call json.Decoder.DisallowUnknownFields(). Unknown fields are silently ignored by default."
+      go-sonic: "Do NOT use sonic.ConfigStrict. Use sonic.ConfigDefault or sonic.ConfigFastest."
+    open-schema-contract: >-
+      All payload schemas in internal/eventschema/ declare
+      "additionalProperties": true — an explicit signal that the shape is
+      OPEN and new fields may appear in any Glue schema version without a
+      version bump. CI's schema-gov validate Pass 5 rejects any schema that
+      re-introduces "additionalProperties": false.
+
+  x-semantic-contract:
+    summary: >-
+      JSON Schema structural diff cannot detect semantic drift: a field's
+      units, scale, or business meaning can change without any structural
+      difference (e.g. days_remaining meant business days, now means
+      calendar days — type stays integer, but every consumer's
+      interpretation is wrong).
+    required-action: >-
+      If a field's observable meaning changes (units, scale, encoding,
+      nullability) without a structural change, create a versioned type
+      (e.g. DelegationEnded.v2) and mark the old type deprecated — do not
+      reuse an existing field name for a semantically different value.
+      See the "Event Schema Semantic Evolution" PR-template checklist.
+
+  x-version-governance:
+    summary: >-
+      Glue schema version numbers are internal counters that increment on
+      every backward-compatible structural change. High version numbers
+      (beyond SCHEMA_VERSIONS_ALERT_THRESHOLD, default 10) signal a schema
+      that has been evolving in-place rather than being compacted into a
+      clean .v2 event type.
+    compaction-protocol: |
+      When a schema exceeds the version threshold:
+        1. Create  internal/eventschema/{name}_v2.json  (new field layout)
+        2. Register {name}.v2 as a new AsyncAPI message in this file with
+           x-lifecycle: {status: active}
+        3. Mark the old message: x-lifecycle: {status: deprecated,
+           deprecated-by: {name}.v2, retire-after: YYYY-MM-DD}
+        4. Dual-publish from the producer for one release cycle
+        5. Migrate all consumers to the .v2 type
+        6. Retire the old type
+    cleanup-cadence: |
+      Monthly    (schema-prune.yml, schedule)            — dry-run orphan report; operator reviews and re-triggers with dry_run=false when ready.
+      Quarterly  (schema-health-quarterly.yml, schedule) — lifecycle lint + version-accumulation scan; no mutations.
+      Ad-hoc     (schema-prune.yml, workflow_dispatch)   — operator-triggered execute mode; production pruning is always manual.
+
+  x-usage-override:
+    summary: >-
+      Escape hatch for Prometheus usage-classification false negatives. When
+      usage-check reports NEVER_SEEN but the event is known to be active
+      (metric delay, dashboard migration), add this annotation to a
+      components/messages entry to suppress enforcement for a bounded
+      window.
+    format: |
+      x-usage-override:
+        status: active-override   # the only accepted value
+        reason: "<why the usage signal is unreliable right now>"
+        until:  YYYY-MM-DD        # remove the annotation on or after this date
+
   license:
     name: Proprietary
 
@@ -186,6 +268,11 @@ components:
       name: DelegationStarted
       title: Delegation created (routing begins)
       summary: Emitted by DLG-2 create and the create leg of DLG-5 reassign.
+      x-lifecycle:
+        status: active    # active | deprecated | retired
+      x-owner:
+        team: iam-team
+        slack: "#delegation-events"
       tags:
         - $ref: '#/components/tags/published'
       contentType: application/json
@@ -220,6 +307,11 @@ components:
         Fires on every end path — cancel, ends_at expiry, review auto-end,
         delegate-removed cascade (DLG-EVT-3) — never path-dependent.
         Delegator-side removal ends silently, no event (DEL-7/DLG-EVT-4).
+      x-lifecycle:
+        status: active    # active | deprecated | retired
+      x-owner:
+        team: iam-team
+        slack: "#delegation-events"
       tags:
         - $ref: '#/components/tags/published'
       contentType: application/json
@@ -251,6 +343,11 @@ components:
       name: DelegationReviewRequested
       title: Open-ended delegation approaching its review deadline
       summary: Emitted by the delegation-review sweep at the 7-day and 3-day marks (DLG-I2, DLG-D7).
+      x-lifecycle:
+        status: active    # active | deprecated | retired
+      x-owner:
+        team: iam-team
+        slack: "#delegation-events"
       tags:
         - $ref: '#/components/tags/published'
       contentType: application/json

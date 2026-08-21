@@ -26,6 +26,35 @@ MAX_RECEIVES=5
 
 queue_arn() { printf 'arn:aws:sqs:%s:%s:%s' "$AWS_REGION" "$AWS_ACCOUNT" "$1"; }
 
+# ── Glue Schema Registry ──────────────────────────────────────────────────────
+# Best-effort: Glue requires LocalStack Pro (docker-compose.pro.yml). If
+# unavailable the script continues so SNS/SQS are always created.
+# Schema definitions are read from /etc/localstack/init/schemas/ (mounted from
+# internal/eventschema/ in docker-compose.pro.yml) so local dev stays in sync
+# with the source-of-truth JSON files automatically.
+# Registered under the PascalCase names codec.go/docs/runbook-schema-registry.md
+# prescribe — matching what production Glue holds. The JSON filenames on disk
+# stay snake_case; only the registered Glue schema name is PascalCase.
+SCHEMA_DIR="/etc/localstack/init/schemas"
+if awslocal glue create-registry --registry-name iam-delegation-events 2>/dev/null; then
+  echo "Glue registry iam-delegation-events created"
+  register_schema() {
+    local FILE="$1" NAME="$2"
+    awslocal glue create-schema \
+      --registry-id "RegistryName=iam-delegation-events" \
+      --schema-name "$NAME" \
+      --data-format JSON \
+      --compatibility BACKWARD \
+      --schema-definition "$(cat "$FILE")"
+    echo "Glue schema $NAME created (from $(basename "$FILE"))"
+  }
+  register_schema "${SCHEMA_DIR}/delegation_started.json"          DelegationStarted
+  register_schema "${SCHEMA_DIR}/delegation_ended.json"            DelegationEnded
+  register_schema "${SCHEMA_DIR}/delegation_review_requested.json" DelegationReviewRequested
+else
+  echo "Glue not available — skipping registry setup (GLUE_REGISTRY_NAME must remain empty)"
+fi
+
 # ── Outbound SNS topic ──────────────────────────────────────────────────────
 TOPIC_ARN=$(awslocal sns create-topic --name iam-delegation-events --query TopicArn --output text)
 echo "SNS topic iam-delegation-events created: $TOPIC_ARN"

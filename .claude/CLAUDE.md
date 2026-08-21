@@ -1,0 +1,207 @@
+# CLAUDE.md
+
+This file provides guidance to Claude Code when working with the **Delegation Service** (`iam-delegation`), a Go microservice in the IAM subsystem.
+
+## What This Repo Is
+
+`iam-delegation` is a **private Go service** (module: `github.com/BCBP-SOLUTIONS-FZC-LLC/iam-delegation`, Go 1.26.6 — pinned exactly, DLG-D16) that owns out-of-office delegation: who delegated their work to whom, over what scope (all work / one department / one tender), for how long, and why it ended (expired, cancelled, the delegate was removed, or the review window lapsed). It is the fourth and last O&M extraction from `iam-org-membership` (ADR-0008, Option C).
+
+**Key responsibilities:**
+- The `delegations` and `delegation_tenant_settings` tables (per-tenant policy defaults)
+- The DLG-1..7 public API (list/create/cancel/extend/reassign/get-settings/set-settings) and DLG-I1..I4 mesh-only internal API
+- Two synchronous outbound dependencies of its own: grant-time membership-existence checks against `iam-org-membership` (DLG-D3), and availability-first pointer set/clear against `iam-user-profile` (DEL-6)
+- One inbound async subscription, `delegation-cascade-q` (Core's `MembershipRevoked`/`TenantOffboarded`)
+- Its own outbound event topic, `iam.delegation.events` (`DelegationStarted`/`DelegationEnded`/`DelegationReviewRequested`)
+
+This service is **both a producer and a consumer** — the one structural difference from most of its O&M extraction siblings.
+
+**Does NOT own:** tenant membership (Core/`iam-org-membership`), the synchronous user-removal gate (stays in Core, DLG-D9), availability state itself (`iam-user-profile` — this service only sets/clears a pointer), future-dated/scheduled delegation activation (v1 is active-at-create only, DLG-D12), Core's I-8 endpoint (Option C dropped `active_delegations[]` from it entirely — nothing here feeds it back).
+
+**Source of truth for:** the `delegations`/`delegation_tenant_settings` tables; `iam.delegation.events` (consumed by Workflow Service for reassignment, per LLD §10.5); `GET /internal/users/:id/active-delegations` (DLG-I4 — the escape-hatch replacement for Core's removed `active_delegations[]` embed; unused today).
+
+## Common Commands
+
+```bash
+make setup            # copy .env.example to .env if missing, install git hooks (.githooks/pre-commit)
+make install-hooks    # install .githooks/pre-commit into .git/hooks
+make tidy             # go mod tidy
+make fmt              # format source with gofmt
+make fmt-check        # verify gofmt formatting (mirrors CI)
+make vet              # go vet (default build + every test build tag)
+make lint             # run golangci-lint (via go tool)
+make mod-verify       # go mod verify
+make vuln-check       # govulncheck on cmd/ + internal/ + pkg/
+make test             # unit + integration + rls tests, in parallel (requires Docker)
+make test-unit        # unit tests only (no Docker required)
+make test-integration # integration tests: Postgres+Valkey+SQS-compatible via Testcontainers (requires Docker)
+make test-rls         # Postgres Row-Level-Security tests via Testcontainers (requires Docker)
+make test-e2e         # end-to-end tests: Postgres+Valkey+SQS-compatible via Testcontainers (requires Docker)
+make race             # all four suites with -race, in parallel (requires Docker)
+make test-ci          # race + coverage, merged into coverage.out (used in CI, requires Docker)
+make cover            # coverage HTML report
+make cover-func       # coverage summary by function
+make run / run-server # run the server locally (go run cmd/server), sourcing .env if present
+make run-reconciler   # run the reconciler locally; pass JOB=delegation-expiry|delegation-review|delegation-cleanup
+make build            # compile both binaries (iam-delegation-server, iam-delegation-reconciler) to bin/
+make build-server     # compile only cmd/server
+make build-reconciler # compile only cmd/reconciler
+make arch-lint        # run go-arch-lint against .go-arch-lint.yml
+make swag             # regenerate docs/swagger/ from handler annotations
+make swag-check       # fail if Swagger regeneration would change docs/swagger/ (CI drift gate)
+make ci               # tidy + fmt-check + vet + lint + arch-lint + test-ci + build
+make docker-build     # build the container image (carries both binaries)
+make docker-push      # push the container image
+make docker-up        # start local Postgres + Valkey + LocalStack
+make docker-down      # stop containers started by docker-up/compose-up
+make compose-up       # start the full local dev stack, including the service itself (self-migrates at startup)
+make compose-down     # stop and remove the local dev stack, including volumes
+make migrate-up/-down/-create  # manual migration ops against DATABASE_MIGRATION_URL
+make godoc            # serve local godoc/pkgsite at http://localhost:8080
+make clean            # remove build artifacts and coverage output
+
+# Schema governance (platform-schemagov 0.4, DLG-D20)
+make schema-pull      # pull the schema-gov Docker image
+make schema-validate  # validate AsyncAPI + event schemas — 8 passes (no AWS required)
+make schema-diff      # diff two schema files: CURRENT=<path> PROPOSED=<path>
+make schema-register  # register event schemas to Glue (requires AWS/LocalStack)
+make schema-verify    # pre-deploy check: fail if PascalCase schemas are missing (requires AWS)
+make schema-prune     # dry-run: list orphaned Glue schemas (requires AWS)
+```
+
+To run a single test:
+```bash
+go test ./internal/core/service/... -run TestDelegationService_Create -v
+go test -tags=rls ./internal/adapter/outbound/postgres/... -run TestRLS -v
+```
+
+**Test layout note:** unlike some sibling services, every test in this repo is colocated white-box (`*_test.go` next to the source it covers, package-internal) — there is no separate `test/` tree. `go test ./...` alone runs the complete suite (unit + Postgres/testcontainer integration + the full RLS matrix all together); `-tags=integration|rls|e2e` currently select no additional files (no test declares those build tags yet) and are no-ops kept for future extensibility — the `test-*` Makefile targets differ only in which `-tags` flag they pass, not in which packages they run.
+
+**Coverage note:** measure with `-coverpkg=$(go list ./internal/... ./pkg/... | tr '\n' ',')` — `make cover`/`make cover-func` already do this. CI enforces a single global statement-coverage gate of ≥70% on the merged `coverage.out` (`.github/scripts/coverage-gate.sh`), well below the per-package percentages actually achieved (`internal/core/service` 84.7%, `internal/adapter/inbound/http` 90.4%, etc. — see `IMPLEMENTATION_NOTES.md` § Test coverage).
+
+**Testcontainers note:** Postgres/Valkey/SQS-compatible integration and RLS tests spin up real containers via `testcontainers-go`. Docker must be running.
+
+**Tool directive note:** `golangci-lint` and `swag` are declared as `tool` entries in `go.mod` and invoked via `go tool <name>`. They do not need to be installed separately.
+
+## Architecture
+
+Clean Architecture — dependencies point inward; outer layers never import inner layers.
+
+```
+iam-delegation/
+├── api/
+│   ├── asyncapi.yaml                  # AsyncAPI 3.0 spec — iam.delegation.events + delegation-cascade-q's two consumed types; x-lifecycle/x-owner/x-forward-compatibility/x-semantic-contract/x-version-governance/x-usage-override governance annotations (DLG-D20)
+│   └── embed.go                       # `//go:embed asyncapi.yaml` → AsyncAPISpec []byte — GET /asyncapi(.yaml) serve this, not a disk read
+├── cmd/
+│   ├── server/
+│   │   ├── main.go                    # composition root — errgroup runs outboxRunner, sqsConsumer, HTTP server, and the shutdown goroutine (only 3 real background workers — see "Key Files to Know")
+│   │   ├── adapters.go                # gucBoundReader (DLG-I3/I4 GUC binding) + reconcilerRunner (DLG-D17 dual entry point) + redisPinger
+│   │   ├── config.go                  # loadConfig() — env var parsing, SNS_TOPIC_ARN/CASCADE_QUEUE_URL fail-fast checks
+│   │   ├── observability.go
+│   │   └── swagger_info.go            # swaggo metadata
+│   └── reconciler/
+│       ├── main.go                    # --job=<name> dispatch (this chart's own convention, not shelling out over HTTP)
+│       ├── config.go / observability.go
+│       └── jobs/
+│           ├── context.go             # jobs.Context — shared deps for all three jobs
+│           ├── delegation_expiry.go   # DLG-I1 (*/5 * * * *, LLD §11.3)
+│           ├── delegation_review.go   # DLG-I2 (0 * * * *, dual 7d/3d warn, LLD §11.4)
+│           └── delegation_cleanup.go  # soft-delete purge (0 4 1 * *, LLD §11.6/§18.4)
+├── internal/
+│   ├── core/
+│   │   ├── domain/
+│   │   │   ├── delegation.go          # Delegation, enums (Scope, Status, EndReason incl. review_expired)
+│   │   │   ├── tenant_settings.go     # DelegationTenantSettings (policy)
+│   │   │   ├── event.go               # DomainEvent + published/consumed event-type constants — see "Key Files to Know"
+│   │   │   ├── event_payloads.go      # per-event payload structs
+│   │   │   └── errors.go              # domain.Err* sentinels — the full LLD §20 taxonomy (see development-guide.md's Appendix)
+│   │   ├── port/                      # delegation_repository.go · settings_repository.go · user_profile_client.go · membership_check_client.go · idempotency_store.go · event_publisher.go · cache.go · tx_runner.go · errors.go · doc.go
+│   │   └── service/
+│   │       ├── delegation_service.go  # DLG-1..5 orchestration
+│   │       ├── settings_service.go    # DLG-6/7
+│   │       └── cascade_service.go     # delegation-cascade-q business logic (MembershipRevoked/TenantOffboarded handling)
+│   └── adapter/
+│       ├── inbound/
+│       │   ├── http/                  # router.go · delegation_handler.go · settings_handler.go · internal_handler.go · asyncapi.go · health.go · authz.go · middleware.go (incl. tenantGUCMiddleware, requireIdempotencyKey) · dto.go · errors.go (errorStatusByCode)
+│       │   └── consumer/              # cascade_consumer.go · processed_events.go · wiring.go — delegation-cascade-q
+│       └── outbound/
+│           ├── postgres/              # db.go (TxRunner, PayloadValidator, WithTenantGUC) · delegation_repository.go · settings_repository.go · migrate.go · migrations_fs.go · migrations/ (000001_schema only, as of this build)
+│           ├── userprofile/           # http_client.go (UserProfileClient impl, DEL-6) + propagate.go
+│           ├── orgmembership/         # http_client.go (MembershipCheckClient impl, DLG-D3) + propagate.go
+│           ├── eventbus/              # validator.go (SchemaValidator, enqueue-time) · codec.go (GlueCodec/NoopCodec, SNS-publish-time) · publisher_helpers.go
+│           ├── valkey/                # cache.go · client.go · idempotency.go — del: cache + idempotency store
+│           └── metrics/               # metrics.go — iam_delegation_* Prometheus instruments (registered but NOT yet called from the service layer, DLG-D19 — see development-guide.md's Troubleshooting)
+├── internal/eventschema/              # delegation_{started,ended,review_requested}.json + schemas.go (//go:embed) — hand-maintained, no extract-schemas step (DLG-D20)
+├── pkg/requestctx/                    # gateway-identity / tenant-actor extraction helpers
+├── docs/
+│   ├── lld/iam-lld-delegation-service.md  # the full LLD v2.1 (design-time source of truth)
+│   ├── architecture/                  # README.md (index) + mermaid/*.mmd — 11 diagrams (layer model, package deps, ER, RLS/GUC flow, 7 request/cron/cascade flows)
+│   ├── runbook-schema-registry.md     # operator runbook for the Glue registry (DLG-D20)
+│   └── swagger/                       # generated by `make swag` — checked in
+├── deploy/
+│   ├── helm/iam-delegation/           # this service's independent Helm chart
+│   ├── iam/                           # policy.json (incl. GlueSchemaRegistryReadOnly SID) + policy.tf.example
+│   └── monitoring/schema-registry-alerts.yml  # Prometheus alert rules for the CI schema pipeline
+├── .github/workflows/                 # ci.yml · validate-quality.yml · validate-test.yml · release.yml · changelog-check.yml · schema-registry.yml · schema-prune.yml · schema-health-quarterly.yml · freeze-watchdog.yml
+├── .githooks/pre-commit               # tidy + fmt-check + lint + swag-check
+├── Dockerfile  docker-compose.yml  docker-compose.pro.yml  Makefile  go.mod  .golangci.yml  .go-arch-lint.yml
+├── ARCHITECTURE.md                    # detailed architecture narrative with Mermaid diagrams (~660 lines)
+├── CONTRIBUTING.md                    # dev setup, extension playbooks, PR checklist
+├── IMPLEMENTATION_NOTES.md            # DLG-D1..D20 as-built decision register
+└── README.md                          # onboarding + quick-start (~470 lines)
+```
+
+### Shared library dependencies
+
+```go
+require (
+    github.com/BCBP-SOLUTIONS-FZC-LLC/platform-events     v1.4.0
+    github.com/BCBP-SOLUTIONS-FZC-LLC/platform-gincommon  v1.3.0
+    github.com/BCBP-SOLUTIONS-FZC-LLC/platform-pgcommon   v1.2.1
+)
+```
+
+- `platform-gincommon` — HTTP middleware, logging, tracing (OTel OTLP), Prometheus registerer
+- `platform-pgcommon` — PostgreSQL pool (`pgx/v5`), RLS GUC injection (`GUCSetFromContext`/`WithGUCSet`), migrations
+- `platform-events` — transactional outbox, SNS publisher (`events.WithCodec`), SQS consumer
+
+Also notable: `github.com/aws/aws-sdk-go-v2/service/glue` (GlueCodec's schema-version lookups) and `github.com/santhosh-tekuri/jsonschema/v6` (SchemaValidator).
+
+### Dependency rules (enforced in CI via `go-arch-lint`, `.go-arch-lint.yml`)
+
+- `internal/core/*` imports no adapter, Gin, pgx, or AWS SDK.
+- `core/port` depends only on `core/domain`; `core/service` depends on `domain`+`port`+`requestctx`.
+- Inbound adapters depend on `service`+`port`+`domain` — never an outbound adapter directly.
+- Outbound adapters depend on `port`+`domain`+`eventschema` — never `service`, never inbound.
+- `cmd/*` is the only place concretes get wired together.
+- No session-scoped `SET app.tenant_id` — only `SET LOCAL` via `pgcommon.GUCSetFromContext` (CI greps the forbidden form, `.github/scripts/check-forbidden-set-guc.sh`, RLS-6).
+
+## Key Files to Know
+
+- **`cmd/server/main.go`** — composition root. Notably simpler than some sibling services: only **three** real background goroutines run under one `errgroup` — the outbox runner, the `delegation-cascade-q` SQS consumer, and the HTTP server itself (plus a graceful-shutdown goroutine and `GlueCodec.StartRefresher`'s internal ticker). There is no OOO-sweep/maintenance-sweep/compliance-exporter equivalent here — consistent with DLG-D19's gap (business metrics registered but not yet instrumented anywhere).
+- **`cmd/server/adapters.go`** — two adapters unique to this service's topology: `gucBoundReader` binds `app.tenant_id` per-call for the mesh-only DLG-I3/I4 reads (no per-request middleware on that route group); `reconcilerRunner` adapts `cmd/reconciler/jobs`' `Expiry`/`ReviewSweep` functions to the HTTP handler's injected runner interfaces so DLG-I1/I2's on-demand HTTP endpoints and the CronJob binary share one implementation (DLG-D17).
+- **`internal/core/domain/event.go`** — `EventDelegationStarted`/`EventDelegationEnded`/`EventDelegationReviewRequested` constants. Unlike `iam-user-profile`'s `domain.GlueSchemaName` translation switch, **these constants ARE the PascalCase Glue schema names directly** — no dot-notation-to-PascalCase mapping exists or is needed here.
+- **`internal/core/service/delegation_service.go`** — DLG-1..5 orchestration: the availability-first create ordering (membership checks → User Profile → `RunInTx`), fail-open cancel, self-retrying expiry, dual-bucket review warnings.
+- **`internal/core/service/cascade_service.go`** — `EndForUser` (MembershipRevoked → end every delegation where the user is delegator or delegate; delegate-side only emits an event, delegator-side is silent per DLG-EVT-4) and `ScrubTenant` (TenantOffboarded → soft-delete the tenant's rows).
+- **`internal/adapter/inbound/http/router.go`** — route registration; `tenantGUCMiddleware` on the public group (right after `ContextMiddleware`); `requireIdempotencyKey()` gates `POST /delegations` with a 400, not a service-layer check.
+- **`internal/adapter/inbound/http/errors.go`** — `errorStatusByCode`, the map from every `domain.Err*` sentinel to its HTTP status (LLD §20 verbatim). A code missing from this map falls back to 500.
+- **`internal/adapter/outbound/eventbus/validator.go`** — `SchemaValidator`, enqueue-time JSON Schema validation (fail-closed on unregistered event types); independent of the wire-format codec.
+- **`internal/adapter/outbound/eventbus/codec.go`** — `GlueCodec`/`NoopCodec`, both implementing `platform-events`' `events.Codec` directly; injected via `events.WithCodec` at SNS-publish time, gated by `GLUE_REGISTRY_NAME`.
+- **`internal/adapter/outbound/postgres/db.go`** — `PayloadValidator` interface (the duck-typed seam `SchemaValidator` satisfies without a direct import), `TxRunner`, and `WithTenantGUC` (binds the GUC for the reconciler jobs/cascade consumer's own injected `BindTenantGUC` parameters).
+- **`api/asyncapi.yaml`** — hand-maintained (no `extract-schemas` step, DLG-D20); carries the `x-lifecycle`/`x-owner`/`x-forward-compatibility`/`x-semantic-contract`/`x-version-governance`/`x-usage-override` governance annotations `schema-gov validate` requires.
+- **`api/embed.go`** — `//go:embed asyncapi.yaml` → `AsyncAPISpec []byte`, served by `GET /asyncapi`/`GET /asyncapi.yaml` without a disk read.
+
+## See Also
+
+Detailed reference docs in `.claude/`:
+- [Database Schema](database.md) — tables, RLS, pool config, migrations, triggers
+- [API, Caching & Events](api-and-events.md) — endpoints, cache keys, event types, Glue wire format
+- [Request Flows & Concurrency](flows-and-concurrency.md) — create/cancel/cron/cascade flows, optimistic locking, shutdown ordering
+- [Operations](operations.md) — security, observability (incl. the DLG-D19 metrics gap), configuration, CI/CD, schema governance (`platform-schemagov`/`schema-gov` CLI rules — read before touching `.github/workflows/schema-registry.yml` or any Glue/event-schema-validation file)
+- [Development Guide](development-guide.md) — design decisions, extending, workflow, troubleshooting, error codes
+
+Supplementary docs in the repo root and `docs/`:
+- **`README.md`** — onboarding, quick-start, local dev setup, integrating with other services
+- **`ARCHITECTURE.md`** — detailed architecture narrative with Mermaid diagrams
+- **`CONTRIBUTING.md`** — dev setup, extension playbooks, PR checklist
+- **`IMPLEMENTATION_NOTES.md`** — the DLG-D1..D20 as-built decision register
+- **`docs/lld/iam-lld-delegation-service.md`** — the full Low-Level Design (v2.1) this service implements

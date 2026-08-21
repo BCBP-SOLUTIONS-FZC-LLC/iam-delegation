@@ -63,16 +63,13 @@ resources:
 env:
   LOG_LEVEL: "info"
   ENVIRONMENT: "production"
-  HTTP_PORT: "8080"
-  METRICS_PORT: "9090"
 
-  # ElastiCache Valkey — "del:" keyspace (LLD §9/§15). No auth token is
-  # embedded in this URL form; VALKEY_PASSWORD (if any) is in
-  # envFromSecret.
+  # ElastiCache Valkey — "del:" keyspace is a compile-time constant, not
+  # env-driven (LLD §9/§15). No auth token is embedded in this URL form;
+  # VALKEY_PASSWORD (if any) is in envFromSecret.
   VALKEY_ADDR: "valkey.iam-delegation.svc.cluster.local:6379"
-  CACHE_KEYSPACE: "del:"
-  CACHE_LIST_TTL_SECONDS: "60"
-  CACHE_IDEMPOTENCY_TTL_SECONDS: "86400"
+  LIST_CACHE_TTL_SECONDS: "60"
+  IDEMPOTENCY_TTL_SECONDS: "86400"
 
   # DEL-6 availability-first coordination — User Profile is the
   # authoritative owner of user_availability (LLD §1, §6.3).
@@ -91,30 +88,30 @@ env:
   POLICY_DEFAULT_MAX_DURATION_DAYS: "90"
   POLICY_DEFAULT_REVIEW_WINDOW_DAYS: "90"
 
-  # Dual review-warning bucket (DLG-D7/DLG-Q6, §11.4).
-  REVIEW_WARN_EARLY_DAYS: "7"
-  REVIEW_WARN_LATE_DAYS: "3"
+  # Dual review-warning bucket (DLG-D7/DLG-Q6, §11.4) — the 7d/3d marks are
+  # compile-time literals in cmd/reconciler/jobs/delegation_review.go, not
+  # env-driven; no config knob exists for them.
 
   # Dedicated event topic (DLG-D5/DLG-Q1) — Core's AsyncAPI drops these
   # events entirely; this service is both producer and consumer (§6.3).
-  EVENTS_TOPIC: "iam-delegation-events"
-  EVENTS_SOURCE: "iam-delegation"
-
-  # AWS SNS/SQS — the delegation-cascade-q consumer (MembershipRevoked /
-  # TenantOffboarded, §11.5/§11.6) runs in-process inside this same server
-  # binary, not a separate consumer process.
-  SQS_QUEUE_URL: ""
-  SQS_DLQ_URL: ""
-  SQS_CONCURRENCY: "4"
+  # REQUIRED — cmd/server/config.go fails fast at startup if either of the
+  # next two is empty. No generic in-cluster default exists (real ARN/URL
+  # depends on the environment's AWS account) — set per environment.
+  SNS_TOPIC_ARN: ""
+  CASCADE_QUEUE_URL: ""
   AWS_REGION: "us-east-1"
+  # Set to the Glue Schema Registry name (iam-delegation-events) to activate
+  # eventbus.GlueCodec at publish time; empty → NoopCodec (dev/test only).
+  # See docs/runbook-schema-registry.md.
+  GLUE_REGISTRY_NAME: ""
 
   # OpenTelemetry — OTLP/gRPC via platform-gincommon's
   # ObservabilityMiddlewares (port 4317, not the legacy OTLP/HTTP 4318).
   OTEL_EXPORTER_OTLP_ENDPOINT: "otel-collector.observability.svc.cluster.local:4317"
 
-  # Postgres pool sizing (pgcommon.ConfigFromEnv()) — logical database
-  # "delegation" (LLD §7, Owner database table).
-  DATABASE_LOGICAL_NAME: "delegation"
+  # Postgres pool sizing (pgcommon.ConfigFromEnv()) — logical database name
+  # ("delegation", LLD §7) is embedded in DATABASE_URL itself, not a
+  # separate env var.
   PG_MAX_CONNS: "10"
   PG_MIN_CONNS: "2"
   PG_SLOW_QUERY_THRESHOLD: "200ms"
@@ -136,6 +133,7 @@ envFromSecret:
   - MIGRATION_DATABASE_URL
   - VALKEY_PASSWORD
   - DOCS_AUTH_TOKEN
+  - GLUE_REGISTRY_ARN
 
 # existingSecret — preferred for production. Set to the name of a
 # pre-existing Kubernetes Secret whose keys match envFromSecret. When set,
@@ -160,6 +158,9 @@ secretValues:
   MIGRATION_DATABASE_URL: ""
   VALKEY_PASSWORD: ""
   DOCS_AUTH_TOKEN: ""
+  # For IAM-policy-scoping documentation/validation only — not read by the
+  # Go runtime. See deploy/iam/policy.tf.example's glue_registry_arn.
+  GLUE_REGISTRY_ARN: ""
 
 # 30s HTTP+metrics server graceful shutdown budget + buffer for the SQS
 # cascade consumer to finish its in-flight message (LLD §16.4: "at-least-

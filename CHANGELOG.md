@@ -35,10 +35,45 @@ adapters were rehosted onto this repo's own Clean Architecture / Ports-and-Adapt
   (`.github/workflows/{ci,validate-quality,validate-test,schema-registry,changelog-check,release}.yml`),
   matching the shared conventions across the IAM service family.
 
+### Added — CI schema governance and documentation parity with `iam-user-profile`
+
+Superseded DLG-D15's CI-governance scope (recorded as DLG-D20 in `IMPLEMENTATION_NOTES.md`): this
+service's Go-level event validation (`eventbus.SchemaValidator`, `GlueCodec`) was already at parity
+with `iam-user-profile`'s — the only real gap was the CI-time `platform-schemagov` pipeline and its
+monitoring, now closed.
+
+- `.github/workflows/schema-registry.yml` rewritten to drive `platform-schemagov` validate/diff/
+  register against a dedicated `iam-delegation-events` Glue registry, replacing the earlier
+  Python-only structural check; added `schema-prune.yml`, `schema-health-quarterly.yml`, and
+  `freeze-watchdog.yml` to match.
+- Added `deploy/monitoring/schema-registry-alerts.yml`, `docs/runbook-schema-registry.md`, the
+  `schema-*` Makefile targets, `docker-compose.pro.yml`, and `GLUE_REGISTRY_NAME`/`GLUE_REGISTRY_ARN`
+  in `deploy/helm/iam-delegation/values.yaml`.
+- Added `x-lifecycle`/`x-owner`/`x-forward-compatibility`/`x-semantic-contract`/`x-version-governance`/
+  `x-usage-override` governance annotations to `api/asyncapi.yaml`, required by `schema-gov validate`
+  and previously absent.
+- Fixed a real local-dev bug found along the way: `docker-compose.yml`'s `iam-delegation` service set
+  `EVENTS_TOPIC`/`SQS_QUEUE_URL`/`SQS_DLQ_URL`/`CACHE_LIST_TTL_SECONDS`/`CACHE_IDEMPOTENCY_TTL_SECONDS`,
+  none of which `cmd/server/config.go` actually reads — the container would have crash-looped on the
+  missing required `SNS_TOPIC_ARN`/`CASCADE_QUEUE_URL`. Corrected to the real env var names and added
+  the previously-missing `.env.example`.
+- Brought `docs/`, `README.md`, `ARCHITECTURE.md`, and `CONTRIBUTING.md` up to the structure
+  `iam-user-profile` uses: copied the authoritative LLD in as `docs/lld/iam-lld-delegation-service.md`
+  (previously lived outside the repo); added `docs/architecture/` (nine Mermaid diagrams — eight
+  extracted verbatim from the LLD, plus a new layer-model, package-dependency graph, and RLS/GUC-path
+  diagram authored from the actual code); expanded `ARCHITECTURE.md` with the sections
+  `iam-user-profile`'s has (cache strategy, observability stack, RLS/GUC injection, concurrency,
+  failure domains, key invariants, consumer conformance, schema lifecycle, trust boundaries,
+  developer tools); expanded `README.md` (why this service exists, input validation, CI, Docker,
+  integrating with other services, out of scope, license/ownership); added `CONTRIBUTING.md` (this
+  repo had none). Every fact in the new content was verified against this repo's actual source rather
+  than copied from `iam-user-profile` — where this service is simpler (e.g. no rate limiting, a
+  two-key cache, business metrics registered but not yet called per DLG-D19) the new docs say so
+  rather than fabricating parity.
+
 ### Known gaps
 
-- `cmd/server` and `cmd/reconciler` (including `cmd/reconciler/jobs/`) are being wired concurrently
-  with this Helm/CI scaffolding — until that lands, `make build`/`docker-build` will not yet produce
-  runnable binaries.
 - HPA on `delegation-cascade-q` queue depth (LLD §16.3) is not wired — the chart currently scales on
   CPU/memory (and, optionally, RPS) only; a queue-depth-based scaler (e.g. KEDA) is future work.
+- DLG-D19 (`IMPLEMENTATION_NOTES.md`): the `iam_delegation_*` business metrics are registered but no
+  service-layer call site invokes them yet — counters will report zero until that wiring lands.

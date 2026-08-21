@@ -41,6 +41,42 @@ Provide a clear description of the changes.
 - [ ] Event schema JSON files updated to match (`internal/eventschema/*.json`)
 - [ ] `"additionalProperties": true` is set on every modified or new schema in `internal/eventschema/` (mirrors the shipped schemas' open-schema convention)
 
+### Consumer Forward-Compatibility
+*Complete only when `internal/eventschema/` changed.*
+
+Backward-compatible changes (new fields, widened enums) do not require a consumer migration cycle,
+but consumers must be configured for lenient deserialization or they will crash on the new fields.
+
+- [ ] **Consumer lenient-parsing confirmed** — All known consumers of this event type are configured
+      to ignore unknown fields. Required per-language settings:
+      - **Go (encoding/json):** do NOT call `json.Decoder.DisallowUnknownFields()` — silently ignored by default.
+      - **Go (sonic):** use `sonic.ConfigDefault` or `sonic.ConfigFastest`, NOT `sonic.ConfigStrict`.
+- [ ] **Deploy order followed for non-breaking additions** — Consumers deployed first, then producer.
+      New fields in the payload reach consumers before the producer starts sending them. Consumers
+      that haven't been updated yet will receive the new field as an ignored unknown — no crash.
+      See `api/asyncapi.yaml § x-forward-compatibility` for the canonical order.
+
+### Event Schema Semantic Evolution
+*Complete only when `api/asyncapi.yaml` or `internal/eventschema/` changed.*
+
+Structural schema diff and lifecycle checks run in CI automatically
+(`.github/workflows/schema-registry.yml`). This section covers semantic drift
+that is **invisible to tooling**: a field's valid range, units, encoding, or
+business meaning can change without any JSON Schema difference.
+
+- [ ] **No semantic drift** — Confirmed that no existing field changed its valid range,
+      units, encoding, or business meaning without a structural schema change.
+      *Example of a semantic-only breaking change:*
+      `days_remaining` meant business days, now means calendar days.
+      The JSON Schema type stays `integer` — structural diff cannot catch this.
+- [ ] **Semantic change acknowledged → `.v2` created** — If a field's meaning changed
+      without a structural change, a new versioned event type has been created
+      (e.g. `DelegationEnded.v2`) and the old type is marked deprecated in `asyncapi.yaml`
+      with `x-lifecycle: {status: deprecated, deprecated-by: DelegationEnded.v2, retire-after: YYYY-MM-DD}`.
+- [ ] **Description-only change confirmed** — Any `description` field edits in
+      `asyncapi.yaml` are wording clarifications only (no change to valid range,
+      units, nullability, or consumer-observable behaviour).
+
 ### RLS / Tenant Isolation
 *Complete only when a new query, table, or GUC-binding path was added.*
 - [ ] Every new query against a tenant-scoped table runs inside a transaction with `app.tenant_id` bound via `pgcommon`'s `SET LOCAL` semantics — never a session-scoped `SET app.tenant_id` (CI's forbidden-GUC grep enforces this, but double-check any new call path: public routes go through `tenantGUCMiddleware`, internal reads through `gucBoundReader`, crons/cascade through their injected `BindTenantGUC`)

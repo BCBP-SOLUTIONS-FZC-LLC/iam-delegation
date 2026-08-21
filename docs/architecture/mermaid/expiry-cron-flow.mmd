@@ -1,0 +1,18 @@
+sequenceDiagram
+    autonumber
+    participant CR as delegation-expiry CronJob
+    participant DLG as Delegation Service
+    participant UP as User Profile
+    participant PG as Delegation Postgres
+
+    CR->>DLG: POST /internal/delegations/expire
+    DLG->>PG: SELECT ... WHERE status=active AND deleted_at IS NULL AND ends_at IS NOT NULL AND ends_at < now() LIMIT 50
+    loop per expired delegation
+        DLG->>UP: PUT /internal/users/:delegator_id/availability {delegate_id null}
+        alt UP fail
+            DLG->>DLG: leave active, defer (DEL-6), retry next tick
+        else UP 200
+            DLG->>PG: RunInTx { bind app.tenant_id, UPDATE status=ended at record_version v, then outbox DelegationEnded expired }
+        end
+    end
+    DLG-->>CR: {attempted, succeeded, failed}

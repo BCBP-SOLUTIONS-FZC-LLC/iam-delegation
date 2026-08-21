@@ -1,0 +1,19 @@
+sequenceDiagram
+    autonumber
+    actor U as Delegator / admin
+    participant DLG as Delegation Service
+    participant UP as User Profile
+    participant PG as Delegation Postgres
+
+    U->>DLG: DELETE /api/v1/delegations/:id?record_version=N
+    DLG->>PG: FindByID (RLS-scoped)
+    DLG->>UP: PUT /internal/users/:delegator_id/availability {delegate_id null} (clear pointer only, never status available)
+    Note over DLG,UP: fail-open — if UP is down, log and proceed, the expiry cron re-clears later
+    DLG->>PG: RunInTx { End status=cancelled at record_version N, then outbox DelegationEnded cancelled }
+    alt version mismatch
+        DLG-->>U: 409 optimistic_lock_conflict
+    else terminal already
+        DLG-->>U: 404 delegation_not_found
+    else ok
+        DLG-->>U: 200 {delegation}
+    end

@@ -1,0 +1,48 @@
+sequenceDiagram
+    autonumber
+    actor C as Caller
+    participant DLG as Delegation Service
+    participant V as Valkey (del:)
+    participant PG as Delegation Postgres
+
+    Note over C,PG: DLG-1 GET /delegations (list, self)
+    C->>DLG: GET /api/v1/delegations
+    DLG->>V: GET del:list:{tenant}:{caller}
+    alt hit
+        V-->>DLG: cached list
+    else miss
+        DLG->>PG: SELECT ... WHERE tenant_id=$1 AND delegator_id=$2 AND deleted_at IS NULL
+        DLG->>V: SET del:list (60s)
+    end
+    DLG-->>C: 200 {items}
+
+    Note over C,PG: DLG-4 POST /delegations/:id/extend (open-ended only, no UP call)
+    C->>DLG: POST /delegations/:id/extend {extend_days?}
+    DLG->>PG: FindByID (RLS-scoped)
+    alt fixed ends_at (review_due_at IS NULL)
+        DLG-->>C: 422 not_review_tracked
+    else extend_days outside [1,180]
+        DLG-->>C: 422 extend_days_out_of_range
+    else ok
+        DLG->>PG: RunInTx { ExtendReview push review_due_at, reset review_last_warned_bucket=NULL at record_version N }
+        DLG-->>C: 200 {review_due_at, review_last_warned_bucket=null}
+    end
+
+    Note over C,PG: DLG-5 POST /delegations/:id/reassign (end old, create new)
+    C->>DLG: POST /delegations/:id/reassign {new_delegate_id?, scope?, ...}
+    DLG->>DLG: Cancel(old) flow (§11.2) — emits DelegationEnded cancelled
+    DLG->>DLG: Create(new) flow (§11.1) — membership checks + UP + DelegationStarted
+    Note over DLG: if the new create fails after the old ended, old is NOT resurrected (DLG-D11)
+    DLG-->>C: 201 {new delegation}
+
+    Note over C,PG: DLG-6/7 tenant policy (settings)
+    C->>DLG: GET /delegations/settings
+    DLG->>PG: SELECT ... FROM delegation_tenant_settings WHERE tenant_id=$1 (default 90/90 if no row)
+    DLG-->>C: 200 {max_duration_days, review_window_days}
+    C->>DLG: PUT /delegations/settings {max_duration_days, review_window_days}  (tenant_admin/owner)
+    alt either outside [1,180]
+        DLG-->>C: 400 invalid_delegation_max_duration_days / invalid_delegation_review_window_days
+    else ok
+        DLG->>PG: UPSERT delegation_tenant_settings (optimistic-locked)
+        DLG-->>C: 200 {settings, record_version}
+    end

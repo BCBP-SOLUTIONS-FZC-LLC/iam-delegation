@@ -1,0 +1,17 @@
+sequenceDiagram
+    autonumber
+    actor C as Caller
+    participant E as Envoy Gateway
+    participant AZ as AuthZ Enrichment
+    participant DLG as Delegation Service
+    C->>E: HTTP request (Bearer JWT)
+    E->>E: jwt_authn validate signature, iss, exp
+    E->>AZ: ext_authz (gRPC)
+    AZ-->>E: Allow plus x-tenant-id, x-user-id, x-tenant-roles
+    E->>DLG: forward request plus x-* headers (mTLS)
+    Note over DLG: RequireAuth, ContextMiddleware, GUC-bridge<br/>set app.tenant_id (txn-local, RLS-6)
+    alt headers missing or invalid
+        DLG-->>C: 401 unauthorized
+    else caller lacks required role (DLG-3/4/5/7)
+        DLG-->>C: 403 insufficient_role
+    end

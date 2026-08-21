@@ -1,0 +1,33 @@
+graph TD
+    subgraph path1["Path 1 — Public routes (DLG-1..7)"]
+        p1a["tenantGUCMiddleware(bindTenantGUC)\nregistered after ContextMiddleware()\non the public route group (router.go)"]
+        p1b["binds ctx from requestctx.FromContext(rc)\nonce per request, before the handler runs"]
+        p1a --> p1b
+    end
+
+    subgraph path2["Path 2 — Mesh-only internal reads (DLG-I3/I4)"]
+        p2a["gucBoundReader (cmd/server/adapters.go)\nwraps *postgres.DelegationRepository"]
+        p2b["binds app.tenant_id + userID=\"iam-system\"\nper call, immediately before each\nsingle-statement query — no middleware,\nno open tx (LLD §7.3/RLS-6)"]
+        p2a --> p2b
+    end
+
+    subgraph path3["Path 3 — Reconciler jobs + cascade consumer"]
+        p3a["jobs.Context.BindTenantGUC (cmd/reconciler/jobs)\nconsumer.GUCBinder (internal/adapter/inbound/consumer)\ninjected function params — no HTTP request to bridge"]
+        p3b["called explicitly per-row before each\nRunInTx (delegation_expiry.go, delegation_review.go,\ncascade_consumer.go)"]
+        p3a --> p3b
+    end
+
+    withTenantGUC["postgres.WithTenantGUC(ctx, tenantID, userID)\n(internal/adapter/outbound/postgres/db.go)\nall three paths converge here"]
+
+    p1b --> withTenantGUC
+    p2b --> withTenantGUC
+    p3b --> withTenantGUC
+
+    gucset["pgcommon.WithGUCSet(ctx, GUCSet{TenantID, UserID})"]
+    withTenantGUC --> gucset
+
+    setlocal["Next pool checkout issues:\nSET LOCAL app.tenant_id = '...'\n(transaction-scoped, never session-scoped —\nCI greps for the forbidden SET form,\n.github/scripts/check-forbidden-set-guc.sh)"]
+    gucset --> setlocal
+
+    rls["Postgres RLS — FORCE ROW LEVEL SECURITY,\nfail-closed NULLIF policy on delegations\nand delegation_tenant_settings (LLD §7.3)"]
+    setlocal --> rls

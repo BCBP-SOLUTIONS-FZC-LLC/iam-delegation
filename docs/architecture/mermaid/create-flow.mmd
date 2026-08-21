@@ -1,0 +1,30 @@
+sequenceDiagram
+    autonumber
+    actor DR as Delegator (or admin)
+    participant DLG as Delegation Service
+    participant Core as Core (Org and Membership)
+    participant UP as User Profile
+    participant PG as Delegation Postgres
+
+    DR->>DLG: POST /api/v1/delegations {...} + Idempotency-Key
+    DLG->>DLG: idempotency check (del:idem), pre-flight (self-delegation, scope_id, bounds vs local delegation_tenant_settings)
+    par membership checks (both parties)
+        DLG->>Core: GET /internal/tenants/:id/members/:delegator_id/exists
+        DLG->>Core: GET /internal/tenants/:id/members/:delegate_id/exists
+    end
+    alt either Core unreachable
+        DLG-->>DR: 503 org_membership_unavailable
+    else either not active
+        Core-->>DLG: {active false}
+        DLG-->>DR: 422 invalid_delegate
+    else both active (each returns tenant_membership_id)
+        DLG->>UP: PUT /internal/users/:delegator_id/availability {status ooo, delegate_id, ooo_note, ends_at}
+        alt UP 5xx/timeout
+            DLG-->>DR: 503 user_profile_unavailable
+        else UP 200
+            DLG->>PG: RunInTx { INSERT delegations with both membership ids, then outbox DelegationStarted }
+            DLG->>DLG: SET del:idem, DEL del:list cache
+            DLG-->>DR: 201 Created
+            Note over DLG,PG: DelegationStarted to iam.delegation.events, Workflow reroutes
+        end
+    end

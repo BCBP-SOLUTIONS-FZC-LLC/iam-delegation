@@ -1,0 +1,26 @@
+sequenceDiagram
+    autonumber
+    actor Admin
+    participant Core as Core (MembershipService.RemoveUser)
+    participant WF as Workflow Service
+    participant DLG as Delegation Service
+    participant PG as Delegation Postgres
+    participant UP as User Profile
+
+    Note over Core,WF: SYNCHRONOUS gate stays in Core
+    Admin->>Core: DELETE user (P-8 / I-5)
+    Core->>WF: GetDelegateImpact(tenant, user, optional delegation_id)
+    Core->>DLG: dept-level trigger, GET /internal/delegations/dept-delegate to get delegation_id (WFI-11)
+    alt active_workflows > 0
+        Core-->>Admin: 409 workflow_resolution_required
+        Admin->>Core: P-26 (replace_delegate to ReassignDelegate, or stop_workflows to CancelByDelegate)
+        Core->>WF: reassign or cancel, then re-check GetDelegateImpact (WFI-6)
+    end
+    Note over Core,DLG: removal applied, ASYNC row-end here
+    Core->>Core: RunInTx { remove membership }, then emit MembershipRevoked
+    Core-->>DLG: MembershipRevoked (SQS delegation-cascade-q)
+    DLG->>PG: end all active delegations where delegator_id=user OR delegate_id=user
+    loop per ended delegation
+        DLG->>UP: PUT /internal/users/:delegator_id/availability {delegate_id null} (DEL-6)
+        DLG->>PG: RunInTx { UPDATE status=ended, then outbox DelegationEnded delegate_removed } (delegate-side, delegator-side silent per DLG-EVT-4)
+    end

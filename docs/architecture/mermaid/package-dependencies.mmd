@@ -1,0 +1,36 @@
+graph LR
+    domain["core/domain\n(no internal imports —\nstdlib + uuid only, LLD §6.2)"]
+    port["core/port\n(imports domain only)"]
+    service["core/service\nDelegationService · SettingsService\n(imports domain, port, requestctx)"]
+    cascadeservice["core/service\nCascadeService\n(imports domain, port)"]
+    requestctx["pkg/requestctx\n(no internal imports)"]
+    eventschema["internal/eventschema\n(no internal imports)"]
+
+    http["adapter/inbound/http\n(imports domain, service, requestctx)"]
+    consumer["adapter/inbound/consumer\n(imports domain only — accepts\n*service.CascadeService via a\nlocal duck-typed interface, no\ndirect service import)"]
+
+    postgres["adapter/outbound/postgres\n(imports domain, port)"]
+    userprofile["adapter/outbound/userprofile\n(imports port only)"]
+    orgmembership["adapter/outbound/orgmembership\n(imports port only)"]
+    eventbus["adapter/outbound/eventbus\n(imports domain, eventschema)"]
+    valkey["adapter/outbound/valkey\n(imports domain, port)"]
+    metrics["adapter/outbound/metrics\n(no internal imports —\npure prometheus/client_golang)"]
+
+    port --> domain
+    service --> domain
+    service --> port
+    service --> requestctx
+    cascadeservice --> domain
+    cascadeservice --> port
+    http --> domain
+    http --> service
+    http --> requestctx
+    consumer --> domain
+    postgres --> domain
+    postgres --> port
+    userprofile --> port
+    orgmembership --> port
+    eventbus --> domain
+    eventbus --> eventschema
+    valkey --> domain
+    valkey --> port
