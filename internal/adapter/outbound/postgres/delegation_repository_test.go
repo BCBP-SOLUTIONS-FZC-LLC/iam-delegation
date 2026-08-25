@@ -93,7 +93,8 @@ func TestDelegationRepository_List_ListByDelegator_FindActiveByDelegator(t *test
 
 	byDelegator, err := repo.ListByDelegator(ctxA, tenantID, delegatorID)
 	require.NoError(t, err)
-	assert.Len(t, byDelegator, 2)
+	// ListByDelegator now filters status='active' only (BUG-02/GAP-01) — the ended row is excluded.
+	assert.Len(t, byDelegator, 1)
 
 	active, err := repo.FindActiveByDelegator(ctxA, tenantID, delegatorID)
 	require.NoError(t, err)
@@ -208,50 +209,35 @@ func TestDelegationRepository_FindActiveDeptDelegateForUser(t *testing.T) {
 func TestDelegationRepository_ReviewSweepFinders(t *testing.T) {
 	db := setupTestDB(t)
 	ctx := context.Background()
-	// These three finders have no tenant_id predicate (LLD §11.4 — they are
+	// These finders have no tenant_id predicate (LLD §11.4 — they are
 	// cross-tenant cron sweeps), so they must run against a BYPASSRLS pool
 	// exactly like the delegation_migrator role wired for the real cron.
 	repo := NewDelegationRepository(db.Bypass)
 	tenantID := uuid.New()
 	now := time.Now().UTC()
 
-	// 7d window: (now+3d, now+7d], review_last_warned_bucket IS NULL.
-	in7d := seedDelegation(t, ctx, db.Raw, seedDelegationOpts{TenantID: tenantID, Status: "active", ReviewDueAt: timePtr(now.Add(5 * 24 * time.Hour))})
-	// Exactly at the now+7d boundary — inclusive.
-	at7dBoundary := seedDelegation(t, ctx, db.Raw, seedDelegationOpts{TenantID: tenantID, Status: "active", ReviewDueAt: timePtr(now.Add(7 * 24 * time.Hour))})
-	// Just past now+7d — excluded.
-	_ = seedDelegation(t, ctx, db.Raw, seedDelegationOpts{TenantID: tenantID, Status: "active", ReviewDueAt: timePtr(now.Add(7*24*time.Hour + time.Minute))})
-	// Exactly at the now+3d boundary — excluded from the 7d window (boundary
-	// is exclusive on the near side there), but this same row legitimately
-	// falls inside the 3d window's inclusive far boundary too (a row due in
-	// exactly 3 days is a real 3-day-warning candidate) — asserted below.
-	sharedAt3dBoundary := seedDelegation(t, ctx, db.Raw, seedDelegationOpts{TenantID: tenantID, Status: "active", ReviewDueAt: timePtr(now.Add(3 * 24 * time.Hour))})
-	// In-window but already warned this cycle — excluded.
-	_ = seedDelegation(t, ctx, db.Raw, seedDelegationOpts{TenantID: tenantID, Status: "active", ReviewDueAt: timePtr(now.Add(6 * 24 * time.Hour)), ReviewLastWarnedBucket: intPtr(7)})
-
-	// 3d window: (now, now+3d], review_last_warned_bucket IS DISTINCT FROM 3.
+	// Daily-warn window: (now, now+3d] — no review_last_warned_bucket filter
+	// (that's done in the job layer).
 	in3d := seedDelegation(t, ctx, db.Raw, seedDelegationOpts{TenantID: tenantID, Status: "active", ReviewDueAt: timePtr(now.Add(2 * 24 * time.Hour))})
 	at3dBoundary := seedDelegation(t, ctx, db.Raw, seedDelegationOpts{TenantID: tenantID, Status: "active", ReviewDueAt: timePtr(now.Add(3 * 24 * time.Hour))})
-	// Already warned at 3 -> excluded.
-	_ = seedDelegation(t, ctx, db.Raw, seedDelegationOpts{TenantID: tenantID, Status: "active", ReviewDueAt: timePtr(now.Add(1 * 24 * time.Hour)), ReviewLastWarnedBucket: intPtr(3)})
+	// Just past now+3d — excluded from daily-warn window.
+	_ = seedDelegation(t, ctx, db.Raw, seedDelegationOpts{TenantID: tenantID, Status: "active", ReviewDueAt: timePtr(now.Add(3*24*time.Hour + time.Minute))})
 	// Exactly at now -> excluded (near-side exclusive).
 	_ = seedDelegation(t, ctx, db.Raw, seedDelegationOpts{TenantID: tenantID, Status: "active", ReviewDueAt: timePtr(now)})
+	// Already warned at 3 — still returned by FindDueForDailyWarn (job layer filters).
+	alreadyWarned3 := seedDelegation(t, ctx, db.Raw, seedDelegationOpts{TenantID: tenantID, Status: "active", ReviewDueAt: timePtr(now.Add(1 * 24 * time.Hour)), ReviewLastWarnedBucket: intPtr(3)})
+	// due now+1h — inside the window.
+	nearDue := seedDelegation(t, ctx, db.Raw, seedDelegationOpts{TenantID: tenantID, Status: "active", ReviewDueAt: timePtr(now.Add(time.Hour))})
+
+	gotDailyWarn, err := repo.FindDueForDailyWarn(ctx, now, 100)
+	require.NoError(t, err)
+	// All rows with review_due_at in (now, now+3d] are returned; job layer skips already-warned.
+	assert.ElementsMatch(t, []uuid.UUID{in3d, at3dBoundary, alreadyWarned3, nearDue}, idsOf(gotDailyWarn))
 
 	// Auto-end: review_due_at <= now.
 	overdue := seedDelegation(t, ctx, db.Raw, seedDelegationOpts{TenantID: tenantID, Status: "active", ReviewDueAt: timePtr(now.Add(-time.Hour))})
 	exactlyNow := seedDelegation(t, ctx, db.Raw, seedDelegationOpts{TenantID: tenantID, Status: "active", ReviewDueAt: timePtr(now)})
 	notYetDue := seedDelegation(t, ctx, db.Raw, seedDelegationOpts{TenantID: tenantID, Status: "active", ReviewDueAt: timePtr(now.Add(time.Hour))})
-
-	got7d, err := repo.FindDueForWarning7d(ctx, now, 100)
-	require.NoError(t, err)
-	assert.ElementsMatch(t, []uuid.UUID{in7d, at7dBoundary}, idsOf(got7d))
-
-	got3d, err := repo.FindDueForWarning3d(ctx, now, 100)
-	require.NoError(t, err)
-	// notYetDue (seeded below for the auto-end pass, due now+1h) also falls
-	// legitimately inside the 3d window's (now, now+3d] range — a row can be
-	// a genuine 3-day-warning candidate and not-yet-auto-end-due at once.
-	assert.ElementsMatch(t, []uuid.UUID{in3d, at3dBoundary, sharedAt3dBoundary, notYetDue}, idsOf(got3d))
 
 	gotAutoEnd, err := repo.FindDueForAutoEnd(ctx, now, 100)
 	require.NoError(t, err)

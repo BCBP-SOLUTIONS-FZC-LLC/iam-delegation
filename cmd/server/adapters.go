@@ -5,6 +5,7 @@ import (
 	"errors"
 
 	"github.com/BCBP-SOLUTIONS-FZC-LLC/iam-delegation/cmd/reconciler/jobs"
+	httpadapter "github.com/BCBP-SOLUTIONS-FZC-LLC/iam-delegation/internal/adapter/inbound/http"
 	pgadapter "github.com/BCBP-SOLUTIONS-FZC-LLC/iam-delegation/internal/adapter/outbound/postgres"
 	"github.com/BCBP-SOLUTIONS-FZC-LLC/iam-delegation/internal/core/domain"
 	"github.com/BCBP-SOLUTIONS-FZC-LLC/platform-events/pkg/outbox"
@@ -48,9 +49,12 @@ func (r reconcilerRunner) RunExpiry(ctx context.Context) (attempted, succeeded, 
 	return res.Attempted, res.Succeeded, res.Failed, err
 }
 
-func (r reconcilerRunner) RunReviewSweep(ctx context.Context) (warned7d, warned3d, expired, deferred int, err error) {
+func (r reconcilerRunner) RunReviewSweep(ctx context.Context) (httpadapter.ReviewSweepResult, error) {
 	res, err := jobs.ReviewSweep(ctx, r.jctx)
-	return res.Warned7d, res.Warned3d, res.Expired, res.Deferred, err
+	return httpadapter.ReviewSweepResult{
+		Warned3d: res.Warned3d, Warned2d: res.Warned2d, Warned1d: res.Warned1d,
+		Expired: res.Expired, Deferred: res.Deferred, Failed: res.Failed,
+	}, err
 }
 
 // redisPinger adapts *redis.Client to the httpadapter.Pinger shape

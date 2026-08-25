@@ -123,8 +123,9 @@ func run() error {
 	}
 	logger.Info("job complete", slog.String("job", *jobName),
 		slog.Int("attempted", result.Attempted), slog.Int("succeeded", result.Succeeded),
-		slog.Int("failed", result.Failed), slog.Int("warned_7d", result.Warned7d),
-		slog.Int("warned_3d", result.Warned3d), slog.Int("expired", result.Expired),
-		slog.Int("deferred", result.Deferred), slog.Int("purged", result.Purged))
+		slog.Int("failed", result.Failed), slog.Int("warned_3d", result.Warned3d),
+		slog.Int("warned_2d", result.Warned2d), slog.Int("warned_1d", result.Warned1d),
+		slog.Int("expired", result.Expired), slog.Int("deferred", result.Deferred),
+		slog.Int("purged", result.Purged))
 	return nil
 }

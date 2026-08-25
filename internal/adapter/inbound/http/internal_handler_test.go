@@ -58,9 +58,9 @@ func TestInternalHandler_Expire(t *testing.T) {
 func TestInternalHandler_ReviewSweep(t *testing.T) {
 	t.Run("injected runner invoked, result translated", func(t *testing.T) {
 		called := false
-		runner := &fakeReviewRunner{fn: func(ctx context.Context) (int, int, int, int, error) {
+		runner := &fakeReviewRunner{fn: func(ctx context.Context) (ReviewSweepResult, error) {
 			called = true
-			return 3, 2, 1, 0, nil
+			return ReviewSweepResult{Warned3d: 3, Warned2d: 2, Warned1d: 1, Expired: 1}, nil
 		}}
 		h := NewInternalHandler(&fakeExpiryRunner{}, runner, &fakeDelegationReader{})
 		c, w := newRequestWithIdentity(http.MethodPost, "/internal/delegations/review-sweep", nil, nil)
@@ -69,12 +69,12 @@ func TestInternalHandler_ReviewSweep(t *testing.T) {
 		require.Equal(t, http.StatusOK, w.Code)
 		var resp ReviewSweepRunResponse
 		require.NoError(t, json.Unmarshal(w.Body.Bytes(), &resp))
-		require.Equal(t, ReviewSweepRunResponse{Warned7d: 3, Warned3d: 2, Expired: 1, Deferred: 0}, resp)
+		require.Equal(t, ReviewSweepRunResponse{Warned3d: 3, Warned2d: 2, Warned1d: 1, Expired: 1, Deferred: 0, Failed: 0}, resp)
 	})
 
 	t.Run("runner error mapped", func(t *testing.T) {
-		runner := &fakeReviewRunner{fn: func(ctx context.Context) (int, int, int, int, error) {
-			return 0, 0, 0, 0, domain.NewError(domain.ErrUserProfileUnavailable, "down")
+		runner := &fakeReviewRunner{fn: func(ctx context.Context) (ReviewSweepResult, error) {
+			return ReviewSweepResult{}, domain.NewError(domain.ErrUserProfileUnavailable, "down")
 		}}
 		h := NewInternalHandler(&fakeExpiryRunner{}, runner, &fakeDelegationReader{})
 		c, w := newRequestWithIdentity(http.MethodPost, "/internal/delegations/review-sweep", nil, nil)

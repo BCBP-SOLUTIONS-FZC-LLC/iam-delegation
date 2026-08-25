@@ -23,12 +23,24 @@ type ExpiryRunner interface {
 	RunExpiry(ctx context.Context) (attempted, succeeded, failed int, err error)
 }
 
+// ReviewSweepResult carries the outcome counters from a single DLG-I2 run.
+// Using a struct avoids the >5-return-value lint violation (gocritic
+// tooManyResultsChecker) while keeping the interface clean.
+type ReviewSweepResult struct {
+	Warned3d int
+	Warned2d int
+	Warned1d int
+	Expired  int
+	Deferred int
+	Failed   int
+}
+
 // ReviewRunner backs DLG-I2 (POST /internal/delegations/review-sweep —
 // the delegation-review CronJob's entry point, LLD §11.4). Same
-// thin-wrapper rationale as ExpiryRunner: the dual 7d/3d warn + auto-end
+// thin-wrapper rationale as ExpiryRunner: the daily cascade warn + auto-end
 // orchestration lives in cmd/reconciler/jobs, injected here later.
 type ReviewRunner interface {
-	RunReviewSweep(ctx context.Context) (warned7d, warned3d, expired, deferred int, err error)
+	RunReviewSweep(ctx context.Context) (ReviewSweepResult, error)
 }
 
 // InternalHandler implements DLG-I1…I4 — mesh-only, mTLS trust boundary, no
@@ -66,21 +78,19 @@ func (h *InternalHandler) Expire(c *gin.Context) {
 // ReviewSweep is DLG-I2.
 //
 // @Summary      DLG-I2 — Run the delegation review-window sweep
-// @Description  Mesh-only. Dual 7d/3d warn passes over open-ended delegations, then an auto-end pass for those whose review_due_at has passed.
+// @Description  Mesh-only. Daily cascade warn pass over open-ended delegations (days_remaining ∈ {3,2,1}), then an auto-end pass for those whose review_due_at has passed.
 // @Tags         internal
 // @Produce      json
 // @Success      200  {object}  ReviewSweepRunResponse
 // @Failure      500  {object}  gincommon.ErrorResponse
 // @Router       /internal/delegations/review-sweep [post]
 func (h *InternalHandler) ReviewSweep(c *gin.Context) {
-	warned7d, warned3d, expired, deferred, err := h.review.RunReviewSweep(c.Request.Context())
+	res, err := h.review.RunReviewSweep(c.Request.Context())
 	if err != nil {
 		HandleError(c, err)
 		return
 	}
-	c.JSON(http.StatusOK, ReviewSweepRunResponse{
-		Warned7d: warned7d, Warned3d: warned3d, Expired: expired, Deferred: deferred,
-	})
+	c.JSON(http.StatusOK, ReviewSweepRunResponse(res))
 }
 
 // DeptDelegate is DLG-I3 — Core's §8.8.4 department-scope removal precision

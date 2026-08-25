@@ -145,12 +145,12 @@ func (f *fakeExpiryRunner) RunExpiry(ctx context.Context) (int, int, int, error)
 }
 
 type fakeReviewRunner struct {
-	fn func(ctx context.Context) (warned7d, warned3d, expired, deferred int, err error)
+	fn func(ctx context.Context) (ReviewSweepResult, error)
 }
 
-func (f *fakeReviewRunner) RunReviewSweep(ctx context.Context) (int, int, int, int, error) {
+func (f *fakeReviewRunner) RunReviewSweep(ctx context.Context) (ReviewSweepResult, error) {
 	if f.fn != nil {
 		return f.fn(ctx)
 	}
-	return 0, 0, 0, 0, nil
+	return ReviewSweepResult{}, nil
 }

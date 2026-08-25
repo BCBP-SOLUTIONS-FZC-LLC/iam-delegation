@@ -49,6 +49,17 @@ var errorStatusByCode = map[string]int{
 	domain.ErrUserProfileUnavailable.Error():   http.StatusServiceUnavailable,
 }
 
+// errorResponseWithDetails extends gincommon.ErrorResponse with a free-form
+// details map. Used instead of gincommon.ErrorResponse when domain.Error
+// carries non-nil Details (e.g. record_version on ErrOptimisticLockConflict).
+type errorResponseWithDetails struct {
+	Error     string         `json:"error"`
+	Status    int            `json:"status"`
+	TraceID   string         `json:"trace_id,omitempty"`
+	RequestID string         `json:"request_id,omitempty"`
+	Details   map[string]any `json:"details,omitempty"`
+}
+
 // writeError writes the standard gincommon.ErrorResponse envelope — the
 // real (flat Error/Status/TraceID/RequestID) shape platform-gincommon
 // ships today, verified via `go doc`, not the nested {"error":{...}} shape
@@ -62,10 +73,27 @@ func writeError(c *gin.Context, status int, code string) {
 	})
 }
 
+// writeErrorWithDetails writes the error envelope, including a non-nil
+// details map when present. Falls back to writeError when details is nil to
+// keep the common-path response shape unchanged.
+func writeErrorWithDetails(c *gin.Context, status int, code string, details map[string]any) {
+	if len(details) == 0 {
+		writeError(c, status, code)
+		return
+	}
+	c.AbortWithStatusJSON(status, errorResponseWithDetails{
+		Error:     code,
+		Status:    status,
+		TraceID:   gincommon.TraceIDFromContext(c),
+		RequestID: gincommon.RequestIDFromContext(c),
+		Details:   details,
+	})
+}
+
 // HandleError maps err onto the HTTP status from LLD §20 and writes it via
-// writeError. Any error that isn't a *domain.Error — or is one with a code
-// this adapter doesn't recognize — becomes a generic 500, never leaking
-// implementation detail.
+// writeErrorWithDetails. Any error that isn't a *domain.Error — or is one
+// with a code this adapter doesn't recognize — becomes a generic 500, never
+// leaking implementation detail.
 func HandleError(c *gin.Context, err error) {
 	var derr *domain.Error
 	if !errors.As(err, &derr) {
@@ -76,5 +104,5 @@ func HandleError(c *gin.Context, err error) {
 	if !ok {
 		status = http.StatusInternalServerError
 	}
-	writeError(c, status, derr.Code)
+	writeErrorWithDetails(c, status, derr.Code, derr.Details)
 }

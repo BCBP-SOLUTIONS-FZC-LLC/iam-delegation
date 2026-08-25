@@ -14,6 +14,7 @@ package jobs
 
 import (
 	"context"
+	"time"
 
 	"github.com/BCBP-SOLUTIONS-FZC-LLC/iam-delegation/internal/core/port"
 	"github.com/google/uuid"
@@ -36,33 +37,42 @@ type Logger interface {
 // the concrete function).
 type BindTenantGUC func(ctx context.Context, tenantID uuid.UUID, userID string) context.Context
 
+// ProcessedEventsStore is the minimal interface needed by the cleanup job to
+// purge the idempotency ledger. Satisfied by
+// *consumer.ProcessedEvents (LLD §18.4, GAP-09).
+type ProcessedEventsStore interface {
+	CleanupExpired(ctx context.Context, olderThan time.Duration) error
+}
+
 // Context carries every dependency a job needs. Delegations must be backed
 // by a BYPASSRLS pool (delegation_migrator) for the cross-tenant sweep
-// finder methods (ListExpiringBefore, FindDueForWarning7d/3d, FindDueForAutoEnd,
+// finder methods (ListExpiringBefore, FindDueForDailyWarn, FindDueForAutoEnd,
 // HardPurgeSoftDeletedBefore) to see rows across all tenants; TxRunner must
 // be backed by the RLS-scoped app pool so BindTenantGUC's per-row binding is
 // actually enforced on the write (LLD §7.3 roles table).
 type Context struct {
-	Delegations   port.DelegationRepository
-	UserProfile   port.UserProfileClient
-	TxRunner      port.TxRunner
-	BindTenantGUC BindTenantGUC
-	Logger        Logger
-	BatchLimit    int
-	RetentionDays int // delegation-cleanup only (LLD §18.4, default 90)
+	Delegations     port.DelegationRepository
+	UserProfile     port.UserProfileClient
+	TxRunner        port.TxRunner
+	BindTenantGUC   BindTenantGUC
+	Logger          Logger
+	BatchLimit      int
+	RetentionDays   int                  // delegation-cleanup only (LLD §18.4, default 90)
+	ProcessedEvents ProcessedEventsStore // delegation-cleanup only — purges the idempotency ledger (LLD §18.4, GAP-09); nil means skip
 }
 
 // Result aggregates every job's outcome counters. Unused fields stay zero —
 // delegation-expiry populates Attempted/Succeeded/Failed; delegation-review
-// populates Warned7d/Warned3d/Expired/Deferred; delegation-cleanup
+// populates Warned3d/Warned2d/Warned1d/Expired/Deferred; delegation-cleanup
 // populates Purged.
 type Result struct {
 	Attempted int
 	Succeeded int
 	Failed    int
 
-	Warned7d int
-	Warned3d int
+	Warned3d int // days_remaining=3
+	Warned2d int // days_remaining=2
+	Warned1d int // days_remaining=1
 	Expired  int
 	Deferred int
 

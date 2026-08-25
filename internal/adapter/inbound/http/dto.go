@@ -81,12 +81,13 @@ type DelegationExtendRequest struct {
 }
 
 // DelegationExtendResponse is DLG-4's exact 200 response shape (LLD §8.4) —
-// deliberately narrower than DelegationResponse: only these three fields
+// deliberately narrower than DelegationResponse: only these four fields
 // are documented on the wire for this route.
 type DelegationExtendResponse struct {
 	DelegationID           uuid.UUID  `json:"delegation_id"`
 	ReviewDueAt            *time.Time `json:"review_due_at"`
 	ReviewLastWarnedBucket *int       `json:"review_last_warned_bucket"`
+	RecordVersion          int64      `json:"record_version"`
 }
 
 // DelegationToExtendResponse builds DLG-4's response shape from a domain.Delegation.
@@ -95,6 +96,7 @@ func DelegationToExtendResponse(d domain.Delegation) DelegationExtendResponse {
 		DelegationID:           d.ID,
 		ReviewDueAt:            d.ReviewDueAt,
 		ReviewLastWarnedBucket: d.ReviewLastWarnedBucket,
+		RecordVersion:          d.RecordVersion,
 	}
 }
 
@@ -197,11 +199,13 @@ type ExpiryRunResponse struct {
 }
 
 // ReviewSweepRunResponse is the DLG-I2 response (LLD §11.4 sequence
-// diagram) — four independent counters across the dual 7d/3d warn passes
-// plus the auto-end pass.
+// diagram) — counters across the daily cascade warn pass plus the auto-end
+// pass.
 type ReviewSweepRunResponse struct {
-	Warned7d int `json:"warned_7d"`
-	Warned3d int `json:"warned_3d"`
+	Warned3d int `json:"warned_3d"` // days_remaining=3
+	Warned2d int `json:"warned_2d"` // days_remaining=2
+	Warned1d int `json:"warned_1d"` // days_remaining=1
 	Expired  int `json:"expired"`
 	Deferred int `json:"deferred"`
+	Failed   int `json:"failed"`
 }

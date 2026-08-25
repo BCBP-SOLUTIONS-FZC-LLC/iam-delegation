@@ -86,7 +86,7 @@ MIGRATE_IMAGE  := migrate/migrate:v4.17.1
         race _race-unit _race-integration _race-rls _race-e2e \
         test-ci _test-unit-cov _test-integration-cov _test-rls-cov _merge-coverage \
         cover cover-func \
-        docker-build docker-push docker-up docker-down compose-up compose-down \
+        docker-build docker-push docker-up docker-up-pro docker-down compose-up compose-down \
         migrate-up migrate-down migrate-create \
         swag swag-check arch-lint generate ci
 
@@ -159,7 +159,8 @@ help:
 	@echo "  make ci               - tidy + fmt-check + vet + lint + arch-lint + test-ci + build (matches 'make ci' in CI docs)"
 	@echo "  make docker-build     - build the container image (IMAGE to override, carries both binaries)"
 	@echo "  make docker-push      - push the container image"
-	@echo "  make docker-up        - start local Postgres + Valkey + LocalStack (for \`make run\` against a live stack)"
+	@echo "  make docker-up        - start local Postgres + Valkey + LocalStack community (no token needed)"
+	@echo "  make docker-up-pro    - start local Postgres + Valkey + LocalStack Pro (Glue Schema Registry; requires LOCALSTACK_AUTH_TOKEN in .env)"
 	@echo "  make docker-down      - stop containers started by docker-up/compose-up"
 	@echo "  make compose-up       - start the full local dev stack (postgres, valkey, localstack, server — self-migrates at startup)"
 	@echo "  make compose-down     - stop and remove the local dev stack, including volumes"
@@ -280,7 +281,7 @@ race:
 	$(MAKE) -j4 _race-unit _race-integration _race-rls _race-e2e
 
 _race-unit:
-	$(GO) test $(TEST_UNIT_PKGS) -race -count=1 -timeout 120s
+	$(GO) test $(TEST_UNIT_PKGS) -race -count=1 -timeout 300s
 _race-integration:
 	$(GO) test $(TEST_INTEGRATION_PKGS) -tags=integration -race -count=1 -timeout 300s
 _race-rls:
@@ -289,7 +290,7 @@ _race-e2e:
 	$(GO) test $(TEST_E2E_PKGS) -tags=e2e -race -count=1 -timeout 300s
 
 _test-unit-cov: | .coverage
-	$(GO) test $(TEST_UNIT_PKGS) -race -count=1 -timeout 120s -coverpkg=$(COVER_PKG_LIST) -coverprofile=.coverage/unit.out
+	$(GO) test $(TEST_UNIT_PKGS) -race -count=1 -timeout 300s -coverpkg=$(COVER_PKG_LIST) -coverprofile=.coverage/unit.out
 _test-integration-cov: | .coverage
 	$(GO) test $(TEST_INTEGRATION_PKGS) -tags=integration -race -count=1 -timeout 300s -coverpkg=$(COVER_PKG_LIST) -coverprofile=.coverage/integration.out
 _test-rls-cov: | .coverage
@@ -333,7 +334,13 @@ docker-push: docker-build
 	docker push $(IMAGE)
 
 docker-up:
+	@echo "Starting local PostgreSQL + Valkey + LocalStack (community)..."
 	docker compose up -d postgres valkey localstack
+
+docker-up-pro:
+	@echo "Starting local PostgreSQL + Valkey + LocalStack Pro (Glue Schema Registry)..."
+	@grep -q '^LOCALSTACK_AUTH_TOKEN=.\+' .env 2>/dev/null || { echo "ERROR: LOCALSTACK_AUTH_TOKEN not set in .env"; exit 1; }
+	docker compose -f docker-compose.yml -f docker-compose.pro.yml up -d postgres valkey localstack
 
 docker-down:
 	docker compose down

@@ -555,7 +555,7 @@ const docTemplate = `{
         },
         "/internal/delegations/review-sweep": {
             "post": {
-                "description": "Mesh-only. Dual 7d/3d warn passes over open-ended delegations, then an auto-end pass for those whose review_due_at has passed.",
+                "description": "Mesh-only. Daily cascade warn pass over open-ended delegations (days_remaining ∈ {3,2,1}), then an auto-end pass for those whose review_due_at has passed.",
                 "produces": [
                     "application/json"
                 ],
@@ -745,6 +745,9 @@ const docTemplate = `{
                 "delegation_id": {
                     "type": "string"
                 },
+                "record_version": {
+                    "type": "integer"
+                },
                 "review_due_at": {
                     "type": "string"
                 },
@@ -874,10 +877,19 @@ const docTemplate = `{
                 "expired": {
                     "type": "integer"
                 },
-                "warned_3d": {
+                "failed": {
                     "type": "integer"
                 },
-                "warned_7d": {
+                "warned_1d": {
+                    "description": "days_remaining=1",
+                    "type": "integer"
+                },
+                "warned_2d": {
+                    "description": "days_remaining=2",
+                    "type": "integer"
+                },
+                "warned_3d": {
+                    "description": "days_remaining=3",
                     "type": "integer"
                 }
             }

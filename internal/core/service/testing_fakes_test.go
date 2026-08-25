@@ -240,13 +240,8 @@ func (f *fakeDelegationRepository) FindActiveByDelegator(ctx context.Context, te
 	return nil, nil
 }
 
-func (f *fakeDelegationRepository) FindDueForWarning7d(ctx context.Context, now time.Time, limit int) ([]domain.Delegation, error) {
-	f.rec.record("delegationRepo.FindDueForWarning7d")
-	return nil, nil
-}
-
-func (f *fakeDelegationRepository) FindDueForWarning3d(ctx context.Context, now time.Time, limit int) ([]domain.Delegation, error) {
-	f.rec.record("delegationRepo.FindDueForWarning3d")
+func (f *fakeDelegationRepository) FindDueForDailyWarn(ctx context.Context, now time.Time, limit int) ([]domain.Delegation, error) {
+	f.rec.record("delegationRepo.FindDueForDailyWarn")
 	return nil, nil
 }
 

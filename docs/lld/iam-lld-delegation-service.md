@@ -23,6 +23,7 @@
 | 1.0 | 2026-08-20 | Initial extraction LLD under a no-contract-change constraint (**Option A** — Core kept an event-synced `delegations` projection so I-8 still served `active_delegations[]`). Carried O&M invariants DEL-1…DEL-14, introduced the `DLG-*` families, and left DLG-Q1…Q10 as sign-off items. |
 | 2.0 | 2026-08-20 | **Free-hand revision — the IAM subsystem is in development, nothing deployed.** With the backward-compatibility constraint lifted, DLG-Q9 resolves to **Option C**: `active_delegations[]` is removed from I-8 and **Core drops the `delegations` table entirely**, making the extraction symmetric with the three ADR-0007 cuts and leaving I-8 *faster* (four-table join). All other open questions are resolved as decisions (§19/§23): dedicated event topic `iam.delegation.events` (Q1); tenant delegation policy moves into this service as `delegation_tenant_settings` (Q2); mandatory create idempotency key (Q3); Core `MembershipRevoked`/`TenantOffboarded` signals (Q4); `ended_reason` gains `review_expired` (Q5); dual 7 d/3 d review warnings (Q6); fuller reassign body (Q7); canonical error taxonomy (Q8); active-at-create v1 scope (Q10). v1's projection is retained only as a documented fallback (§22). |
 | 2.1 | 2026-08-20 | **Depth/quality uplift to the `iam-lld-user-profile.md` standard.** No design change — this revision raises the document to the maturity bar of the User Profile LLD: §10 Event Architecture is expanded to that doc's §7 depth (inbound-consumer table with queue/DLQ/`maxReceiveCount`/filter policy; serialization; a full hand-authored `api/asyncapi.yaml` 3.0.0 skeleton with an `EventEnvelope` + `allOf` per-payload schemas; a Glue Schema Registry layout table, schema-evolution rules, and enqueue-vs-publish Go codec wiring; an outbound consumer→queue→DLQ fan-out table; a published-events catalogue; and an idempotency/ordering subsection). §7.3 RLS is expanded to the three-function fail-closed design (`app_tenant_id()`/`rls_check_tenant()`/`log_rls_violation()`) + `rls_violation_log` + per-table policies + roles + CI-verified RLS-1/2/4/6. §7.5 now shows the `touch_row()` trigger SQL + TRG-1/2/3. §11 gains a shared request preamble (§11.0) and per-endpoint diagrams for the remaining routes (§11.7). §14.1 gains a second SLO table (cache-vs-DB + background freshness) and a 99.9% availability target. No schema, API, or event *content* changed — this revision only brings the write-up to the sibling doc's standard. |
+| 2.2 | 2026-08-24 | **Bug-fix and notification-redesign revision.** Addresses five confirmed bugs (BUG-01…BUG-05) and fourteen LLD/design gaps (LLD-GAP-01…LLD-GAP-09, LLD-GAP-27, LLD-GAP-29) discovered during implementation review: (1) DLG-1 `ListByDelegator` must filter `status='active'` — currently returns cancelled/ended rows (BUG-02/GAP-01); (2) `EndForUser` cascade must add `AND status='active'` to prevent re-ending terminal rows and corrupting their `deleted_at` (GAP-02); (3) all time comparisons in Create use a single `now` capture (GAP-03); (4) `actor_id` in `DelegationEnded`/`DelegationReviewRequested` must reflect the actual triggering caller, not always the delegator (GAP-04); (5) DLG-4 Extend must invalidate the `del:list` Valkey cache and return `record_version` in its response (BUG-04/GAP-06); (6) `review_window_days` written on INSERT (GAP-07); (7) `DomainEvent.OccurredAt` must be set at enqueue time (GAP-08); (8) `processed_events.CleanupExpired` added to the monthly cleanup job (GAP-09); (9) deferred-counter metrics must be instrumented in reconciler jobs, not only registered (GAP-27); (10) error response `details` field must be included in HTTP responses for `delegation_window_too_long` and `optimistic_lock_conflict` (BUG-01); (11) `reason_too_long` cap is 500 Unicode characters (rune count), not 500 bytes (BUG-03); (12) compensating UP pointer-clear added to Create tx-failure path (BUG-05); (13) DLG-3 Cancel response body documented (GAP-29). **Notification redesign (DLG-Q6/DLG-D7):** the dual 7 d/3 d single-fire model is replaced by a **3-day daily cascade** — `DelegationReviewRequested` fires once per calendar-day in the 3-day window before `review_due_at` (`days_remaining ∈ {3,2,1}`), so delegators receive a notification on each of the three days leading up to auto-end rather than two single notices. `review_last_warned_bucket CHECK` updated accordingly. No code merges were blocked by this revision — all changes are spec corrections and the implementation must be updated to match. |
 
 ---
 
@@ -72,7 +73,7 @@ Delegation is a "two records, two owners" concern (O&M §2.3): this service owns
 - **Own per-tenant delegation policy** — `delegation_tenant_settings` (`max_duration_days`, `review_window_days`), relocated from Core's `tenants` row (DLG-Q2), read in-process at create/extend.
 - **Serve the lifecycle + policy API** — DLG-1…DLG-5 (list / create / cancel / extend / reassign) byte-compatible with old P-18/19/20/32/33, plus DLG-6/DLG-7 (get/set tenant policy).
 - **Coordinate availability-first with User Profile** — DEL-6 two-phase write on create; pointer-clear-only (`{delegate_id:null}`) on every end path.
-- **Run the two reconcilers** — `delegation-expiry` and `delegation-review` (dual 7 d/3 d warnings then auto-end), both availability-first and self-retrying.
+- **Run the two reconcilers** — `delegation-expiry` and `delegation-review` (3-day daily-cascade warnings then auto-end — see §11.4), both availability-first and self-retrying.
 - **Produce the delegation events** on the dedicated topic `iam.delegation.events`, driving Workflow reroute/restore, Notification fan-out, and Audit.
 - **Run the removal / offboarding cascade** — consume Core's `MembershipRevoked` / `TenantOffboarded` and end affected delegations asynchronously.
 - **Answer two internal reads for Core/consumers** — `GET /internal/delegations/dept-delegate` (Core's §8.8.4 removal precision) and `GET /internal/users/:id/active-delegations` (the escape hatch replacing I-8's removed field).
@@ -150,7 +151,7 @@ iam-delegation/
 │       ├── main.go                          -- --job=<name> dispatch (this chart's own convention)
 │       └── jobs/
 │           ├── delegation_expiry.go         -- DLG-I1 (*/5 * * * *, §11.3)
-│           ├── delegation_review.go         -- DLG-I2 (0 * * * *, dual 7d/3d warn, §11.4)
+│           ├── delegation_review.go         -- DLG-I2 (0 * * * *, 3-day daily cascade warn, §11.4)
 │           └── delegation_cleanup.go        -- soft-delete purge (0 4 1 * *, §11.6/§18.4)
 ├── internal/
 │   ├── core/
@@ -232,7 +233,7 @@ erDiagram
         timestamptz starts_at "NOT NULL DEFAULT now()"
         timestamptz ends_at "NULL = open-ended (DEL-8)"
         timestamptz review_due_at "open-ended only, starts_at + review window (DEL-13)"
-        int review_last_warned_bucket "7 or 3 or NULL, tracks which review notice fired (DLG-Q6)"
+        int review_last_warned_bucket "3, 2, 1, or NULL — last days_remaining value notified (DLG-Q6)"
         int review_window_days "per-delegation override, range 1..180 (DEL-14)"
         delegation_status status "ENUM active-ended-cancelled (DEL-3)"
         bigint record_version "optimistic lock"
@@ -284,8 +285,8 @@ CREATE TABLE delegations (
   starts_at      timestamptz NOT NULL DEFAULT now(),
   ends_at        timestamptz,                     -- NULL = open-ended (DEL-8)
   review_due_at            timestamptz,           -- open-ended only (DEL-13)
-  review_last_warned_bucket int CHECK (review_last_warned_bucket IN (7, 3)),  -- which review notice fired (DLG-Q6); NULL = none this cycle
-  review_window_days       int CHECK (review_window_days IS NULL OR review_window_days BETWEEN 1 AND 180),
+  review_last_warned_bucket int CHECK (review_last_warned_bucket IS NULL OR review_last_warned_bucket BETWEEN 1 AND 3),  -- last days_remaining value notified (DLG-Q6); NULL = no notification sent this cycle; values: 3, 2, 1
+  review_window_days       int CHECK (review_window_days IS NULL OR review_window_days BETWEEN 1 AND 180),  -- seeded from tenant review_window_days at INSERT time so DLG-4 per-row priority works
   status         delegation_status NOT NULL DEFAULT 'active',
   record_version bigint NOT NULL DEFAULT 1 CHECK (record_version > 0),
   created_at     timestamptz NOT NULL DEFAULT now(),
@@ -442,9 +443,9 @@ CREATE TRIGGER trg_touch_delegation_tenant_settings BEFORE UPDATE ON delegation_
 | **DEL-7** | Every end path emits `DelegationEnded{reason}`; delegator-side removal silent | **Owner changed** — cascade moves here (§11.5); asymmetry preserved (DLG-EVT-4). |
 | **DEL-8** | `ends_at IS NULL OR > starts_at`; NULL = open-ended | Unchanged. |
 | **DEL-9** | Both sides DB-anchored to same-tenant memberships | **DB-mechanism changed** — the composite FKs → §7.6.2 checks; `*_membership_id` stay `NOT NULL`. |
-| **DEL-10** | `reason` optional, ≤500, audit-only | Unchanged. |
+| **DEL-10** | `reason` optional, ≤500 **Unicode characters** (rune count, not byte length — multi-byte UTF-8 chars count as one character each), audit-only | Unchanged. |
 | DEL-11/12 | do not exist | n/a |
-| **DEL-13** | Open-ended review window | Unchanged mechanism; **now genuinely dual-warns (7 d + 3 d)** via `review_last_warned_bucket` (DLG-Q6). |
+| **DEL-13** | Open-ended review window | Unchanged mechanism; **now fires a daily cascade for the 3 days before `review_due_at`** (`days_remaining ∈ {3,2,1}`) via `review_last_warned_bucket` (DLG-Q6). The 7-day single warning is removed. |
 | **DEL-14** | Bounds by tenant `[1,180]`; `starts_at ≤ now()+1yr` | **Read-source changed** — caps read **in-process** from `delegation_tenant_settings` (DLG-Q2), no cross-service call; flat start bounds unchanged. |
 
 ### 7.6 Loss of the composite FKs — explicit treatment (the doubled §7.6)
@@ -522,7 +523,7 @@ Public routes `/api/v1/delegations*`, Envoy-fronted (`jwt_authn` + `ext_authz`),
 
 | ID | Old ID | Method & path | Auth | Notes |
 |---|---|---|---|---|
-| DLG-1 | P-18 | `GET /api/v1/delegations` | self | List active delegations (RLS-scoped) |
+| DLG-1 | P-18 | `GET /api/v1/delegations` | self | List **active** delegations (RLS-scoped; `status='active'` filter applied — cancelled/ended rows excluded) |
 | DLG-2 | P-19 | `POST /api/v1/delegations` | self | Create; availability-first; two membership checks; `Idempotency-Key` required (DLG-Q3) |
 | DLG-3 | P-20 | `DELETE /api/v1/delegations/:id` | self/admin | Cancel; pointer-clear UP first |
 | DLG-4 | P-32 | `POST /api/v1/delegations/:id/extend` | self/admin | Push `review_due_at`; open-ended only |
@@ -530,7 +531,7 @@ Public routes `/api/v1/delegations*`, Envoy-fronted (`jwt_authn` + `ext_authz`),
 | DLG-6 | from P-1 | `GET /api/v1/delegations/settings` | member | Tenant delegation policy (relocated from Core, DLG-Q2) |
 | DLG-7 | from P-2 | `PUT /api/v1/delegations/settings` | admin | Set policy `{max_duration_days, review_window_days}` in `[1,180]` |
 | DLG-I1 | (cron) | `POST /internal/delegations/expire` | iam-system | `delegation-expiry` |
-| DLG-I2 | (cron) | `POST /internal/delegations/review-sweep` | iam-system | `delegation-review` (dual 7d/3d) |
+| DLG-I2 | (cron) | `POST /internal/delegations/review-sweep` | iam-system | `delegation-review` (3-day daily cascade: warns at days_remaining=3, 2, 1 then auto-ends) |
 | DLG-I3 | new | `GET /internal/delegations/dept-delegate?tenant_id=&user_id=&dept_id=` | iam-system | Core's §8.8.4 removal precision (WFI-11) |
 | DLG-I4 | new | `GET /internal/users/:id/active-delegations` | iam-system | Escape hatch replacing I-8's removed field (§6.1); unused today |
 
@@ -563,18 +564,18 @@ Public routes `/api/v1/delegations*`, Envoy-fronted (`jwt_authn` + `ext_authz`),
 }
 ```
 
-Ordering (§7.6.4): pre-flight → two membership checks → UP availability (on `200`) → `RunInTx{ INSERT; outbox DelegationStarted }`. Bounds from **local** `delegation_tenant_settings` (DEL-14): span ≤ `max_duration_days` (`422 delegation_window_too_long`); `starts_at` within `(now()−skew, now()+1yr]`; `ends_at > starts_at`. `ooo_note` rides the UP call (not stored); `reason` is stored and forwarded to UP as the display note. **Idempotency (DLG-Q3):** a repeated `Idempotency-Key` within 24 h returns the original `201` without creating a second delegation.
+Ordering (§7.6.4): a single `now` timestamp is captured at the start of the request and reused for all time comparisons (skew check, future-start check, span check) — this guarantees the deterministic 5-second skew contract (GAP-03). Flow: pre-flight → two concurrent membership checks → UP availability (on `200`) → `RunInTx{ INSERT delegations (including review_window_days from tenant settings), outbox DelegationStarted }` → SET del:idem, INVALIDATE del:list cache. **If `RunInTx` fails after UP.SetAvailability succeeded**, a best-effort compensating `PUT /internal/users/:delegator_id/availability {delegate_id null}` is issued to clear the stale OOO pointer — failure is logged but does not change the error returned to the caller (BUG-05). Bounds from **local** `delegation_tenant_settings` (DEL-14): span ≤ `max_duration_days` (`422 delegation_window_too_long` — response body includes `details.max_duration_days`); `starts_at` within `(now()−5s skew, now()+1yr]`; `ends_at > starts_at`. The wire field for the note is **`ooo_note`** (stored in `delegations.reason`; forwarded to UP as the display note — DEL-10); sending a `reason` key is silently ignored. `reason` ≤ 500 **Unicode characters** (rune count). **Idempotency (DLG-Q3):** a repeated `Idempotency-Key` within 24 h returns the original delegation without creating a second row. Notification: `DelegationStarted` → Notification Service notifies **delegate (B)** ("You have been assigned as delegate") and **delegator (A)** (confirmation).
 
 #### DLG-4 — extend (old P-32)
 
 ```jsonc
 // POST /api/v1/delegations/:id/extend
-{ "extend_days": 90 }   // optional; default = tenant review_window_days (or row override); must be [1,180]
+{ "extend_days": 90, "record_version": 3 }   // extend_days optional; default = row review_window_days override, else tenant default; must be [1,180]
 // 200 OK
-{ "delegation_id": "del-uuid", "review_due_at": "2026-11-08T00:00:00Z", "review_last_warned_bucket": null }
+{ "delegation_id": "del-uuid", "review_due_at": "2026-11-08T00:00:00Z", "review_last_warned_bucket": null, "record_version": 4 }
 ```
 
-Open-ended only (`422 not_review_tracked` if fixed `ends_at`); `422 extend_days_out_of_range` outside `[1,180]`; computed from current `review_due_at`; resets `review_last_warned_bucket` to NULL (re-arms both warnings). No UP call.
+Open-ended only (`422 not_review_tracked` if fixed `ends_at`); `422 extend_days_out_of_range` outside `[1,180]`; pushes `review_due_at` forward from its current value by `extend_days`; resets `review_last_warned_bucket` to NULL (re-arms the 3-day daily cascade for the new window); **`record_version` is returned** so the caller can issue subsequent OCC operations without an extra DLG-1 round-trip (BUG-04); **invalidates `del:list` Valkey cache** for the delegator (GAP-06); no UP call. Priority for window: caller-supplied `extend_days` > per-row `review_window_days` override > tenant default.
 
 #### DLG-5 — reassign (old P-33; fuller body, DLG-Q7)
 
@@ -585,7 +586,30 @@ Open-ended only (`422 not_review_tracked` if fixed `ends_at`); `422 extend_days_
 { "delegation_id": "del-uuid-2", "delegator_id": "2b1f...", "delegate_id": "7cd1...", "status": "active" }
 ```
 
-Ends the current delegation (`DelegationEnded{cancelled}`) then creates a new one (full DLG-2 pre-flight incl. both membership checks). All body fields optional; each defaults to the current delegation's value. On UP failure for the new delegation, reassign aborts after the old ended (old not resurrected).
+Ends the current delegation (`DelegationEnded{cancelled}`) then creates a new one (full DLG-2 pre-flight incl. both membership checks, `max_duration_days` span check, and UP availability call). All body fields optional; each defaults to the current delegation's value. `ends_at: null` (explicitly provided) makes the new delegation open-ended; omitting `ends_at` key preserves the existing `ends_at`. Same for `scope_id`. **Partial-failure semantics (DLG-D11):** if Cancel succeeds but Create fails, the old delegation is permanently ended — the caller must issue a fresh DLG-2. `actor_id` in `DelegationEnded` for the old delegation is the actual triggering caller (admin or delegator).
+
+#### DLG-3 — cancel response body
+
+```jsonc
+// DELETE /api/v1/delegations/:id?record_version=N
+// 200 OK  (note: DELETE returns 200 with body, not 204)
+{
+  "delegation_id": "del-uuid",
+  "delegator_id": "2b1f...",
+  "delegate_id": "9ac3...",
+  "scope": "all",
+  "scope_id": null,
+  "starts_at": "2026-07-01T00:00:00Z",
+  "ends_at": "2026-07-14T23:59:59Z",
+  "status": "cancelled",
+  "record_version": 2,
+  "review_due_at": null,
+  "review_last_warned_bucket": null,
+  "review_window_days": null
+}
+```
+
+`actor_id` in the `DelegationEnded` event reflects the **actual caller** (the admin or the delegator themselves), not always the delegator. UP pointer-clear (`{delegate_id: null}`) is issued first, fail-open — if UP is down the cancellation still commits locally (DEL-6 pointer-clear-only rule). `record_version` absent or non-integer in the query param defaults to 0, which the optimistic-lock check rejects with `409`.
 
 #### DLG-7 — set tenant policy (relocated from Core P-2, DLG-Q2)
 
@@ -628,7 +652,9 @@ Valkey `del:` keyspace. **No cross-service config cache** (tenant policy is now 
 ```
 key := "del:list:" + tenant + ":" + delegator
 if v := valkey.GET(key); hit { return deserialize(v) }
-rows := SELECT ... FROM delegations WHERE tenant_id=$1 AND delegator_id=$2 AND deleted_at IS NULL ORDER BY starts_at DESC
+rows := SELECT ... FROM delegations
+        WHERE tenant_id=$1 AND delegator_id=$2 AND status='active' AND deleted_at IS NULL
+        ORDER BY starts_at DESC          -- status='active' filter is mandatory (BUG-02/GAP-01)
 valkey.SET(key, serialize(rows), 60s)
 return rows
 ```
@@ -723,9 +749,17 @@ A single SNS topic, `events.NewSNSPublisher` (no RoutingPublisher — one topic,
 |---|---|---|---|
 | `DelegationStarted` | DLG-2 create, and the create leg of DLG-5 reassign | `delegation_id, tenant_id, delegator_id, delegate_id, scope, scope_id, starts_at, ends_at, actor_id` | **Workflow Service** (reroute), Notification, Audit |
 | `DelegationEnded` | DLG-3 cancel, `ends_at` expiry (DLG-I1), review auto-end (DLG-I2), the end leg of DLG-5, and the delegate-removed cascade (§11.5) | `delegation_id, tenant_id, delegator_id, delegate_id, ended_reason, actor_id` — `ended_reason ∈ {expired, cancelled, delegate_removed, review_expired}` | **Workflow Service** (restore), Notification, Audit |
-| `DelegationReviewRequested` | `delegation-review` sweep at the 7-day and 3-day marks (DLG-I2) | `delegation_id, tenant_id, delegator_id, delegate_id, days_remaining` — `days_remaining ∈ {7,3}` | Notification, Audit |
+| `DelegationReviewRequested` | `delegation-review` sweep — once per calendar day for each of the 3 days before `review_due_at` (DLG-I2, DLG-Q6) | `delegation_id, tenant_id, delegator_id, delegate_id, days_remaining` — `days_remaining ∈ {3,2,1}` | Notification, Audit |
 
-Notes: (1) cron-origin events (`DelegationEnded` from expiry/review, `DelegationReviewRequested`) carry system sentinels — `ip_address:"system"`, `user_agent:"iam-delegation/delegation-expiry-cron"` or `".../delegation-review-cron"`, `actor: SystemActorID`. (2) `DelegationStarted`/`DelegationEnded` are the *authoritative* routing signals the Workflow Service acts on — distinct from User Profile's presentation-only `UserAvailabilityChanged` (O&M §2.3). (3) The delegator-side removal end is intentionally silent (no event) — the DEL-7 asymmetry (DLG-EVT-4).
+**Notification fan-out by event type:**
+
+| Event | Who Notification Service notifies |
+|---|---|
+| `DelegationStarted` | **Delegate (B)** — "You have been assigned as delegate for A's work"; **Delegator (A)** — confirmation that delegation is active |
+| `DelegationEnded` | **Delegator (A)** — "Your delegation has ended (`ended_reason`)"; **Delegate (B)** — "Delegation of A's work to you has ended" |
+| `DelegationReviewRequested` | **Delegator (A)** — "Your open delegation expires in N day(s) — extend or let it auto-end"; **Delegate (B)** — heads-up; **tenant_admin/tenant_owner** — copy (notify-only) |
+
+Notes: (1) cron-origin events (`DelegationEnded` from expiry/review, `DelegationReviewRequested`) carry system sentinels — `ip_address:"system"`, `user_agent:"iam-delegation/delegation-expiry-cron"` or `".../delegation-review-cron"`, `actor: SystemActorID`. (2) `DelegationStarted`/`DelegationEnded` are the *authoritative* routing signals the Workflow Service acts on — distinct from User Profile's presentation-only `UserAvailabilityChanged` (O&M §2.3). (3) The delegator-side removal end is intentionally silent (no event) — the DEL-7 asymmetry (DLG-EVT-4). (4) `actor_id` in `DelegationEnded` (from DLG-3/DLG-5) must reflect the **actual triggering caller** (the admin or the delegator), not always the delegator's ID. (5) `DomainEvent.OccurredAt` **must be set to `time.Now().UTC()` at enqueue time** — the event envelope `time` field (RFC 3339) depends on it (GAP-08).
 
 ### 10.6 Idempotency and ordering
 
@@ -739,7 +773,7 @@ Publishing is at-least-once (outbox + SNS); every consumer is idempotent via `pr
 | DLG-EVT-2 | Event `type` values and payload `data` shapes are byte-identical to O&M §7.4 (plus the `review_expired` enum value and the topic/`source` change); consumers dispatch by `type` on `iam.delegation.events`. |
 | DLG-EVT-3 | `DelegationEnded` fires on **every** end path — cancel (`cancelled`), `ends_at` expiry (`expired`), review auto-end (`review_expired`), delegate-removed cascade (`delegate_removed`) — never path-dependent (DEL-7). |
 | DLG-EVT-4 | Delegator-side removal ends the row **silently** (no event), preserving the O&M DEL-7 asymmetry as a deliberate carry-over. |
-| DLG-EVT-5 | The `delegation-review` sweep emits `DelegationReviewRequested` at most once per bucket (7 then 3) per cycle, tracked by `review_last_warned_bucket` (DLG-Q6); extend/reassign reset it to NULL, re-arming both. |
+| DLG-EVT-5 | The `delegation-review` sweep emits `DelegationReviewRequested` **once per calendar-day bucket** in the 3-day window before `review_due_at`. `days_remaining` decrements from 3 → 2 → 1 across consecutive daily cron ticks. `review_last_warned_bucket` tracks the last `days_remaining` value notified; extend/reassign reset it to NULL, re-arming the full 3-day cascade for the new window (DLG-Q6). |
 | DLG-EVT-6 | Audit consumes all three types on `delegation-audit-q` (no filter); every event and its DB effect are traceable via the shared `trace_id` (§14.3); cron events carry system sentinels. |
 | DLG-EVT-7 | Payloads are self-contained snapshots; consumers are idempotent (`processed_events`) and order-insensitive, converging on the latest state (§10.6). |
 
@@ -798,10 +832,15 @@ sequenceDiagram
         alt UP 5xx/timeout
             DLG-->>DR: 503 user_profile_unavailable
         else UP 200
-            DLG->>PG: RunInTx { INSERT delegations with both membership ids, then outbox DelegationStarted }
-            DLG->>DLG: SET del:idem, DEL del:list cache
-            DLG-->>DR: 201 Created
-            Note over DLG,PG: DelegationStarted to iam.delegation.events, Workflow reroutes
+            DLG->>PG: RunInTx { INSERT delegations (incl. review_window_days from tenant settings), outbox DelegationStarted }
+            alt RunInTx fails (DB error, pool exhaustion, etc.)
+                DLG->>UP: PUT /internal/users/:delegator_id/availability {delegate_id null} (best-effort compensating clear — BUG-05)
+                DLG-->>DR: 500 / appropriate error
+            else RunInTx ok
+                DLG->>DLG: SET del:idem, INVALIDATE del:list cache
+                DLG-->>DR: 201 Created
+                Note over DLG,PG: DelegationStarted → iam.delegation.events; Notification Service notifies A (confirmation) and B (assigned as delegate); Workflow reroutes
+            end
         end
     end
 ```
@@ -853,38 +892,60 @@ sequenceDiagram
     DLG-->>CR: {attempted, succeeded, failed}
 ```
 
-### 11.4 Review-window cron (DLG-I2) — dual 7 d/3 d warn, then auto-end (DLG-Q6)
+### 11.4 Review-window cron (DLG-I2) — 3-day daily cascade, then auto-end (DLG-Q6)
+
+**Design:** instead of two single-fire notices (old 7 d + 3 d model), the sweep sends one notification per calendar day for each of the three days before `review_due_at`. A delegator whose `review_due_at` is Aug 30 receives:
+
+| Date | `days_remaining` | Event fired |
+|---|---|---|
+| Aug 27 | 3 | `DelegationReviewRequested{days_remaining:3}` |
+| Aug 28 | 2 | `DelegationReviewRequested{days_remaining:2}` |
+| Aug 29 | 1 | `DelegationReviewRequested{days_remaining:1}` |
+| Aug 30 | — | `DelegationEnded{review_expired}` (auto-end) |
+
+Notification service fans out each `DelegationReviewRequested` to: **delegator (A)** ("Your delegation expires in N day(s) — extend or let it auto-end"), **delegate (B)** (heads-up), and **tenant_admin/tenant_owner** (copy).
+
+**`days_remaining` computation:** `CEIL((review_due_at − now()) / interval '1 day')`, clamped to `[1, 3]`. Because the cron runs hourly, only the first tick within a calendar day fires the notification — subsequent ticks within the same day see `review_last_warned_bucket = days_remaining` and skip.
 
 ```mermaid
 sequenceDiagram
     autonumber
-    participant CR as delegation-review CronJob
+    participant CR as delegation-review CronJob (hourly, 0 * * * *)
     participant DLG as Delegation Service
     participant UP as User Profile
     participant PG as Delegation Postgres
 
     CR->>DLG: POST /internal/delegations/review-sweep
-    DLG->>PG: Pass 1a (7d warn) WHERE ends_at IS NULL AND status=active AND review_due_at in (now()+3d, now()+7d] AND review_last_warned_bucket IS NULL
-    loop per 7d target
-        DLG->>PG: RunInTx { UPDATE review_last_warned_bucket=7, then outbox DelegationReviewRequested days_remaining=7 }
+    Note over DLG: Pass 1 — daily cascade warn
+    DLG->>PG: SELECT WHERE ends_at IS NULL AND status='active' AND review_due_at > now() AND review_due_at <= now()+3d AND status='active' AND deleted_at IS NULL ORDER BY review_due_at LIMIT 100
+    loop per target row
+        DLG->>DLG: days_remaining = CEIL((review_due_at − now()) / 1 day) clamped to [1,3]
+        alt review_last_warned_bucket IS DISTINCT FROM days_remaining
+            DLG->>PG: RunInTx { UPDATE review_last_warned_bucket=days_remaining AND status='active', outbox DelegationReviewRequested{days_remaining} }
+        else already notified today
+            DLG->>DLG: skip (idempotent)
+        end
     end
-    DLG->>PG: Pass 1b (3d warn) WHERE ends_at IS NULL AND status=active AND review_due_at in (now(), now()+3d] AND review_last_warned_bucket IS DISTINCT FROM 3
-    loop per 3d target
-        DLG->>PG: RunInTx { UPDATE review_last_warned_bucket=3, then outbox DelegationReviewRequested days_remaining=3 }
-    end
-    DLG->>PG: Pass 2 (auto-end) WHERE ends_at IS NULL AND status=active AND review_due_at <= now()
+    Note over DLG: Pass 2 — auto-end
+    DLG->>PG: SELECT WHERE ends_at IS NULL AND status='active' AND review_due_at <= now() AND deleted_at IS NULL ORDER BY review_due_at LIMIT 100
     loop per end target
         DLG->>UP: PUT /internal/users/:delegator_id/availability {delegate_id null}
         alt UP ok
-            DLG->>PG: RunInTx { UPDATE status=ended, then outbox DelegationEnded review_expired }
+            DLG->>PG: RunInTx { UPDATE status='ended' AND status='active' at record_version v, outbox DelegationEnded{review_expired} }
         else UP fail
-            DLG->>DLG: defer (DEL-6), retry next tick
+            DLG->>DLG: defer — increment iam_delegation_review_deferred_total, retry next tick (DEL-6)
         end
     end
-    DLG-->>CR: {warned_7d, warned_3d, expired, deferred}
+    DLG-->>CR: {warned_3d, warned_2d, warned_1d, expired, deferred}
 ```
 
-Fixed-`ends_at` delegations are never considered (the sweep selects `ends_at IS NULL`). The `review_last_warned_bucket` marker makes the 7 d notice fire once and the 3 d notice fire once; extend/reassign reset it to NULL, re-arming both.
+**Key properties:**
+- Fixed-`ends_at` delegations are **never** considered (all passes select `ends_at IS NULL`).
+- `review_last_warned_bucket` is scoped to the **current days_remaining value** — the cron fires at most one notification per integer-day mark per delegation. As `review_due_at` approaches, `days_remaining` decrements naturally (3 → 2 → 1) across consecutive days, each triggering a new notification.
+- `MarkReviewWarned` UPDATE includes `AND status='active'` to ensure terminal rows return `404` (not misleading `409`) via the probe.
+- Extend/reassign reset `review_last_warned_bucket` to NULL, re-arming the full 3-day cascade for the new `review_due_at` window.
+- Batch limit: 100 rows per pass per tick. Tenants with >100 delegations entering the window simultaneously are processed across consecutive hourly ticks (the `review_last_warned_bucket IS DISTINCT FROM days_remaining` guard prevents duplicates).
+- Deferred counter `iam_delegation_review_deferred_total` **must be incremented** in the reconciler job on every UP failure (DLG-D19 gap closure — the production alert fires on sustained non-zero deferral).
 
 ### 11.5 User removal — synchronous gate in Core, async row-end here
 
@@ -910,10 +971,15 @@ sequenceDiagram
     Note over Core,DLG: removal applied, ASYNC row-end here
     Core->>Core: RunInTx { remove membership }, then emit MembershipRevoked
     Core-->>DLG: MembershipRevoked (SQS delegation-cascade-q)
-    DLG->>PG: end all active delegations where delegator_id=user OR delegate_id=user
+    DLG->>PG: UPDATE delegations SET status='ended', deleted_at=now() WHERE tenant_id=$1 AND (delegator_id=$2 OR delegate_id=$2) AND status='active' AND deleted_at IS NULL
+    Note over DLG,PG: status='active' filter is mandatory — prevents re-ending terminal rows and corrupting deleted_at on historical records (GAP-02)
     loop per ended delegation
-        DLG->>UP: PUT /internal/users/:delegator_id/availability {delegate_id null} (DEL-6)
-        DLG->>PG: RunInTx { UPDATE status=ended, then outbox DelegationEnded delegate_removed } (delegate-side, delegator-side silent per DLG-EVT-4)
+        alt d.delegator_id == removedUser (delegator-side row)
+            DLG->>DLG: silent — no UP call, no event (delegator's OOO state is on their own UP record, handled by UP's user-removal flow); DLG-EVT-4 asymmetry
+        else d.delegate_id == removedUser (delegate-side row)
+            DLG->>UP: PUT /internal/users/:delegator_id/availability {delegate_id null} (DEL-6 — clear delegator's OOO pointer)
+            DLG->>PG: RunInTx { outbox DelegationEnded{delegate_removed} }
+        end
     end
 ```
 
@@ -1031,7 +1097,7 @@ Public behind Envoy; `/internal/*` (DLG-I1…I4) mesh-only mTLS via the internal
 
 ### 13.3 Input validation
 
-Mirrors the DB CHECKs and DEL invariants: scope in enum; scope↔scope_id; `reason ≤ 500`; `starts_at` within `(now()−skew, now()+1yr]`; `ends_at > starts_at`; span ≤ tenant `max_duration_days`; `extend_days` in `[1,180]`; policy days in `[1,180]`.
+Mirrors the DB CHECKs and DEL invariants: scope in enum; scope↔scope_id; `reason ≤ 500 Unicode characters` (rune count — **not** byte length; a Japanese or emoji-heavy note of 500 characters is accepted regardless of byte size, BUG-03); `starts_at` within `(now()−5s skew, now()+1yr]` where **`now` is captured once at request entry and reused for all time comparisons** (GAP-03 — two separate `time.Now()` calls would break the deterministic 5-second skew contract); `ends_at > starts_at`; span ≤ tenant `max_duration_days` (error response includes `details.max_duration_days` — BUG-01); `extend_days` in `[1,180]`; policy days in `[1,180]`; `Idempotency-Key` header must be non-empty and ≤ 256 characters.
 
 ### 13.4 Authorization rules
 
@@ -1075,7 +1141,9 @@ Mirrors the DB CHECKs and DEL invariants: scope in enum; scope↔scope_id; `reas
 
 ### 14.2 Metrics
 
-`iam_delegation_created_total{scope}`, `iam_delegation_ended_total{ended_reason}` (now incl. `review_expired`), `iam_delegation_active_gauge{tenant}`, `iam_delegation_expiry_deferred_total`, `iam_delegation_review_deferred_total`, `iam_delegation_review_warned_total{days_remaining}`, `iam_delegation_review_expired_total`, `iam_delegation_membership_check_duration_seconds`, `iam_delegation_membership_check_failures_total`, `iam_delegation_up_availability_failures_total{path}`, `iam_delegation_idempotency_hits_total`, `iam_delegation_cascade_processed_total`, `iam_delegation_cascade_dlq_total`, plus passthrough `http_*`/`events_*`/`sqs_*`. **No projection-lag metric** (Option C removed the projection).
+`iam_delegation_created_total{scope}`, `iam_delegation_ended_total{ended_reason}` (now incl. `review_expired`), `iam_delegation_active_gauge{tenant}`, `iam_delegation_expiry_deferred_total`, `iam_delegation_review_deferred_total`, `iam_delegation_review_warned_total{days_remaining}` (label values now `3`, `2`, `1`), `iam_delegation_review_expired_total`, `iam_delegation_membership_check_duration_seconds`, `iam_delegation_membership_check_failures_total`, `iam_delegation_up_availability_failures_total{path}`, `iam_delegation_idempotency_hits_total`, `iam_delegation_cascade_processed_total`, `iam_delegation_cascade_dlq_total`, plus passthrough `http_*`/`events_*`/`sqs_*`. **No projection-lag metric** (Option C removed the projection).
+
+**Instrumentation requirement (GAP-27 / DLG-D19 gap closure):** `iam_delegation_expiry_deferred_total` and `iam_delegation_review_deferred_total` **must be incremented from the reconciler jobs** on every UP-failure defer — not only registered. The §14.5 alert "expiry_deferred > 0 sustained 30 min" is unenforceable if the counter is never incremented. Both counters are already computed in `jobs.Result.Deferred`; the jobs must call `metrics.RecordExpiryDeferred()` / `metrics.RecordReviewDeferred()` for each deferred row.
 
 ### 14.3 Tracing and logging
 
@@ -1127,13 +1195,13 @@ The O&M `DELEGATION_REVIEW_WINDOW_DAYS` env var is gone entirely — the window 
 
 ## 17. Testing Strategy
 
-**17.1 Unit.** DEL-1…DEL-14 branches; availability-first ordering; pointer-clear-only; optimistic-lock 404-vs-409; extend range/open-ended; reassign end-then-create; idempotency replay; dual-warning bucket transitions (7 then 3, reset on extend).
+**17.1 Unit.** DEL-1…DEL-14 branches; availability-first ordering (UP called before RunInTx, compensating clear on tx failure — BUG-05); pointer-clear-only (Cancel UP call must use `ClearDelegate=true`, `Status=nil` — never set status to "available"); optimistic-lock 404-vs-409; extend range/open-ended; `review_last_warned_bucket` reset to NULL after extend (re-arms 3-day daily cascade); `record_version` in extend response; reassign end-then-create including `max_duration_days` enforcement on the new leg; idempotency replay; **3-day daily-cascade bucket transitions (days_remaining: 3 → 2 → 1, reset on extend)** — the 7-day single-fire model is removed; `review_window_days` written on INSERT; DLG-1 returns `status='active'` rows only. Test UP call shape on Cancel: assert `ClearDelegate=true`, `Status=nil`. Test membership checks run concurrently (use a barrier to prove overlap, not just ordering).
 
-**17.2 Integration.** Postgres testcontainer with RLS: repository CRUD, cron sweeps (`idx_delegations_ends_at`, `idx_delegations_review_due`), `review_last_warned_bucket` firing both notices once, soft-delete cascade, `record_version` trigger, `delegation_tenant_settings` upsert/default, `processed_events` dedup. Port the shipped `p19_delegation_coverage_test.go` / `tenant_delegation_happy_test.go`.
+**17.2 Integration.** Postgres testcontainer with RLS: repository CRUD (`ListByDelegator` must filter `status='active'`; `FindDueForWarning` must exclude warned rows on re-query; `MarkReviewWarned` must include `AND status='active'`; `EndForUser` must include `AND status='active'`), cron sweeps (`idx_delegations_ends_at`, `idx_delegations_review_due`), sequential state-machine test for daily cascade (seed delegation → tick at 3d → assert warned_3d=1 → tick at 2d → assert warned_2d=1 → tick at 1d → assert warned_1d=1 → tick past → assert expired=1), `record_version` trigger, `delegation_tenant_settings` upsert/default, `processed_events` dedup (including `MarkProcessed` failure → redeliver idempotent path). RLS-6 cron/cascade GUC-less write path test. Port the shipped `p19_delegation_coverage_test.go` / `tenant_delegation_happy_test.go`.
 
-**17.3 Contract.** Membership-check mock: two calls, both `tenant_membership_id`s stored, `{active:false}` gives `422`, response must carry `tenant_membership_id` (DLG-D3). **Core-side regression:** assert I-8's response **no longer contains** `active_delegations[]` and its SQL joins four tables (the Option-C removal). DLG-I4 returns the identical six-field shape I-8 used to embed. AsyncAPI: validate the three payloads incl. `review_expired`.
+**17.3 Contract.** Membership-check mock: two calls issued **concurrently** (verify with barrier, not just ordering), both `tenant_membership_id`s stored, `{active:false}` gives `422`, response must carry `tenant_membership_id` (DLG-D3). DLG-I4 returns all six LLD-specified fields (`delegation_id`, `delegator_id`, `delegate_id`, `scope`, `scope_id`, `ends_at`) including nil variants. DLG-4 extend response includes `record_version`. DLG-7 partial body (zero-valued field) → 400. **Core-side regression:** assert I-8's response **no longer contains** `active_delegations[]` and its SQL joins four tables (the Option-C removal). AsyncAPI: validate the three payloads incl. `review_expired`; `days_remaining ∈ {1,2,3}`.
 
-**17.4 E2E.** Create → Workflow reroute event → cancel → restore event; expiry ends past-`ends_at` + re-clears availability; review warns at 7 d then 3 d then auto-ends `review_expired`; user removal → Core gate `409` → P-26 → removal → async cascade ends rows + emits `delegate_removed`.
+**17.4 E2E.** Create → Workflow reroute event → A and B both notified (DelegationStarted) → cancel → restore event; expiry ends past-`ends_at` + re-clears availability; review daily cascade (warns at days_remaining=3, 2, 1 then auto-ends `review_expired`); user removal → Core gate `409` → P-26 → removal → async cascade ends **active-only** rows + emits `delegate_removed`.
 
 ### 17.5 RLS test cases (canonical)
 
@@ -1168,7 +1236,9 @@ UPDATE delegations SET deleted_at = now() WHERE tenant_id = 'bbbbbbbb-...';  -- 
 
 **18.3 Residency.** Single-region RDS/ElastiCache (HLD §7.1).
 
-**18.4 Retention.** Active until ended/cancelled/expired, then soft-deleted 90 days, then purge; `processed_events` 30 days; delegation events per Audit Log policy.
+**18.4 Retention.** Active until ended/cancelled/expired, then soft-deleted 90 days, then hard-purge (`delegation-cleanup` CronJob, monthly). **`processed_events` 30-day retention is enforced by calling `CleanupExpired(30 days)` from within the monthly `delegation-cleanup` job** (GAP-09 — without this call the table grows without bound). Delegation events per Audit Log policy.
+
+> **Important:** regular `End`/`Cancel` operations do NOT set `deleted_at` — only `EndForUser` cascade and explicit soft-deletes do. The cleanup cron targets `deleted_at IS NOT NULL`. Cancelled/ended delegations without `deleted_at` remain in the DB indefinitely as historical records and are excluded from DLG-1 via the `status='active'` filter.
 
 ---
 
@@ -1181,7 +1251,7 @@ All v1 open questions are **resolved as decisions** for this development-stage b
 - **DLG-Q3 — Create idempotency. RESOLVED:** mandatory `Idempotency-Key` on DLG-2, 24 h dedup (§9.2).
 - **DLG-Q4 — Core removal signal. RESOLVED:** Core emits `MembershipRevoked{tenant_id, user_id, actor_id}` + `TenantOffboarded`; consumed on `delegation-cascade-q` (§10.2). *(Requires the Core team to add the `MembershipRevoked` emission — a development task, tracked with Core.)*
 - **DLG-Q5 — `review_expired` end-reason. RESOLVED:** added to the enum, `[expired, cancelled, delegate_removed, review_expired]` (§7.1/§10).
-- **DLG-Q6 — Review cadence. RESOLVED:** dual 7 d + 3 d warnings via `review_last_warned_bucket`; `days_remaining` in `{7,3}` (§7.2.1/§11.4).
+- **DLG-Q6 — Review cadence. RESOLVED (revised in v2.2):** ~~dual 7 d + 3 d single-fire warnings~~ replaced by a **3-day daily cascade** — `DelegationReviewRequested` fires once per calendar day for each of the 3 days before `review_due_at`; `days_remaining ∈ {3,2,1}`; `review_last_warned_bucket` CHECK updated to `BETWEEN 1 AND 3`; `review_warned_total{days_remaining}` label values updated accordingly (§7.2.1/§11.4). The 7-day warning is removed entirely.
 - **DLG-Q7 — Reassign surface. RESOLVED:** fuller body `{new_delegate_id?, scope?, scope_id?, ends_at?, reason?}` (§8.4).
 - **DLG-Q8 — Error taxonomy. RESOLVED:** §20 — keep `scope_id_required`/`not_review_tracked`; add `invalid_scope_id`, `reason_too_long`; drop `delegation_not_open_ended`.
 - **DLG-Q9 — Drop the Core projection (Option C). RESOLVED:** yes — `active_delegations[]` removed from I-8, Core drops the `delegations` table (§6.1, ADR-0008 §13.1).
@@ -1193,27 +1263,39 @@ The one item still requiring **cross-team coordination** (not a design open ques
 
 ## 20. Appendix — Error Taxonomy
 
-`gincommon.ErrorResponse`: `{ "error": { "code", "message", "request_id", "trace_id", "details" } }`. Canonical, reconciled per DLG-Q8.
+`gincommon.ErrorResponse` wire shape (BUG-01 correction — the implementation uses a flat shape, not nested):
 
-| `code` | HTTP | Meaning |
-|---|---|---|
-| `invalid_delegation_scope` | 400 | `scope` not in `{all, department, tender}` |
-| `invalid_delegation_max_duration_days` | 400 | DLG-7 `max_duration_days` outside `[1,180]` |
+```json
+{
+  "error":      "delegation_window_too_long",
+  "status":     422,
+  "trace_id":   "abc123",
+  "request_id": "req-xyz",
+  "details":    { "max_duration_days": 30 }
+}
+```
+
+`details` is a free-form map that **must be included in the HTTP response body** for errors that carry actionable context. Specifically: `delegation_window_too_long` must include `details.max_duration_days` (the tenant's current cap); `optimistic_lock_conflict` must include `details.record_version` (the current DB value, so the caller can retry without an extra GET). Canonical error codes, reconciled per DLG-Q8:
+
+| `code` | HTTP | Meaning | `details` |
+|---|---|---|---|
+| `invalid_delegation_scope` | 400 | `scope` not in `{all, department, tender}` | — |
+| `invalid_delegation_max_duration_days` | 400 | DLG-7 `max_duration_days` outside `[1,180]` | — |
 | `invalid_delegation_review_window_days` | 400 | DLG-7 `review_window_days` outside `[1,180]` |
 | `scope_id_required` | 422 | `scope_id` missing for `department`/`tender` |
 | `invalid_scope_id` | 422 | `scope_id` present when `scope='all'` |
 | `self_delegation` | 422 | `delegator_id == delegate_id` |
 | `invalid_delegate` | 422 | Delegate (or delegator) not an active member (§7.6.2, or a UP 4xx race) |
 | `delegate_unavailable` | 422 | Delegate is themselves OOO (from User Profile) |
-| `reason_too_long` | 422 | `reason` exceeds 500 chars |
-| `delegation_window_inverted` | 422 | `ends_at <= starts_at` |
-| `delegation_window_too_long` | 422 | Fixed span exceeds tenant `max_duration_days` (DEL-14) |
+| `reason_too_long` | 422 | `reason` exceeds 500 **Unicode characters** (rune count — not byte length; BUG-03) | — |
+| `delegation_window_inverted` | 422 | `ends_at <= starts_at` | — |
+| `delegation_window_too_long` | 422 | Fixed span exceeds tenant `max_duration_days` (DEL-14) | `details.max_duration_days` (the current tenant cap — **must be included so callers know what to fix**) |
 | `delegation_start_in_past` | 422 | `starts_at` before `now()` (5 s skew) |
 | `delegation_start_too_far_future` | 422 | `starts_at` more than 1 year ahead (DEL-14) |
 | `not_review_tracked` | 422 | DLG-4 extend on a fixed-`ends_at` delegation |
 | `extend_days_out_of_range` | 422 | DLG-4 `extend_days` outside `[1,180]` |
 | `delegation_not_found` | 404 | Not resolvable in caller's tenant (or terminal, DEL-3) |
-| `optimistic_lock_conflict` | 409 | `record_version` mismatch; `details.record_version` carries the current value |
+| `optimistic_lock_conflict` | 409 | `record_version` mismatch | `details.record_version` carries the **current DB value** — must be included so callers can retry without an extra GET (BUG-01) |
 | `org_membership_unavailable` | 503 | §7.6.2 membership check 5xx/timeout; no write; retryable |
 | `user_profile_unavailable` | 503 | DEL-6 availability call 5xx/timeout on create; no write; retryable |
 
@@ -1255,7 +1337,7 @@ The removal-gate errors (`409 workflow_resolution_required`, `503 workflow_servi
 | DLG-D4 | **The lost `fk_del_tenant` cascade → an async tenant-offboarding consumer** (§11.6). |
 | DLG-D5 | **Delegation events get a dedicated topic `iam.delegation.events`** (`source: iam-delegation`); Core's AsyncAPI drops them (§10, DLG-Q1). |
 | DLG-D6 | **`DelegationEnded.ended_reason` gains `review_expired`** (DLG-Q5) — the shipped code's value becomes contract; review auto-ends are distinguishable from `ends_at` expiry. |
-| DLG-D7 | **The review sweep warns twice (7 d and 3 d)** via `review_last_warned_bucket`; `days_remaining` in `{7,3}` (§11.4, DLG-Q6). |
+| DLG-D7 | **The review sweep sends a daily notification for each of the 3 days before `review_due_at`** (revised in v2.2 — replaces the former dual 7 d/3 d single-fire model). `days_remaining ∈ {3,2,1}`; `review_last_warned_bucket CHECK (IS NULL OR BETWEEN 1 AND 3)`. Example: `review_due_at = Aug 30` → notifications on Aug 27 (days_remaining=3), Aug 28 (2), Aug 29 (1); auto-end on Aug 30. Extend/reassign reset `review_last_warned_bucket` to NULL, re-arming the full 3-day cascade for the new window (§11.4, DLG-Q6). |
 | DLG-D8 | **Create takes a mandatory `Idempotency-Key`** (24 h dedup), resolving the duplicate-on-retry gap left by the absence of a `UNIQUE(tenant_id, delegator_id)` (§9.2, DLG-Q3). |
 | DLG-D9 | **The synchronous removal gate stays in Core; only the row-end moves here (async).** Core's §8.8.4 dept-scope precision becomes a Core to Delegation call (DLG-I3) on the admin path (§11.5). |
 | DLG-D10 | **`port.UserProfileClient` + DEL-6 availability-first / pointer-clear-only move here intact**; cancel is fail-open, scheduled ends defer-and-retry (§11.2/§11.3). |

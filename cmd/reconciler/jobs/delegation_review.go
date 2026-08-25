@@ -3,38 +3,77 @@ package jobs
 import (
 	"context"
 	"errors"
+	"math"
 	"time"
 
 	"github.com/BCBP-SOLUTIONS-FZC-LLC/iam-delegation/internal/core/domain"
 	"github.com/BCBP-SOLUTIONS-FZC-LLC/iam-delegation/internal/core/port"
 )
 
-// ReviewSweep is DLG-I2 (delegation-review, hourly, LLD §11.4). Three
-// passes per tick: warn at the 7-day mark, warn at the 3-day mark, then
-// auto-end anything whose review_due_at has passed — each bucket fires at
-// most once per cycle via review_last_warned_bucket (DLG-D7/DLG-EVT-5).
-// Fixed-ends_at delegations are never considered (the finders all select
-// ends_at IS NULL).
+// ReviewSweep is DLG-I2 (delegation-review, hourly, LLD §11.4).
+// Two passes per tick:
+//  1. Daily cascade warn — for each open-ended delegation whose review_due_at
+//     falls in (now, now+3d], emit DelegationReviewRequested once per
+//     calendar-day bucket (days_remaining ∈ {3,2,1}), tracked by
+//     review_last_warned_bucket.
+//  2. Auto-end — end any delegation whose review_due_at has passed.
 func ReviewSweep(ctx context.Context, jctx *Context) (Result, error) {
 	var res Result
 	now := time.Now().UTC()
 
-	warned7d, failed7d, err := warnBucket(ctx, jctx, 7, func() ([]domain.Delegation, error) {
-		return jctx.Delegations.FindDueForWarning7d(ctx, now, batchLimit(jctx))
-	})
+	// Pass 1: daily cascade warn
+	targets, err := jctx.Delegations.FindDueForDailyWarn(ctx, now, batchLimit(jctx))
 	if err != nil {
 		return res, err
 	}
-	res.Warned7d, res.Failed = warned7d, res.Failed+failed7d
+	for _, d := range targets {
+		daysRemaining := computeDaysRemaining(d.ReviewDueAt, now)
+		if daysRemaining < 1 {
+			continue
+		}
+		// Already notified for this days_remaining value today — skip
+		if d.ReviewLastWarnedBucket != nil && *d.ReviewLastWarnedBucket == daysRemaining {
+			continue
+		}
 
-	warned3d, failed3d, err := warnBucket(ctx, jctx, 3, func() ([]domain.Delegation, error) {
-		return jctx.Delegations.FindDueForWarning3d(ctx, now, batchLimit(jctx))
-	})
-	if err != nil {
-		return res, err
+		gucCtx := jctx.BindTenantGUC(ctx, d.TenantID, systemUserID)
+		raced := false
+		txErr := jctx.TxRunner.RunInTx(gucCtx, func(txCtx context.Context) error {
+			if err := jctx.Delegations.MarkReviewWarned(txCtx, d.TenantID, d.ID, daysRemaining, d.RecordVersion); err != nil {
+				if errors.Is(err, domain.ErrDelegationNotFound) || errors.Is(err, domain.ErrOptimisticLockConflict) {
+					raced = true
+					return nil
+				}
+				return err
+			}
+			return enqueueEvent(txCtx, domain.EventDelegationReviewRequested, d.TenantID, d.ID.String(),
+				domain.DelegationReviewRequestedPayload{
+					DelegationID: d.ID, TenantID: d.TenantID,
+					DelegatorID: d.DelegatorID, DelegateID: d.DelegateID,
+					Scope: d.Scope, ScopeID: d.ScopeID,
+					DaysRemaining: daysRemaining,
+					ActorID:       domain.SystemActorID,
+				}, "delegation-review")
+		})
+		if txErr != nil {
+			jctx.Logger.Warn("delegation-review: daily warn failed",
+				map[string]interface{}{"delegation_id": d.ID, "days_remaining": daysRemaining, "error": txErr.Error()})
+			res.Failed++
+			continue
+		}
+		if !raced {
+			switch daysRemaining {
+			case 3:
+				res.Warned3d++
+			case 2:
+				res.Warned2d++
+			case 1:
+				res.Warned1d++
+			}
+		}
 	}
-	res.Warned3d, res.Failed = warned3d, res.Failed+failed3d
 
+	// Pass 2: auto-end
 	endTargets, err := jctx.Delegations.FindDueForAutoEnd(ctx, now, batchLimit(jctx))
 	if err != nil {
 		return res, err
@@ -61,54 +100,26 @@ func ReviewSweep(ctx context.Context, jctx *Context) (Result, error) {
 	}
 
 	jctx.Logger.Info("delegation-review complete", map[string]interface{}{
-		"warned_7d": res.Warned7d, "warned_3d": res.Warned3d,
+		"warned_3d": res.Warned3d, "warned_2d": res.Warned2d, "warned_1d": res.Warned1d,
 		"expired": res.Expired, "deferred": res.Deferred, "failed": res.Failed,
 	})
 	return res, nil
 }
 
-// warnBucket marks and emits DelegationReviewRequested{days_remaining:
-// bucket} for every row find returns, inside a per-row tenant-GUC-bound tx.
-// A race (another tick/an extend already advanced the row) is skipped, not
-// a failure — read back MarkReviewWarned's own optimistic-lock semantics.
-func warnBucket(ctx context.Context, jctx *Context, bucket int, find func() ([]domain.Delegation, error)) (warned, failed int, err error) {
-	targets, err := find()
-	if err != nil {
-		return 0, 0, err
+// computeDaysRemaining returns the number of whole days until reviewDueAt,
+// minimum 1 (since auto-end handles the review_due_at <= now case).
+func computeDaysRemaining(reviewDueAt *time.Time, now time.Time) int {
+	if reviewDueAt == nil {
+		return 0
 	}
-	for _, d := range targets {
-		gucCtx := jctx.BindTenantGUC(ctx, d.TenantID, systemUserID)
-		raced := false
-		txErr := jctx.TxRunner.RunInTx(gucCtx, func(txCtx context.Context) error {
-			if err := jctx.Delegations.MarkReviewWarned(txCtx, d.TenantID, d.ID, bucket, d.RecordVersion); err != nil {
-				if errors.Is(err, domain.ErrDelegationNotFound) || errors.Is(err, domain.ErrOptimisticLockConflict) {
-					raced = true
-					return nil
-				}
-				return err
-			}
-			return enqueueEvent(txCtx, domain.EventDelegationReviewRequested, d.TenantID, d.ID.String(),
-				domain.DelegationReviewRequestedPayload{
-					DelegationID: d.ID, TenantID: d.TenantID,
-					DelegatorID: d.DelegatorID, DelegateID: d.DelegateID,
-					Scope: d.Scope, ScopeID: d.ScopeID,
-					DaysRemaining: bucket,
-					ActorID:       domain.SystemActorID,
-				}, "delegation-review")
-		})
-		if txErr != nil {
-			jctx.Logger.Warn("delegation-review: warn failed",
-				map[string]interface{}{"delegation_id": d.ID, "bucket": bucket, "error": txErr.Error()})
-			failed++
-			continue
-		}
-		if !raced {
-			warned++
-		}
+	days := int(math.Ceil(reviewDueAt.Sub(now).Hours() / 24))
+	if days < 1 {
+		days = 1
 	}
-	return warned, failed, nil
+	return days
 }
 
+// endReviewExpired ends a delegation whose review_due_at has passed.
 func endReviewExpired(ctx context.Context, jctx *Context, d domain.Delegation) (raced bool, err error) {
 	gucCtx := jctx.BindTenantGUC(ctx, d.TenantID, systemUserID)
 	err = jctx.TxRunner.RunInTx(gucCtx, func(txCtx context.Context) error {

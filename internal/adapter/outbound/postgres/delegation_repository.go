@@ -22,7 +22,7 @@ const defaultFindLimit = 100
 // calls made outside one open a short-lived transaction of their own
 // (withPool, db.go).
 //
-// FindDueForWarning7d/3d, FindDueForAutoEnd, and HardPurgeSoftDeletedBefore
+// FindDueForDailyWarn, FindDueForAutoEnd, and HardPurgeSoftDeletedBefore
 // deliberately do not filter by tenant_id — they are cross-tenant sweep
 // queries (LLD §11.4/§18.4) and therefore require pool to be bound to a
 // BYPASSRLS role (delegation_migrator); wiring that pool is the composition
@@ -79,7 +79,7 @@ func (r *DelegationRepository) List(ctx context.Context, tenantID uuid.UUID) ([]
 
 // ListByDelegator implements port.DelegationRepository.ListByDelegator.
 func (r *DelegationRepository) ListByDelegator(ctx context.Context, tenantID, delegatorID uuid.UUID) ([]domain.Delegation, error) {
-	return r.listWhere(ctx, `WHERE tenant_id = $1 AND delegator_id = $2 AND deleted_at IS NULL ORDER BY starts_at DESC`, tenantID, delegatorID)
+	return r.listWhere(ctx, `WHERE tenant_id = $1 AND delegator_id = $2 AND status = 'active' AND deleted_at IS NULL ORDER BY starts_at DESC`, tenantID, delegatorID)
 }
 
 // FindActiveByDelegator implements port.DelegationRepository.FindActiveByDelegator (DLG-I4).
@@ -170,12 +170,12 @@ func (r *DelegationRepository) Insert(ctx context.Context, d *domain.Delegation)
 		row := tx.QueryRow(ctx, `
 			INSERT INTO delegations (id, tenant_id, delegator_id, delegate_id,
 				delegator_membership_id, delegate_membership_id,
-				scope, scope_id, reason, starts_at, ends_at, status, review_due_at)
-			VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
+				scope, scope_id, reason, starts_at, ends_at, status, review_due_at, review_window_days)
+			VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)
 			RETURNING `+delegationCols,
 			d.ID, d.TenantID, d.DelegatorID, d.DelegateID,
 			d.DelegatorMembershipID, d.DelegateMembershipID,
-			string(d.Scope), d.ScopeID, reason, d.StartsAt, d.EndsAt, string(d.Status), d.ReviewDueAt)
+			string(d.Scope), d.ScopeID, reason, d.StartsAt, d.EndsAt, string(d.Status), d.ReviewDueAt, d.ReviewWindowDays)
 		created, err := scanDelegation(row)
 		if err != nil {
 			return err
@@ -288,28 +288,15 @@ func (r *DelegationRepository) ListExpiringBefore(ctx context.Context, before ti
 
 // ── DLG-I2 review sweep (LLD §11.4, DLG-D7) ────────────────────────────────
 
-// FindDueForWarning7d returns open-ended active delegations whose
-// review_due_at falls in (now+3d, now+7d] and have not yet been warned this
-// cycle (review_last_warned_bucket IS NULL).
-func (r *DelegationRepository) FindDueForWarning7d(ctx context.Context, now time.Time, limit int) ([]domain.Delegation, error) {
-	return r.listWhere(ctx,
-		`WHERE ends_at IS NULL AND status = 'active' AND deleted_at IS NULL
-		   AND review_due_at > $1::timestamptz + interval '3 days'
-		   AND review_due_at <= $1::timestamptz + interval '7 days'
-		   AND review_last_warned_bucket IS NULL
-		 ORDER BY review_due_at LIMIT $2`,
-		now, limitOrDefault(limit))
-}
-
-// FindDueForWarning3d returns open-ended active delegations whose
-// review_due_at falls in (now, now+3d] and have not yet received the 3-day
-// warning (review_last_warned_bucket IS DISTINCT FROM 3).
-func (r *DelegationRepository) FindDueForWarning3d(ctx context.Context, now time.Time, limit int) ([]domain.Delegation, error) {
+// FindDueForDailyWarn returns open-ended active delegations whose
+// review_due_at falls in (now, now+3d] — candidates for the daily cascade
+// notification. days_remaining filtering (to avoid same-day duplicates) is
+// done in the job layer against review_last_warned_bucket.
+func (r *DelegationRepository) FindDueForDailyWarn(ctx context.Context, now time.Time, limit int) ([]domain.Delegation, error) {
 	return r.listWhere(ctx,
 		`WHERE ends_at IS NULL AND status = 'active' AND deleted_at IS NULL
 		   AND review_due_at > $1
 		   AND review_due_at <= $1::timestamptz + interval '3 days'
-		   AND review_last_warned_bucket IS DISTINCT FROM 3
 		 ORDER BY review_due_at LIMIT $2`,
 		now, limitOrDefault(limit))
 }
@@ -353,7 +340,7 @@ func (r *DelegationRepository) EndForUser(ctx context.Context, tenantID, userID 
 	err := withPool(ctx, r.pool, func(tx pgx.Tx) error {
 		rows, err := tx.Query(ctx, `
 			UPDATE delegations SET status = 'ended', deleted_at = now()
-			WHERE tenant_id = $1 AND (delegator_id = $2 OR delegate_id = $2) AND deleted_at IS NULL
+			WHERE tenant_id = $1 AND (delegator_id = $2 OR delegate_id = $2) AND status = 'active' AND deleted_at IS NULL
 			RETURNING `+delegationCols,
 			tenantID, userID)
 		if err != nil {

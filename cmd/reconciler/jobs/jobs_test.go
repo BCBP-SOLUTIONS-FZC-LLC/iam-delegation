@@ -53,8 +53,7 @@ type fakeDelegationRepo struct {
 	port.DelegationRepository
 
 	expiring  []domain.Delegation
-	warn7d    []domain.Delegation
-	warn3d    []domain.Delegation
+	dailyWarn []domain.Delegation
 	autoEnd   []domain.Delegation
 	endErr    error
 	warnErr   error
@@ -71,11 +70,8 @@ type fakeDelegationRepo struct {
 func (f *fakeDelegationRepo) ListExpiringBefore(context.Context, time.Time, int) ([]domain.Delegation, error) {
 	return f.expiring, nil
 }
-func (f *fakeDelegationRepo) FindDueForWarning7d(context.Context, time.Time, int) ([]domain.Delegation, error) {
-	return f.warn7d, nil
-}
-func (f *fakeDelegationRepo) FindDueForWarning3d(context.Context, time.Time, int) ([]domain.Delegation, error) {
-	return f.warn3d, nil
+func (f *fakeDelegationRepo) FindDueForDailyWarn(context.Context, time.Time, int) ([]domain.Delegation, error) {
+	return f.dailyWarn, nil
 }
 func (f *fakeDelegationRepo) FindDueForAutoEnd(context.Context, time.Time, int) ([]domain.Delegation, error) {
 	return f.autoEnd, nil
@@ -195,14 +191,22 @@ func TestExpiry_UnexpectedRepoError_CountsAsFailed(t *testing.T) {
 
 // ── ReviewSweep ─────────────────────────────────────────────────────────
 
-func TestReviewSweep_WarnsBothBucketsAndAutoEnds(t *testing.T) {
-	d7 := newDelegation(uuid.New())
+func TestReviewSweep_WarnsDailyCascadeAndAutoEnds(t *testing.T) {
+	now := time.Now().UTC()
+	// d3 has review_due_at in ~3 days -> daysRemaining=3
+	due3d := now.Add(3 * 24 * time.Hour)
 	d3 := newDelegation(uuid.New())
+	d3.ReviewDueAt = &due3d
+
+	// d2 has review_due_at in ~2 days -> daysRemaining=2
+	due2d := now.Add(2 * 24 * time.Hour)
+	d2 := newDelegation(uuid.New())
+	d2.ReviewDueAt = &due2d
+
 	dEnd := newDelegation(uuid.New())
 	repo := &fakeDelegationRepo{
-		warn7d:  []domain.Delegation{d7},
-		warn3d:  []domain.Delegation{d3},
-		autoEnd: []domain.Delegation{dEnd},
+		dailyWarn: []domain.Delegation{d3, d2},
+		autoEnd:   []domain.Delegation{dEnd},
 	}
 	up := &fakeUserProfile{}
 	tx := &fakeTxRunner{}
@@ -212,7 +216,7 @@ func TestReviewSweep_WarnsBothBucketsAndAutoEnds(t *testing.T) {
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
-	if res.Warned7d != 1 || res.Warned3d != 1 || res.Expired != 1 || res.Failed != 0 {
+	if res.Warned3d != 1 || res.Warned2d != 1 || res.Expired != 1 || res.Failed != 0 {
 		t.Fatalf("unexpected result: %+v", res)
 	}
 
@@ -220,11 +224,11 @@ func TestReviewSweep_WarnsBothBucketsAndAutoEnds(t *testing.T) {
 	for _, c := range repo.warnCalls {
 		gotBuckets = append(gotBuckets, c.bucket)
 	}
-	if len(gotBuckets) != 2 || !containsInt(gotBuckets, 7) || !containsInt(gotBuckets, 3) {
-		t.Fatalf("expected MarkReviewWarned called with buckets 7 and 3, got %v", gotBuckets)
+	if len(gotBuckets) != 2 || !containsInt(gotBuckets, 3) || !containsInt(gotBuckets, 2) {
+		t.Fatalf("expected MarkReviewWarned called with buckets 3 and 2, got %v", gotBuckets)
 	}
 
-	var endedReviewExpired, reviewRequested7, reviewRequested3 int
+	var endedReviewExpired, reviewRequested3, reviewRequested2 int
 	for _, evt := range tx.published {
 		switch evt.Type {
 		case domain.EventDelegationEnded:
@@ -235,18 +239,18 @@ func TestReviewSweep_WarnsBothBucketsAndAutoEnds(t *testing.T) {
 		case domain.EventDelegationReviewRequested:
 			p := evt.Data.(domain.DelegationReviewRequestedPayload)
 			switch p.DaysRemaining {
-			case 7:
-				reviewRequested7++
 			case 3:
 				reviewRequested3++
+			case 2:
+				reviewRequested2++
 			}
 		}
 	}
 	if endedReviewExpired != 1 {
 		t.Fatalf("expected one DelegationEnded{review_expired}, got %d", endedReviewExpired)
 	}
-	if reviewRequested7 != 1 || reviewRequested3 != 1 {
-		t.Fatalf("expected one DelegationReviewRequested per bucket, got 7d=%d 3d=%d", reviewRequested7, reviewRequested3)
+	if reviewRequested3 != 1 || reviewRequested2 != 1 {
+		t.Fatalf("expected one DelegationReviewRequested per bucket, got 3d=%d 2d=%d", reviewRequested3, reviewRequested2)
 	}
 }
 
@@ -270,8 +274,11 @@ func TestReviewSweep_AutoEnd_UPFailure_Defers(t *testing.T) {
 }
 
 func TestReviewSweep_WarnRace_NotCountedAsWarned(t *testing.T) {
-	d7 := newDelegation(uuid.New())
-	repo := &fakeDelegationRepo{warn7d: []domain.Delegation{d7}, warnErr: domain.NewError(domain.ErrDelegationNotFound, "raced")}
+	now := time.Now().UTC()
+	due3d := now.Add(3 * 24 * time.Hour)
+	d := newDelegation(uuid.New())
+	d.ReviewDueAt = &due3d
+	repo := &fakeDelegationRepo{dailyWarn: []domain.Delegation{d}, warnErr: domain.NewError(domain.ErrDelegationNotFound, "raced")}
 	up := &fakeUserProfile{}
 	tx := &fakeTxRunner{}
 	jctx := &Context{Delegations: repo, UserProfile: up, TxRunner: tx, BindTenantGUC: noopBind, Logger: fakeLogger{}}
@@ -280,8 +287,29 @@ func TestReviewSweep_WarnRace_NotCountedAsWarned(t *testing.T) {
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
-	if res.Warned7d != 0 || res.Failed != 0 {
+	if res.Warned3d != 0 || res.Warned2d != 0 || res.Warned1d != 0 || res.Failed != 0 {
 		t.Fatalf("a raced warn should count toward neither warned nor failed: %+v", res)
+	}
+}
+
+func TestReviewSweep_AlreadyWarnedSameBucket_Skipped(t *testing.T) {
+	now := time.Now().UTC()
+	due3d := now.Add(3 * 24 * time.Hour)
+	bucket3 := 3
+	d := newDelegation(uuid.New())
+	d.ReviewDueAt = &due3d
+	d.ReviewLastWarnedBucket = &bucket3 // already warned at 3d
+	repo := &fakeDelegationRepo{dailyWarn: []domain.Delegation{d}}
+	up := &fakeUserProfile{}
+	tx := &fakeTxRunner{}
+	jctx := &Context{Delegations: repo, UserProfile: up, TxRunner: tx, BindTenantGUC: noopBind, Logger: fakeLogger{}}
+
+	res, err := ReviewSweep(context.Background(), jctx)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if res.Warned3d != 0 || len(repo.warnCalls) != 0 {
+		t.Fatalf("already-warned bucket must be skipped: %+v, warnCalls=%v", res, repo.warnCalls)
 	}
 }
 

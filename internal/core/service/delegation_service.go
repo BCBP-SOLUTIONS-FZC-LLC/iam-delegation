@@ -12,6 +12,7 @@ import (
 	"errors"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"github.com/BCBP-SOLUTIONS-FZC-LLC/iam-delegation/internal/core/domain"
 	"github.com/BCBP-SOLUTIONS-FZC-LLC/iam-delegation/internal/core/port"
@@ -101,14 +102,15 @@ func (s *DelegationService) Create(ctx context.Context, tenantID, delegatorID uu
 		return nil, err
 	}
 
-	starts := time.Now().UTC()
+	now := time.Now().UTC()
+	starts := now
 	if req.StartsAt != nil {
 		starts = *req.StartsAt
 	}
-	if req.StartsAt != nil && starts.Before(time.Now().UTC().Add(-skewTolerance)) {
+	if req.StartsAt != nil && starts.Before(now.Add(-skewTolerance)) {
 		return nil, domain.NewError(domain.ErrDelegationStartInPast, "starts_at must not be in the past")
 	}
-	if req.StartsAt != nil && starts.After(time.Now().UTC().Add(maxFutureStart)) {
+	if req.StartsAt != nil && starts.After(now.Add(maxFutureStart)) {
 		return nil, domain.NewError(domain.ErrDelegationStartTooFarFuture, "starts_at must be within 1 year from now")
 	}
 	if req.EndsAt != nil && !req.EndsAt.After(starts) {
@@ -141,8 +143,8 @@ func (s *DelegationService) Create(ctx context.Context, tenantID, delegatorID uu
 	// now() when starts_at is in the past relative to UP (a past starts_at
 	// is allowed here — the delegation is immediately active).
 	oooFrom := starts
-	if oooFrom.Before(time.Now().UTC()) {
-		oooFrom = time.Now().UTC()
+	if oooFrom.Before(now) {
+		oooFrom = now
 	}
 	oooStatus := "ooo"
 	if err := s.userProfile.SetAvailability(ctx, port.SetAvailabilityRequest{
@@ -167,6 +169,7 @@ func (s *DelegationService) Create(ctx context.Context, tenantID, delegatorID uu
 			due := starts.Add(time.Duration(settings.ReviewWindowDays) * 24 * time.Hour)
 			reviewDueAt = &due
 		}
+		reviewWindowDays := settings.ReviewWindowDays
 		out, err := s.delegations.Insert(txCtx, &domain.Delegation{
 			TenantID:              tenantID,
 			DelegatorID:           delegatorID,
@@ -179,6 +182,7 @@ func (s *DelegationService) Create(ctx context.Context, tenantID, delegatorID uu
 			StartsAt:              starts,
 			EndsAt:                req.EndsAt,
 			ReviewDueAt:           reviewDueAt,
+			ReviewWindowDays:      &reviewWindowDays,
 		})
 		if err != nil {
 			return err
@@ -194,6 +198,12 @@ func (s *DelegationService) Create(ctx context.Context, tenantID, delegatorID uu
 			})
 	})
 	if err != nil {
+		// best-effort compensating UP pointer clear — UP was already updated
+		// before this tx; if tx failed, clear the stale OOO pointer
+		//nolint:errcheck // best-effort: failure is logged by UP client; must not mask the original tx error
+		_ = s.userProfile.SetAvailability(ctx, port.SetAvailabilityRequest{
+			TenantID: tenantID, UserID: delegatorID, ClearDelegate: true,
+		})
 		return nil, err
 	}
 
@@ -225,7 +235,7 @@ func validateCreateInput(delegatorID uuid.UUID, req CreateInput) error {
 	if scope == domain.ScopeAll && req.ScopeID != nil {
 		return domain.NewError(domain.ErrInvalidScopeID, "scope_id must be omitted when scope is all")
 	}
-	if len(req.Reason) > 500 {
+	if utf8.RuneCountInString(req.Reason) > 500 {
 		return domain.NewError(domain.ErrReasonTooLong, "reason must not exceed 500 characters")
 	}
 	return nil
@@ -273,6 +283,14 @@ func (s *DelegationService) Cancel(ctx context.Context, tenantID, id uuid.UUID, 
 	_ = s.userProfile.SetAvailability(ctx, port.SetAvailabilityRequest{
 		TenantID: tenantID, UserID: d.DelegatorID, ClearDelegate: true,
 	})
+	// use actual caller if available in context, fall back to delegator
+	actorID := d.DelegatorID
+	if rc, ok := requestctx.FromContext(ctx); ok {
+		if parsed, err := uuid.Parse(rc.UserID); err == nil {
+			actorID = parsed
+		}
+	}
+
 	var ended *domain.Delegation
 	err = s.txRunner.RunInTx(ctx, func(txCtx context.Context) error {
 		out, err := s.delegations.End(txCtx, tenantID, id, domain.DelegationCancelled, expectedVersion)
@@ -286,7 +304,7 @@ func (s *DelegationService) Cancel(ctx context.Context, tenantID, id uuid.UUID, 
 				DelegatorID: d.DelegatorID, DelegateID: d.DelegateID,
 				Scope: d.Scope, ScopeID: d.ScopeID,
 				EndedReason: domain.EndReasonCancelled,
-				ActorID:     d.DelegatorID,
+				ActorID:     actorID,
 			})
 	})
 	if err != nil {
@@ -330,6 +348,9 @@ func (s *DelegationService) Extend(ctx context.Context, tenantID, id uuid.UUID, 
 	out, err := s.delegations.ExtendReview(ctx, tenantID, id, windowDays, expectedVersion)
 	if err != nil {
 		return nil, err
+	}
+	if s.cache != nil {
+		s.cache.InvalidateDelegatorList(ctx, tenantID, out.DelegatorID)
 	}
 	return out, nil
 }
@@ -407,6 +428,7 @@ func enqueue(ctx context.Context, eventType string, tenantID uuid.UUID, subject,
 	}
 	evt := &domain.DomainEvent{
 		Type: eventType, TenantID: tenantID, Subject: subject, Actor: actor, Data: data,
+		OccurredAt: time.Now().UTC(),
 	}
 	if rc, ok := requestctx.FromContext(ctx); ok {
 		evt.IPAddress = rc.ClientIP

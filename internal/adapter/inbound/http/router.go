@@ -4,6 +4,7 @@ import (
 	"context"
 	"log/slog"
 	"net/http"
+	"strings"
 
 	"github.com/gin-gonic/gin"
 
@@ -164,11 +165,21 @@ func registerDocsRoutes(engine *gin.Engine, docs DocsConfig) {
 	if !docs.active() {
 		return
 	}
+	stdSwagger := ginSwagger.WrapHandler(swaggerFiles.Handler)
 	group := engine.Group("/swagger")
 	if docs.Environment == "production" && docs.AuthToken != "" {
 		group.Use(docsAuthMiddleware(docs.AuthToken))
 	}
-	group.GET("/*any", ginSwagger.WrapHandler(swaggerFiles.Handler))
+	group.GET("/*any", func(c *gin.Context) {
+		switch {
+		case strings.HasSuffix(c.Request.URL.Path, "/index.css"):
+			SwaggerThemeHandler(c)
+		case strings.HasSuffix(c.Request.URL.Path, "/swagger-initializer.js"):
+			SwaggerInitializerHandler(c)
+		default:
+			stdSwagger(c)
+		}
+	})
 
 	asyncGroup := engine.Group("")
 	if docs.Environment == "production" && docs.AuthToken != "" {

@@ -86,12 +86,13 @@ func enqueueEvent(ctx context.Context, eventType string, tenantID uuid.UUID, sub
 		return nil
 	}
 	return pub.EnqueueCtx(ctx, &domain.DomainEvent{
-		Type:      eventType,
-		TenantID:  tenantID,
-		Subject:   subject,
-		Actor:     systemUserID,
-		IPAddress: "system",
-		UserAgent: "iam-delegation/" + cronName + "-cron",
-		Data:      data,
+		Type:       eventType,
+		TenantID:   tenantID,
+		Subject:    subject,
+		Actor:      systemUserID,
+		OccurredAt: time.Now().UTC(),
+		IPAddress:  "system",
+		UserAgent:  "iam-delegation/" + cronName + "-cron",
+		Data:       data,
 	})
 }
