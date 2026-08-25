@@ -55,7 +55,7 @@ jobs:
     needs: [validate-test, validate-quality]
     steps:
       - name: Checkout
-        uses: actions/checkout@v7.0.0
+        uses: actions/checkout@v7.0.1
         with:
           ref: ${{ github.event.inputs.tag || github.ref }}
           fetch-depth: 0
@@ -109,7 +109,7 @@ jobs:
       id-token: write
     steps:
       - name: Checkout
-        uses: actions/checkout@v7.0.0
+        uses: actions/checkout@v7.0.1
         with:
           ref: ${{ env.RELEASE_TAG }}
           token: ${{ secrets.CI_REPO_READ_TOKEN || github.token }}
@@ -241,7 +241,7 @@ jobs:
     environment: production
     steps:
       - name: Checkout
-        uses: actions/checkout@v7.0.0
+        uses: actions/checkout@v7.0.1
         with:
           ref: ${{ env.RELEASE_TAG }}
           token: ${{ secrets.CI_REPO_READ_TOKEN || github.token }}
@@ -329,7 +329,7 @@ jobs:
       contents: write
     steps:
       - name: Checkout
-        uses: actions/checkout@v7.0.0
+        uses: actions/checkout@v7.0.1
         with:
           ref: ${{ env.RELEASE_TAG }}
           fetch-depth: 0

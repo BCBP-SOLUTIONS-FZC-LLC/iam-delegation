@@ -36,7 +36,7 @@ jobs:
       pct: ${{ steps.gate.outputs.pct }}
     steps:
       - name: Checkout
-        uses: actions/checkout@v7.0.0
+        uses: actions/checkout@v7.0.1
         with:
           ref: ${{ inputs.ref || github.ref }}
           persist-credentials: false
