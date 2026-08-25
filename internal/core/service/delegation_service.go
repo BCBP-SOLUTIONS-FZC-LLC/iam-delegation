@@ -402,12 +402,13 @@ func (s *DelegationService) Reassign(ctx context.Context, tenantID, id uuid.UUID
 	if req.Reason != nil {
 		reason = *req.Reason
 	}
-	var endsAt *time.Time
+	// ends_at: null (explicitly provided) makes the new delegation
+	// open-ended; omitting the key preserves the existing ends_at — same
+	// rule as scope_id above (LLD §8.4 DLG-5).
+	endsAt := existing.EndsAt
 	if req.EndsAtProvided {
 		endsAt = req.EndsAt
 	}
-	// else: reassign always creates a fresh open-ended-by-default grant
-	// unless the caller specifies ends_at (DLG-D11's "starts now" reset).
 
 	return s.Create(ctx, tenantID, existing.DelegatorID, "", CreateInput{
 		DelegateID: newDelegateID,

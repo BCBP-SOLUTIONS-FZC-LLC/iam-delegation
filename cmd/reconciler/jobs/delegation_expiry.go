@@ -29,6 +29,9 @@ func Expiry(ctx context.Context, jctx *Context) (Result, error) {
 			jctx.Logger.Warn("delegation-expiry: UP pointer-clear failed — DEL-6 defer",
 				map[string]interface{}{"delegation_id": d.ID, "error": err.Error()})
 			res.Deferred++
+			if jctx.Metrics != nil {
+				jctx.Metrics.RecordExpiryDeferred()
+			}
 			continue
 		}
 		if raced, err := endExpired(ctx, jctx, d); err != nil {

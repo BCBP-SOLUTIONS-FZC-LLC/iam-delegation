@@ -1,6 +1,6 @@
 // Package userprofile is the HTTP adapter implementing
 // port.UserProfileClient against iam-user-profile's internal
-// PUT /internal/users/{userID}/availability endpoint — the availability-
+// PUT /api/v1/internal/users/{userID}/availability endpoint — the availability-
 // first coordination point for DEL-6 (LLD §11.1/§11.2/§11.3/§11.4).
 package userprofile
 
@@ -59,10 +59,24 @@ func NewHTTPClient(baseURL string, httpClient *http.Client, timeout time.Duratio
 //
 // A plain struct with `omitempty` can't express "explicit null vs omitted"
 // on the same field, so this builds a map instead.
+//
+// status is REQUIRED on iam-user-profile's current PutAvailabilityRequest
+// DTO (binding:"required") — a status-less {delegate_id: null} body, which
+// this client's End path used to send per this port's original "NEVER
+// {status:\"available\"}, UP owns that transition" design, now gets a
+// clean 400 from iam-user-profile rather than a clean pointer-clear. Until
+// iam-user-profile makes status optional again (or exposes a dedicated
+// pointer-clear-only endpoint), default to "available" on the End path so
+// the call succeeds — this does shift the return-to-available decision
+// into iam-delegation, which is a real product/ownership question, not a
+// purely mechanical one; flagged for the iam-user-profile team to confirm.
 func buildBody(req port.SetAvailabilityRequest) map[string]any {
 	body := map[string]any{}
-	if req.Status != nil {
+	switch {
+	case req.Status != nil:
 		body["status"] = *req.Status
+	case req.ClearDelegate:
+		body["status"] = "available"
 	}
 	if req.OOOFrom != nil {
 		body["ooo_from"] = req.OOOFrom.UTC().Format(time.RFC3339)
@@ -95,13 +109,13 @@ func (c *HTTPClient) SetAvailability(ctx context.Context, req port.SetAvailabili
 		return fmt.Errorf("userprofile: encode request: %w", err)
 	}
 
-	url := fmt.Sprintf("%s/internal/users/%s/availability", c.baseURL, req.UserID)
+	url := fmt.Sprintf("%s/api/v1/internal/users/%s/availability", c.baseURL, req.UserID)
 	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPut, url, bytes.NewReader(body))
 	if err != nil {
 		return fmt.Errorf("userprofile: build request: %w", err)
 	}
 	httpReq.Header.Set("Content-Type", "application/json")
-	setInternalHeaders(httpReq)
+	setInternalHeaders(httpReq, req.TenantID)
 	propagate(ctx, httpReq)
 
 	resp, err := c.httpClient.Do(httpReq)

@@ -2,12 +2,12 @@ graph TD
     subgraph cmd["Composition Roots — cmd/"]
         main["server/main.go\nHTTP composition root (DLG-1..7, DLG-I1..I4)\n+ delegation-cascade-q SQS consumer, one process\nwires TxRunner/validator/GlueCodec/OutboxRunner\ntenantGUCMiddleware on the public route group"]
         reconciler["reconciler/main.go\n--job=<name> dispatch (this chart's own convention)\nsysPool (BYPASSRLS from SYSTEM_DATABASE_URL)"]
-        jobs["reconciler/jobs/\ndelegation_expiry.go    -- DLG-I1 (*/5 * * * *)\ndelegation_review.go    -- DLG-I2 (0 * * * *, dual 7d/3d warn)\ndelegation_cleanup.go   -- soft-delete purge (0 4 1 * *)\nshares implementation with cmd/server's HTTP handlers\nvia cmd/server/adapters.go's reconcilerRunner (DLG-D17)"]
+        jobs["reconciler/jobs/\ndelegation_expiry.go    -- DLG-I1 (*/5 * * * *)\ndelegation_review.go    -- DLG-I2 (0 * * * *, 3-day daily cascade warn)\ndelegation_cleanup.go   -- soft-delete purge (0 4 1 * *)\nshares implementation with cmd/server's HTTP handlers\nvia cmd/server/adapters.go's reconcilerRunner (DLG-D17)"]
     end
 
     subgraph adapters_in["Inbound Adapters — internal/adapter/inbound/"]
         http_h["http/\nrouter.go — DLG-1..7, DLG-I1..I4, health, docs\ntenantGUCMiddleware · gucBoundReader (DLG-D18)\nAsyncAPI/Swagger doc handlers"]
-        consumer["consumer/\nCascadeConsumer\n(MembershipRevoked -> CascadeService.EndForUser,\nTenantOffboarded -> CascadeService.ScrubTenant)\nprocessed_events idempotency dedup"]
+        consumer["consumer/\nCascadeConsumer\n(MembershipRevoked -> CascadeService.EndForUser,\nTenantMembershipsPurged -> CascadeService.ScrubTenant)\nprocessed_events idempotency dedup"]
     end
 
     subgraph adapters_out["Outbound Adapters — internal/adapter/outbound/"]

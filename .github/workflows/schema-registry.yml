@@ -1,6 +1,6 @@
 # Auto-registers iam-delegation-events JSON schemas in AWS Glue Schema
 # Registry (DLG-D20 — supersedes DLG-D15's CI-governance scope; see
-# IMPLEMENTATION_NOTES.md). Mirrors iam-user-profile's schema-registry.yml.
+# ARCHITECTURE.md's "Session-specific decisions"). Mirrors iam-user-profile's schema-registry.yml.
 #
 # Source of truth for schemas
 # ────────────────────────────

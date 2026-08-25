@@ -96,8 +96,7 @@ business meaning can change without any JSON Schema difference.
 
 ### Documentation
 - [ ] README updated (if public API, env vars, or config changed)
-- [ ] ARCHITECTURE.md updated (if layering, flows, or key invariants changed)
-- [ ] IMPLEMENTATION_NOTES.md updated (if an LLD-section mapping or a new decision-register entry applies)
+- [ ] ARCHITECTURE.md updated (if layering, flows, key invariants, or a new session-specific decision applies — see its "Session-specific decisions" section)
 
 ---
 

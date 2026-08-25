@@ -1,6 +1,6 @@
 // Package orgmembership is the HTTP adapter implementing
 // port.MembershipCheckClient against Core's internal GET
-// /internal/tenants/{tenantID}/members/{userID}/exists endpoint — replacing
+// /api/v1/internal/tenants/{tenantID}/members/{userID}/exists endpoint — replacing
 // the composite membership FKs this table lost when delegation moved out of
 // Core's database (LLD §7.6.2, DLG-D3). Mirrors iam-tender-acl's
 // internal/adapter/outbound/membershipcheck/http_client.go in spirit, but
@@ -68,12 +68,12 @@ type existsResponse struct {
 // unwrapped (the service layer's checkBothMemberships treats any non-nil
 // err from Exists identically, regardless of type).
 func (c *HTTPChecker) Exists(ctx context.Context, tenantID, userID uuid.UUID) (bool, uuid.UUID, error) {
-	url := fmt.Sprintf("%s/internal/tenants/%s/members/%s/exists", c.baseURL, tenantID, userID)
+	url := fmt.Sprintf("%s/api/v1/internal/tenants/%s/members/%s/exists", c.baseURL, tenantID, userID)
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, http.NoBody)
 	if err != nil {
 		return false, uuid.UUID{}, fmt.Errorf("orgmembership: build request: %w", err)
 	}
-	setInternalHeaders(req)
+	setInternalHeaders(req, tenantID)
 	propagate(ctx, req)
 
 	resp, err := c.httpClient.Do(req)

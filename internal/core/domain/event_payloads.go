@@ -46,9 +46,9 @@ type DelegationEndedPayload struct {
 
 // DelegationReviewRequestedPayload is DelegationReviewRequested's data (LLD
 // §10.3 DelegationReviewRequestedPayload). Emitted by the delegation-review
-// sweep at the 7-day and 3-day marks (DLG-I2, DLG-D7). Unlike the
-// pre-extraction O&M shape, this carries days_remaining rather than
-// review_due_at (DLG-Q6's dual-warning contract).
+// sweep once per calendar day for each of the 3 days before review_due_at
+// (DLG-I2, DLG-D7). Unlike the pre-extraction O&M shape, this carries
+// days_remaining rather than review_due_at (DLG-Q6's 3-day daily cascade).
 type DelegationReviewRequestedPayload struct {
 	DelegationID  uuid.UUID       `json:"delegation_id"`
 	TenantID      uuid.UUID       `json:"tenant_id"`
@@ -56,7 +56,7 @@ type DelegationReviewRequestedPayload struct {
 	DelegateID    uuid.UUID       `json:"delegate_id"`
 	Scope         DelegationScope `json:"scope"`
 	ScopeID       *uuid.UUID      `json:"scope_id,omitempty"`
-	DaysRemaining int             `json:"days_remaining"` // 7 | 3
+	DaysRemaining int             `json:"days_remaining"` // 3 | 2 | 1
 	ActorID       uuid.UUID       `json:"actor_id"`
 }
 
@@ -70,9 +70,13 @@ type MembershipRevokedPayload struct {
 	ActorID  uuid.UUID `json:"actor_id"`
 }
 
-// TenantOffboardedPayload is the data of Core's consumed TenantOffboarded
-// event (LLD §10.1, DLG-Q4/DLG-D14).
-type TenantOffboardedPayload struct {
+// TenantMembershipsPurgedPayload is the data of Core's (iam-org-membership's)
+// consumed TenantMembershipsPurged event on iam.membership.events — Core's
+// tenant-scrub cascade relay, renamed from "TenantOffboarded" to avoid
+// colliding with Realm Provisioner's own event of that name (LLD §10.1,
+// DLG-Q4/DLG-D14). Field shape is unchanged from the old TenantOffboarded
+// payload this service used to expect.
+type TenantMembershipsPurgedPayload struct {
 	TenantID uuid.UUID `json:"tenant_id"`
 	ActorID  uuid.UUID `json:"actor_id"`
 }

@@ -32,7 +32,7 @@ type testDB struct {
 	// Bypass is a pgcommon.Pool authenticated as the postgres superuser —
 	// RLS is bypassed for any superuser regardless of policy, matching how
 	// the delegation_migrator role (also BYPASSRLS) sees rows in production.
-	// Used only for the cross-tenant sweep queries (FindDueForWarning7d/3d,
+	// Used only for the cross-tenant sweep queries (FindDueForDailyWarn,
 	// FindDueForAutoEnd, HardPurgeSoftDeletedBefore) that have no tenant_id
 	// predicate at all and therefore return zero rows under a tenant-scoped
 	// GUC no matter which tenant it names.
@@ -77,9 +77,9 @@ func setupTestDB(t *testing.T) *testDB {
 
 	superDSN := fmt.Sprintf("postgres://postgres:postgres@%s:%s/delegation?sslmode=disable", host, port.Port())
 
-	// Applies 000001_schema (enums, tables, indexes, RLS, roles) and then the
-	// platform-events outbox schema — the same entry point cmd/server calls,
-	// so the test fixture can never drift from what actually ships.
+	// Applies the platform-events outbox schema and then 000001_schema
+	// (enums, tables, indexes, RLS, roles) — the same entry point cmd/server
+	// calls, so the test fixture can never drift from what actually ships.
 	require.NoError(t, Migrate(ctx, superDSN))
 
 	rawPool, err := pgxpool.New(ctx, superDSN)

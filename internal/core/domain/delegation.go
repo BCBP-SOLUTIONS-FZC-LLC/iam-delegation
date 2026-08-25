@@ -72,6 +72,6 @@ type Delegation struct {
 
 	// DEL-13/DLG-D7: review window fields — only set when EndsAt is nil.
 	ReviewDueAt            *time.Time // set at creation to StartsAt + review window days
-	ReviewLastWarnedBucket *int       // 7 | 3 | nil — which review notice fired this cycle (DLG-Q6)
+	ReviewLastWarnedBucket *int       // 3 | 2 | 1 | nil — last days_remaining value notified in the 3-day daily cascade (DLG-Q6)
 	ReviewWindowDays       *int       // per-delegation override of the tenant/global default (DEL-14)
 }

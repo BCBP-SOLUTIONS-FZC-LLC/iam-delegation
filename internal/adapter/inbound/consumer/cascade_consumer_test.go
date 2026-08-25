@@ -133,7 +133,7 @@ func TestHandle_MembershipRevoked_DispatchesToEndForUser(t *testing.T) {
 	}
 }
 
-func TestHandle_TenantOffboarded_DispatchesToScrubTenant(t *testing.T) {
+func TestHandle_TenantMembershipsPurged_DispatchesToScrubTenant(t *testing.T) {
 	cascade := &fakeCascadeService{}
 	idem := newFakeIdempotencyStore()
 	var gucCalls []gucBindCall
@@ -141,7 +141,7 @@ func TestHandle_TenantOffboarded_DispatchesToScrubTenant(t *testing.T) {
 
 	tenantID := uuid.New()
 	eventID := uuid.New().String()
-	env := mustEnvelope(t, eventID, domain.EventTenantOffboarded, domain.TenantOffboardedPayload{
+	env := mustEnvelope(t, eventID, domain.EventTenantMembershipsPurged, domain.TenantMembershipsPurgedPayload{
 		TenantID: tenantID,
 		ActorID:  uuid.New(),
 	})

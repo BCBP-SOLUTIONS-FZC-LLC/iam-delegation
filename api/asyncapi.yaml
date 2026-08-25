@@ -18,7 +18,7 @@ info:
     Schemas       : one per PUBLISHED event type, named identically to the
                     event `type` (PascalCase) — DelegationStarted,
                     DelegationEnded, DelegationReviewRequested (LLD §10.3.1).
-                    MembershipRevoked / TenantOffboarded are registered under
+                    MembershipRevoked / TenantMembershipsPurged are registered under
                     their producing services' own Glue registries, not
                     iam-delegation-events — they are documented below purely
                     as this service's consumer-side contract.
@@ -143,11 +143,16 @@ servers:
     protocol: sqs
     description: |
       SQS queue owned and managed by this service — delegation-cascade-q
-      (DLQ: delegation-cascade-q-dlq, maxReceiveCount=5) — fed by two
-      upstream SNS topics this service does not own, via cross-topic
-      subscriptions (LLD §10.1):
-        iam.membership.events -> MembershipRevoked (filter: EventType IN [MembershipRevoked])
-        iam.tenant.events     -> TenantOffboarded   (filter: EventType IN [TenantOffboarded])
+      (DLQ: delegation-cascade-q-dlq, maxReceiveCount=5) — fed by a single
+      upstream SNS topic this service does not own, via cross-topic
+      subscriptions (LLD §10.1). Both consumed event types are produced by
+      Core / Org & Membership on the SAME topic:
+        iam.membership.events -> MembershipRevoked        (filter: EventType IN [MembershipRevoked])
+        iam.membership.events -> TenantMembershipsPurged  (filter: EventType IN [TenantMembershipsPurged])
+      TenantMembershipsPurged was renamed from TenantOffboarded by Core
+      specifically to avoid colliding with Realm Provisioner's own,
+      differently-scoped TenantOffboarded event on iam.tenant.events, which
+      this service does NOT consume.
       Drives the delegate-side removal cascade (§11.5) and tenant-lifecycle
       cleanup (§11.6). Idempotent via processed_events keyed on the envelope
       id (UUID v7); a redelivery is a no-op. A message whose payload fails
@@ -173,9 +178,9 @@ channels:
     address: delegation-cascade-q
     description: |
       This service's own SQS queue (delegation-cascade-q), not a topic it
-      owns — subscribed to two upstream producers' SNS topics
-      (iam.membership.events, iam.tenant.events) per LLD §10.1. DLQ:
-      delegation-cascade-q-dlq, maxReceiveCount=5.
+      owns — subscribed to Core / Org & Membership's single SNS topic
+      (iam.membership.events) per LLD §10.1, filtered to two event types.
+      DLQ: delegation-cascade-q-dlq, maxReceiveCount=5.
     bindings:
       sqs:
         queue:
@@ -183,7 +188,7 @@ channels:
           fifoQueue: false
     messages:
       MembershipRevoked: { $ref: '#/components/messages/MembershipRevoked' }
-      TenantOffboarded:  { $ref: '#/components/messages/TenantOffboarded' }
+      TenantMembershipsPurged:  { $ref: '#/components/messages/TenantMembershipsPurged' }
 
 operations:
   publishDelegationEvents:
@@ -208,9 +213,13 @@ operations:
     summary: Consume Core's removal/offboarding signals driving the delegate-side cascade
     description: |
       Consumer: this service (iam-delegation).
-      Producers: Core / Org & Membership (MembershipRevoked on
-        iam.membership.events) and the tenant-lifecycle owner
-        (TenantOffboarded on iam.tenant.events) — NOT this service.
+      Producer: Core / Org & Membership — both MembershipRevoked and
+        TenantMembershipsPurged are published on the same topic,
+        iam.membership.events. TenantMembershipsPurged is Core's own
+        tenant-scrub relay, renamed from TenantOffboarded to avoid
+        colliding with Realm Provisioner's differently-scoped
+        TenantOffboarded event on iam.tenant.events, which this service
+        does NOT consume.
       Queue: delegation-cascade-q | DLQ: delegation-cascade-q-dlq
         (maxReceiveCount=5).
 
@@ -219,7 +228,7 @@ operations:
         emitting DelegationEnded(ended_reason=delegate_removed) for
         delegate-side rows only — delegator-side removal ends silently
         (DEL-7/DLG-EVT-4, §11.5).
-      On TenantOffboarded: CascadeService.ScrubTenant ends/cleans up every
+      On TenantMembershipsPurged: CascadeService.ScrubTenant ends/cleans up every
         delegation row scoped to the tenant (§11.6).
 
       Idempotent via processed_events keyed on the envelope id (UUID v7); a
@@ -227,7 +236,7 @@ operations:
       routed to the DLQ rather than retried indefinitely.
     messages:
       - $ref: '#/channels/iam~1delegation~1cascade/messages/MembershipRevoked'
-      - $ref: '#/channels/iam~1delegation~1cascade/messages/TenantOffboarded'
+      - $ref: '#/channels/iam~1delegation~1cascade/messages/TenantMembershipsPurged'
 
 components:
   securitySchemes:
@@ -249,7 +258,7 @@ components:
       name: consumed
       description: |
         This service is the consumer, not the producer, of MembershipRevoked
-        (iam.membership.events) and TenantOffboarded (iam.tenant.events).
+        and TenantMembershipsPurged, both on iam.membership.events.
         Canonical schema ownership for anything tagged consumed sits with the
         producing service, not this file — treat these definitions as this
         service's consumer-side documentation (LLD §10.1), kept in sync with
@@ -342,7 +351,7 @@ components:
     DelegationReviewRequested:
       name: DelegationReviewRequested
       title: Open-ended delegation approaching its review deadline
-      summary: Emitted by the delegation-review sweep at the 7-day and 3-day marks (DLG-I2, DLG-D7).
+      summary: Emitted by the delegation-review sweep once per calendar day for each of the 3 days before review_due_at (DLG-I2, DLG-D7).
       x-lifecycle:
         status: active    # active | deprecated | retired
       x-owner:
@@ -405,31 +414,35 @@ components:
               dataType: String
               description: Dynamic — envelope id, used as the processed_events dedup key.
 
-    TenantOffboarded:
-      name: TenantOffboarded
-      title: Tenant offboarded
+    TenantMembershipsPurged:
+      name: TenantMembershipsPurged
+      title: Tenant memberships purged
       summary: |
-        Consumed by this service (not published). Produced once a tenant's
-        realm export+delete is verified; drives
-        CascadeService.ScrubTenant (§11.6, DLG-Q4/DLG-D14).
+        Consumed by this service (not published). Produced by Core / Org &
+        Membership on a real transition into the 'offboarded' tenant
+        status (itself driven by Core having consumed Realm Provisioner's
+        own TenantOffboarded event on a different queue); drives
+        CascadeService.ScrubTenant (§11.6, DLG-Q4/DLG-D14). Renamed by
+        Core from TenantOffboarded to avoid colliding with RP's event of
+        that name.
       tags:
         - $ref: '#/components/tags/consumed'
       contentType: application/json
       payload:
-        $ref: '#/components/schemas/TenantOffboardedPayload'
+        $ref: '#/components/schemas/TenantMembershipsPurgedPayload'
       bindings:
         sns:
           messageAttributes:
             EventType:
               dataType: String
-              value: TenantOffboarded
+              value: TenantMembershipsPurged
               description: Set by the producer. Matches this queue's SNS filter policy.
             TenantID:
               dataType: String
               description: Dynamic — envelope.tenant_id (the tenant being offboarded).
             Source:
               dataType: String
-              description: Producing service identifier (tenant-lifecycle owner).
+              description: Producing service identifier (Core / Org & Membership).
             EventID:
               dataType: String
               description: Dynamic — envelope id, used as the processed_events dedup key.
@@ -442,7 +455,7 @@ components:
       properties:
         id:          { type: string, format: uuid, description: UUID v7 — consumer dedup key }
         source:      { type: string, const: iam-delegation }
-        specversion: { type: string, const: "1.0" }
+        specversion: { type: string, const: "1", description: "Message format semantic version — always \"1\" for this topic (events.WithSchemaVersion, DLG-D24)." }
         time:        { type: string, format: date-time }
         tenant_id:   { type: string, format: uuid }
         trace_id:    { type: string }
@@ -486,10 +499,10 @@ components:
             delegation_id: { type: string, format: uuid }
             delegator_id:  { type: string, format: uuid }
             delegate_id:   { type: string, format: uuid }
-            days_remaining: { type: integer, enum: [7, 3] }   # the two fixed notice points (DLG-Q6)
+            days_remaining: { type: integer, enum: [3, 2, 1] }   # the 3-day daily cascade (DLG-Q6)
 
     # ── Consumed payload schemas (LLD §10.1) — flat, no EventEnvelope allOf;
-    # these mirror MembershipRevokedPayload/TenantOffboardedPayload exactly
+    # these mirror MembershipRevokedPayload/TenantMembershipsPurgedPayload exactly
     # as produced upstream (internal/core/domain/event_payloads.go).
     MembershipRevokedPayload:
       type: object
@@ -499,7 +512,7 @@ components:
         user_id:   { type: string, format: uuid, description: The member whose tenant membership was revoked. }
         actor_id:  { type: string, format: uuid, description: Who performed the revocation. }
 
-    TenantOffboardedPayload:
+    TenantMembershipsPurgedPayload:
       type: object
       required: [tenant_id, actor_id]
       properties:

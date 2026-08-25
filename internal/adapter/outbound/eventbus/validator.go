@@ -65,9 +65,9 @@ var defaultSchemaEntries = []schemaEntry{
 // NewSchemaValidator compiles the three published-event schemas from the
 // embedded JSON files and returns a validator ready to check payloads
 // before they are enqueued. Consumed event types (MembershipRevoked,
-// TenantOffboarded) are intentionally NOT registered here — this service
-// does not validate inbound cascade payloads against these schemas; that is
-// the SQS consumer's own concern.
+// TenantMembershipsPurged) are intentionally NOT registered here — this
+// service does not validate inbound cascade payloads against these schemas;
+// that is the SQS consumer's own concern.
 func NewSchemaValidator() (*SchemaValidator, error) {
 	return newSchemaValidatorFromEntries(defaultSchemaEntries)
 }

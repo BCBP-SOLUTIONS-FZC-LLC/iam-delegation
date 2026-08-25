@@ -16,7 +16,7 @@ type SettingsRepository interface {
 	// Upsert creates or updates the tenant's policy row (DLG-7).
 	Upsert(ctx context.Context, tenantID uuid.UUID, maxDurationDays, reviewWindowDays int) (domain.DelegationTenantSettings, error)
 
-	// SoftDeleteTenant removes the tenant's policy row on TenantOffboarded
+	// SoftDeleteTenant removes the tenant's policy row on TenantMembershipsPurged
 	// (§11.6).
 	SoftDeleteTenant(ctx context.Context, tenantID uuid.UUID) error
 }

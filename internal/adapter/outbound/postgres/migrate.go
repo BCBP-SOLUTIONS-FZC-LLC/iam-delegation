@@ -29,17 +29,24 @@ func RunMigrations(ctx context.Context, dsn string, logger pgcdomain.Logger) err
 }
 
 // Migrate is the single startup entry point cmd/server and cmd/reconciler
-// both call: it applies every domain migration (000001_schema — enums,
-// tables, indexes, triggers, RLS, roles) and then, immediately afterward,
-// applies the platform-events outbox schema — mirroring iam-user-profile's
-// cmd/server/main.go ordering (outbox.ApplySchema right after domain
-// migrations, before anything else touches the DB).
+// both call: it applies the platform-events outbox schema first, then the
+// domain migration (000001_schema — enums, tables, indexes, triggers, RLS,
+// roles, and the delegation_app GRANT on outbox_events).
+//
+// This order is the reverse of iam-user-profile's cmd/server/main.go
+// (domain migrations, then outbox.ApplySchema) — mirroring that ordering
+// here doesn't work: unlike iam-user-profile, this service's own migration
+// creates the delegation_app/delegation_migrator roles from scratch (rather
+// than assuming they're pre-provisioned) and grants delegation_app
+// permissions on outbox_events. If outbox.ApplySchema ran second, that GRANT
+// would target a table that doesn't exist yet and fail every fresh-database
+// bring-up.
 func Migrate(ctx context.Context, dsn string) error {
-	if err := RunMigrations(ctx, dsn, nil); err != nil {
-		return fmt.Errorf("domain migrations: %w", err)
-	}
 	if err := outbox.ApplySchema(ctx, &pgmigrate.Runner{DSN: dsn}); err != nil {
 		return fmt.Errorf("outbox schema: %w", err)
+	}
+	if err := RunMigrations(ctx, dsn, nil); err != nil {
+		return fmt.Errorf("domain migrations: %w", err)
 	}
 	return nil
 }

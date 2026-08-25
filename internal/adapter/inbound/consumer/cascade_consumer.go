@@ -109,9 +109,10 @@ func NewCascadeConsumer(cascade cascadeService, idempotency idempotencyStore, bi
 // ack-and-drop) — redelivery can never fix a permanently malformed id, so
 // retrying it forever would just wedge the queue (mirrors
 // iam-user-profile's user_event_consumer.go). An unrecognized event type is
-// also acked without dispatching — this queue's SNS filter policy only
-// admits MembershipRevoked/TenantOffboarded, so anything else arriving is
-// unexpected but must not crash the consumer. A payload that fails to
+// also acked without dispatching — this queue's SNS filter policy is meant
+// to admit only MembershipRevoked/TenantMembershipsPurged (both on
+// iam.membership.events), so anything else arriving is unexpected but must
+// not crash the consumer. A payload that fails to
 // JSON-decode returns an error instead: LLD §10.1 routes a schema-decode
 // failure to the DLQ rather than retrying indefinitely, which happens
 // automatically via the queue's redrive policy (maxReceiveCount=5) once
@@ -131,7 +132,7 @@ func (c *CascadeConsumer) Handle(ctx context.Context, env events.Envelope[json.R
 	switch env.Type {
 	case domain.EventMembershipRevoked:
 		consumerName = consumerCascade
-	case domain.EventTenantOffboarded:
+	case domain.EventTenantMembershipsPurged:
 		consumerName = consumerOffboarding
 	default:
 		c.logger.Warn("no handler registered for event type on delegation-cascade-q — acknowledging to prevent redelivery", map[string]interface{}{
@@ -158,8 +159,8 @@ func (c *CascadeConsumer) Handle(ctx context.Context, env events.Envelope[json.R
 	switch env.Type {
 	case domain.EventMembershipRevoked:
 		handleErr = c.handleMembershipRevoked(ctx, env)
-	case domain.EventTenantOffboarded:
-		handleErr = c.handleTenantOffboarded(ctx, env)
+	case domain.EventTenantMembershipsPurged:
+		handleErr = c.handleTenantMembershipsPurged(ctx, env)
 	}
 	if handleErr != nil {
 		return handleErr
@@ -192,12 +193,15 @@ func (c *CascadeConsumer) handleMembershipRevoked(ctx context.Context, env event
 	return nil
 }
 
-// handleTenantOffboarded decodes a TenantOffboarded payload and dispatches
-// to CascadeService.ScrubTenant (LLD §11.6).
-func (c *CascadeConsumer) handleTenantOffboarded(ctx context.Context, env events.Envelope[json.RawMessage]) error {
-	var payload domain.TenantOffboardedPayload
+// handleTenantMembershipsPurged decodes a TenantMembershipsPurged payload
+// and dispatches to CascadeService.ScrubTenant (LLD §11.6). This is Core's
+// (iam-org-membership's) tenant-scrub relay on iam.membership.events —
+// renamed from "TenantOffboarded" on Core's side to avoid colliding with
+// Realm Provisioner's own TenantOffboarded event.
+func (c *CascadeConsumer) handleTenantMembershipsPurged(ctx context.Context, env events.Envelope[json.RawMessage]) error {
+	var payload domain.TenantMembershipsPurgedPayload
 	if err := json.Unmarshal(env.Payload, &payload); err != nil {
-		return fmt.Errorf("cascadeconsumer: decode TenantOffboarded payload for event %s: %w", env.ID, err)
+		return fmt.Errorf("cascadeconsumer: decode TenantMembershipsPurged payload for event %s: %w", env.ID, err)
 	}
 
 	gucCtx := c.bindGUC(ctx, payload.TenantID, systemPrincipal)

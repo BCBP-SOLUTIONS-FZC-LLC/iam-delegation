@@ -21,8 +21,8 @@ type DelegationRepository interface {
 	End(ctx context.Context, tenantID, id uuid.UUID, status domain.DelegationStatus, expectedVersion int64) (*domain.Delegation, error)
 
 	// ExtendReview pushes review_due_at forward by windowDays and resets
-	// ReviewLastWarnedBucket to nil, re-arming both warnings (DEL-13, DLG-4,
-	// DLG-EVT-5).
+	// ReviewLastWarnedBucket to nil, re-arming the 3-day daily cascade
+	// (DEL-13, DLG-4, DLG-EVT-5).
 	ExtendReview(ctx context.Context, tenantID, id uuid.UUID, windowDays int, expectedVersion int64) (*domain.Delegation, error)
 
 	// ListExpiringBefore is the delegation-expiry cron query (DLG-I1,
@@ -62,7 +62,7 @@ type DelegationRepository interface {
 	// bulk cascade, §12.1).
 	EndForUser(ctx context.Context, tenantID, userID uuid.UUID) ([]domain.Delegation, error)
 
-	// SoftDeleteTenant cascades on TenantOffboarded — soft-deletes every
+	// SoftDeleteTenant cascades on TenantMembershipsPurged — soft-deletes every
 	// delegation row for the tenant (§11.6). No event emission.
 	SoftDeleteTenant(ctx context.Context, tenantID uuid.UUID) error
 

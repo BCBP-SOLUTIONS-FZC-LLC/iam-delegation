@@ -9,7 +9,6 @@ package main
 import (
 	"context"
 	"fmt"
-	"log/slog"
 	"net/http"
 	"os"
 	"os/signal"
@@ -28,6 +27,7 @@ import (
 	events "github.com/BCBP-SOLUTIONS-FZC-LLC/platform-events/pkg/events"
 	"github.com/BCBP-SOLUTIONS-FZC-LLC/platform-events/pkg/outbox"
 	gincommon "github.com/BCBP-SOLUTIONS-FZC-LLC/platform-gincommon/pkg/gincommon"
+	gclogger "github.com/BCBP-SOLUTIONS-FZC-LLC/platform-gincommon/pkg/logger"
 	pgmigrate "github.com/BCBP-SOLUTIONS-FZC-LLC/platform-pgcommon/pkg/migrate"
 	pgcommon "github.com/BCBP-SOLUTIONS-FZC-LLC/platform-pgcommon/pkg/pgcommon"
 
@@ -54,21 +54,21 @@ import (
 var buildVersion = "dev"
 
 func main() {
-	if err := run(); err != nil {
-		slog.Error("iam-delegation-server exited with error", slog.String("error", err.Error()))
+	logger, err := gclogger.NewLogger(getEnv("ENVIRONMENT", "development"))
+	if err != nil {
+		panic("init logger: " + err.Error())
+	}
+	if err := run(logger); err != nil {
+		logger.Error("iam-delegation-server exited with error", map[string]interface{}{"error": err.Error()})
 		os.Exit(1)
 	}
 }
 
-func run() error {
+func run(logger Logger) error {
 	cfg, err := loadConfig()
 	if err != nil {
 		return fmt.Errorf("load config: %w", err)
 	}
-
-	logger := newLogger(cfg.Environment)
-	slog.SetDefault(logger)
-	ml := mapLogger{l: logger}
 
 	baseCtx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
@@ -90,14 +90,26 @@ func run() error {
 	tracer := otel.Tracer("iam-delegation")
 	defer func() {
 		if shutdownErr := gincommon.Shutdown(nil); shutdownErr != nil {
-			logger.Error("telemetry shutdown failed", slog.String("error", shutdownErr.Error()))
+			logger.Error("telemetry shutdown failed", map[string]interface{}{"error": shutdownErr.Error()})
 		}
 	}()
 
+	// Database — pgcommon.ConfigFromEnv reads DATABASE_URL/PG_* directly so
+	// pool sizing, PgBouncer mode, and DSN assembly have exactly one
+	// implementation instead of a second one hand-rolled here.
+	pgCfg, pgWarnings := pgcommon.ConfigFromEnv()
+	for _, w := range pgWarnings {
+		logger.Warn("postgres config warning", map[string]interface{}{"key": w.Key, "reason": w.Reason})
+	}
+	// DSNFromEnv (not a bare ApplyStatementTimeout(pgCfg.DSN)) so the
+	// DATABASE_URL bypass applies here too: PG_STATEMENT_TIMEOUT must be
+	// ignored when DATABASE_URL is set verbatim, per ApplyStatementTimeout's
+	// own contract.
+	dsn := pgadapter.DSNFromEnv()
 	// Migrations run at startup against the delegation_migrator (BYPASSRLS)
-	// role — MIGRATION_DATABASE_URL, falling back to DATABASE_URL (LLD §7.4).
-	migratorDSN := getEnv("MIGRATION_DATABASE_URL", os.Getenv("DATABASE_URL"))
-	if err := pgadapter.RunMigrations(baseCtx, migratorDSN, slogDomainLogger{l: logger}); err != nil {
+	// role — MIGRATION_DATABASE_URL, falling back to DSNFromEnv() (LLD §7.4).
+	migratorDSN := pgadapter.MigrationDSNFromEnv()
+	if err := pgadapter.RunMigrations(baseCtx, migratorDSN, pgadapter.NewLoggerAdapter(logger)); err != nil {
 		return fmt.Errorf("run migrations: %w", err)
 	}
 	if err := outbox.ApplySchema(baseCtx, &pgmigrate.Runner{DSN: migratorDSN}); err != nil {
@@ -107,31 +119,31 @@ func run() error {
 	// The RLS-scoped delegation_app pool — every public-route write and
 	// read goes through this pool, with app.tenant_id bound per-request by
 	// tenantGUCMiddleware (router.go) or per-call by gucBoundReader.
-	pool, pgWarnings, err := pgadapter.NewPool(baseCtx, slogDomainLogger{l: logger})
+	pgCfg.DSN = dsn
+	pgCfg.GUCProvider = pgcommon.GUCSetFromContext
+	pgCfg.Logger = pgadapter.NewLoggerAdapter(logger)
+	pool, err := pgcommon.NewPool(baseCtx, pgCfg)
 	if err != nil {
 		return fmt.Errorf("connect app pool: %w", err)
 	}
 	//nolint:errcheck // best-effort shutdown cleanup — an error here has no recovery action at process exit.
 	defer func() { _ = pool.DrainAndClose(context.Background()) }()
-	for _, w := range pgWarnings {
-		logger.Warn("postgres config warning", slog.String("key", w.Key), slog.String("reason", w.Reason))
-	}
 
 	// The BYPASSRLS delegation_migrator-privileged pool the cross-tenant
 	// cron sweep queries and the RLS-exempt processed_events ledger need
 	// (LLD §7.2.3/§11.3/§11.4/§18.4). SYSTEM_DATABASE_URL should point at a
-	// role with BYPASSRLS in production; falling back to DATABASE_URL
+	// role with BYPASSRLS in production; falling back to DSNFromEnv()
 	// degrades the reconciler's sweeps to RLS-filtered (incomplete) rather
 	// than failing startup.
-	sysDSN, usedFallback := pgadapter.SystemDSNFromEnv()
-	if usedFallback {
-		logger.Warn("SYSTEM_DATABASE_URL not set — sysPool reuses app DSN; cross-tenant cron/internal sweeps will be RLS-filtered")
-	}
+	sysDSN := pgadapter.SystemDSNFromEnv()
 	sysPool, err := pgcommon.NewPool(baseCtx, pgcommon.Config{
-		DSN: sysDSN, Logger: slogDomainLogger{l: logger}, Tracer: otelSpanTracer{tracer: tracer}, PGBouncerMode: true,
+		DSN: sysDSN, Logger: pgadapter.NewLoggerAdapter(logger), Tracer: otelSpanTracer{tracer: tracer}, PGBouncerMode: true,
 	})
 	if err != nil {
 		return fmt.Errorf("connect system pool: %w", err)
+	}
+	if sysDSN == dsn {
+		logger.Warn("SYSTEM_DATABASE_URL not set — sysPool reuses app DSN; cross-tenant cron/internal sweeps will be RLS-filtered", nil)
 	}
 	//nolint:errcheck // best-effort shutdown cleanup — an error here has no recovery action at process exit.
 	defer func() { _ = sysPool.DrainAndClose(context.Background()) }()
@@ -161,19 +173,26 @@ func run() error {
 		if err != nil {
 			return fmt.Errorf("build Glue codec: %w", err)
 		}
-		gc.StartRefresher(baseCtx, 5*time.Minute)
+		gc.WithLogger(logger).StartRefresher(baseCtx, 5*time.Minute)
 		codec = gc
 	}
 	snsPublisher, err := events.NewSNSPublisher(events.SNSConfig{
-		TopicARN: cfg.SNSTopicARN, Region: cfg.AWSRegion, EndpointURL: cfg.AWSEndpointURL, Logger: ml,
+		TopicARN: cfg.SNSTopicARN, Region: cfg.AWSRegion, EndpointURL: cfg.AWSEndpointURL, Logger: logger,
 	}, events.WithCodec(codec))
 	if err != nil {
 		return fmt.Errorf("build SNS publisher: %w", err)
 	}
 
 	outboxRunner, err := outbox.NewRunner(outbox.Config{
-		Pool: pool, Publisher: snsPublisher, Logger: ml,
-		PollInterval: 500 * time.Millisecond, BatchSize: 50, MaxAttempts: 5,
+		Pool: pool, Publisher: snsPublisher, Logger: logger,
+		PollInterval:       cfg.OutboxPollInterval,
+		BatchSize:          cfg.OutboxBatchSize,
+		MaxAttempts:        cfg.OutboxMaxAttempts,
+		DrainTimeout:       cfg.OutboxDrainTimeout,
+		PublishConcurrency: cfg.OutboxPublishConcurrency,
+		PublishTimeout:     cfg.OutboxPublishTimeout,
+		StartupJitter:      cfg.OutboxStartupJitter,
+		ClaimLeaseDuration: cfg.OutboxClaimLeaseDuration,
 	})
 	if err != nil {
 		return fmt.Errorf("build outbox runner: %w", err)
@@ -181,7 +200,8 @@ func run() error {
 
 	// Metrics — iam_delegation_* counters/gauges land in gincommon's own
 	// Prometheus registry (LLD §14.2), alongside its HTTP metrics.
-	if _, err := metrics.Register(gincommon.MetricsRegisterer()); err != nil {
+	appMetrics, err := metrics.Register(gincommon.MetricsRegisterer())
+	if err != nil {
 		return fmt.Errorf("register metrics: %w", err)
 	}
 	events.InitWithRegisterer("iam-delegation", buildVersion, gincommon.MetricsRegisterer())
@@ -199,8 +219,8 @@ func run() error {
 	redisClient := valkey.NewClient(cfg.ValkeyAddr)
 	//nolint:errcheck // best-effort shutdown cleanup — an error here has no recovery action at process exit.
 	defer func() { _ = redisClient.Close() }()
-	cache := valkey.NewCache(redisClient, ml)
-	idempotencyStore := valkey.NewIdempotencyStore(redisClient, ml)
+	cache := valkey.NewCache(redisClient, logger)
+	idempotencyStore := valkey.NewIdempotencyStore(redisClient, logger)
 
 	// Repositories. delegationRepo/settingsRepo (app pool) back every
 	// public-route and cascade-consumer write/read; delegationRepoSys
@@ -221,7 +241,8 @@ func run() error {
 	// Reconciler jobs — shared with cmd/reconciler (DLG-D17).
 	jctx := &jobs.Context{
 		Delegations: delegationRepoSys, UserProfile: userProfileClient, TxRunner: txRunner,
-		BindTenantGUC: pgadapter.WithTenantGUC, Logger: ml, BatchLimit: 50, RetentionDays: 90,
+		BindTenantGUC: pgadapter.WithTenantGUC, Logger: logger, BatchLimit: 50, RetentionDays: 90,
+		Metrics: appMetrics,
 	}
 	runner := reconcilerRunner{jctx: jctx}
 
@@ -257,10 +278,10 @@ func run() error {
 		ReadHeaderTimeout: 10 * time.Second,
 	}
 
-	// Cascade consumer — Core's MembershipRevoked/TenantOffboarded on
+	// Cascade consumer — Core's MembershipRevoked/TenantMembershipsPurged on
 	// delegation-cascade-q (LLD §10.1/§11.5/§11.6).
 	processedEvents := consumer.NewProcessedEvents(sysPool)
-	cascadeConsumer := consumer.NewCascadeConsumer(cascadeService, processedEvents, pgadapter.WithTenantGUC, ml)
+	cascadeConsumer := consumer.NewCascadeConsumer(cascadeService, processedEvents, pgadapter.WithTenantGUC, logger)
 	awsCfg, err := awsconfig.LoadDefaultConfig(baseCtx, awsconfig.WithRegion(cfg.AWSRegion))
 	if err != nil {
 		return fmt.Errorf("load AWS config: %w", err)
@@ -270,7 +291,14 @@ func run() error {
 			o.BaseEndpoint = &cfg.AWSEndpointURL
 		}
 	})
-	sqsConsumer, err := consumer.NewCascadeSQSConsumer(sqsClient, cfg.CascadeQueueURL, ml, cascadeConsumer)
+	// GlueDecodeCodec (unconditional, not gated on cfg.GlueRegistryName):
+	// Core (iam-org-membership) Glue-encodes MembershipRevoked/
+	// TenantMembershipsPurged whenever ITS OWN GLUE_REGISTRY_MEMBERSHIP_NAME
+	// is set — independently of this service's outbound publish-side Glue
+	// config — so the inbound consumer needs decode support regardless of
+	// whether this service's own events are Glue-encoded (LLD §10.1, DLG-D21).
+	sqsConsumer, err := consumer.NewCascadeSQSConsumer(sqsClient, cfg.CascadeQueueURL, logger, cascadeConsumer,
+		events.WithConsumerCodec(eventbus.GlueDecodeCodec{}))
 	if err != nil {
 		return fmt.Errorf("build cascade SQS consumer: %w", err)
 	}
@@ -278,8 +306,29 @@ func run() error {
 	g, gCtx := errgroup.WithContext(baseCtx)
 	g.Go(func() error { return outboxRunner.Start(gCtx) })
 	g.Go(func() error { return sqsConsumer.Start(gCtx) })
+	// Outbox prune sweep — outbox.Runner.PrunePublished never runs on its
+	// own; without this, published outbox_events rows accumulate forever
+	// (LLD gap, matching iam-user-profile's identical runMaintenanceSweep
+	// ticker: daily by default, 7-day retention, 1000-row batches).
 	g.Go(func() error {
-		logger.Info("iam-delegation-server listening", slog.String("addr", httpServer.Addr))
+		ticker := time.NewTicker(cfg.OutboxPruneInterval)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-gCtx.Done():
+				return nil
+			case <-ticker.C:
+				pruned, err := outboxRunner.PrunePublished(gCtx, cfg.OutboxPruneRetention, cfg.OutboxPruneLimit)
+				if err != nil {
+					logger.Error("outbox prune failed", map[string]interface{}{"error": err.Error()})
+					continue
+				}
+				logger.Info("outbox prune complete", map[string]interface{}{"rows_deleted": pruned})
+			}
+		}
+	})
+	g.Go(func() error {
+		logger.Info("iam-delegation-server listening", map[string]interface{}{"addr": httpServer.Addr})
 		if err := httpServer.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 			return fmt.Errorf("http server: %w", err)
 		}
@@ -295,13 +344,13 @@ func run() error {
 		defer cancel()
 		//nolint:contextcheck // see shutdownCtx's comment above
 		if err := httpServer.Shutdown(shutdownCtx); err != nil {
-			logger.Error("http server shutdown failed", slog.String("error", err.Error()))
+			logger.Error("http server shutdown failed", map[string]interface{}{"error": err.Error()})
 		}
 		if err := outboxRunner.Stop(); err != nil {
-			logger.Error("outbox runner shutdown failed", slog.String("error", err.Error()))
+			logger.Error("outbox runner shutdown failed", map[string]interface{}{"error": err.Error()})
 		}
 		if err := sqsConsumer.Stop(); err != nil {
-			logger.Error("cascade consumer shutdown failed", slog.String("error", err.Error()))
+			logger.Error("cascade consumer shutdown failed", map[string]interface{}{"error": err.Error()})
 		}
 		return nil
 	})

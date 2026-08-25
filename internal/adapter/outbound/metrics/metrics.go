@@ -80,7 +80,7 @@ func Register(reg prometheus.Registerer) (*Metrics, error) {
 		reviewWarnedTotal: prometheus.NewCounterVec(
 			prometheus.CounterOpts{
 				Name: "iam_delegation_review_warned_total",
-				Help: "Total DLG-Q6 dual-warning review notices fired, labeled by days_remaining (7 or 3).",
+				Help: "Total DLG-Q6 3-day daily-cascade review notices fired, labeled by days_remaining (3, 2, or 1).",
 			},
 			[]string{"days_remaining"},
 		),
@@ -119,7 +119,7 @@ func Register(reg prometheus.Registerer) (*Metrics, error) {
 		cascadeProcessedTotal: prometheus.NewCounter(
 			prometheus.CounterOpts{
 				Name: "iam_delegation_cascade_processed_total",
-				Help: "Total inbound MembershipRevoked/TenantOffboarded cascade messages processed successfully.",
+				Help: "Total inbound MembershipRevoked/TenantMembershipsPurged cascade messages processed successfully.",
 			},
 		),
 		cascadeDLQTotal: prometheus.NewCounter(
@@ -152,7 +152,7 @@ func Register(reg prometheus.Registerer) (*Metrics, error) {
 	for _, reason := range []string{"expired", "cancelled", "delegate_removed", "review_expired"} {
 		m.endedTotal.WithLabelValues(reason)
 	}
-	for _, days := range []string{"7", "3"} {
+	for _, days := range []string{"3", "2", "1"} {
 		m.reviewWarnedTotal.WithLabelValues(days)
 	}
 
@@ -186,7 +186,7 @@ func (m *Metrics) RecordReviewDeferred() {
 }
 
 // RecordReviewWarned increments iam_delegation_review_warned_total, tagged
-// by daysRemaining ("7" or "3").
+// by daysRemaining ("3", "2", or "1").
 func (m *Metrics) RecordReviewWarned(daysRemaining string) {
 	m.reviewWarnedTotal.WithLabelValues(daysRemaining).Inc()
 }

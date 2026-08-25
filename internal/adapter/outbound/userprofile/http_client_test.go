@@ -42,13 +42,14 @@ func TestBuildBody_DelegateIDThreeStates(t *testing.T) {
 
 func TestHTTPClient_SetAvailability_Create(t *testing.T) {
 	tenantID, userID, delegateID := uuid.New(), uuid.New(), uuid.New()
-	var gotPath, gotMethod, gotUserID, gotUserRoles string
+	var gotPath, gotMethod, gotUserID, gotTenantID, gotTenantRoles string
 	var gotBody map[string]any
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		gotPath = r.URL.Path
 		gotMethod = r.Method
-		gotUserID = r.Header.Get("X-User-Id")
-		gotUserRoles = r.Header.Get("X-User-Roles")
+		gotUserID = r.Header.Get("x-user-id")
+		gotTenantID = r.Header.Get("x-tenant-id")
+		gotTenantRoles = r.Header.Get("x-tenant-roles")
 		b, _ := io.ReadAll(r.Body)
 		_ = json.Unmarshal(b, &gotBody)
 		w.WriteHeader(http.StatusOK)
@@ -67,9 +68,10 @@ func TestHTTPClient_SetAvailability_Create(t *testing.T) {
 	require.NoError(t, err)
 
 	assert.Equal(t, http.MethodPut, gotMethod)
-	assert.Equal(t, "/internal/users/"+userID.String()+"/availability", gotPath)
+	assert.Equal(t, "/api/v1/internal/users/"+userID.String()+"/availability", gotPath)
 	assert.Equal(t, "iam-system", gotUserID)
-	assert.Equal(t, "iam-system", gotUserRoles)
+	assert.Equal(t, tenantID.String(), gotTenantID)
+	assert.Equal(t, "iam-system", gotTenantRoles)
 	assert.Equal(t, "ooo", gotBody["status"])
 	assert.Equal(t, delegateID.String(), gotBody["delegate_id"])
 	assert.Equal(t, "on leave", gotBody["note"])
@@ -78,7 +80,11 @@ func TestHTTPClient_SetAvailability_Create(t *testing.T) {
 }
 
 // TestHTTPClient_SetAvailability_End covers DEL-6's pointer-clear-only end
-// path: {delegate_id: null}, no status field at all.
+// path: {delegate_id: null, status: "available"}. iam-user-profile's
+// PutAvailabilityRequest DTO requires `status` (binding:"required"), so a
+// bare {delegate_id: null} body — the original design here — gets a clean
+// 400 rather than a clean pointer-clear; defaulting to "available" on this
+// path is the fix (see buildBody's doc comment).
 func TestHTTPClient_SetAvailability_End(t *testing.T) {
 	var gotBody map[string]any
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -99,8 +105,7 @@ func TestHTTPClient_SetAvailability_End(t *testing.T) {
 	val, ok := gotBody["delegate_id"]
 	require.True(t, ok, "delegate_id must be present (explicit null)")
 	assert.Nil(t, val)
-	_, hasStatus := gotBody["status"]
-	assert.False(t, hasStatus, "end must never send status:\"available\" — UP owns that transition")
+	assert.Equal(t, "available", gotBody["status"], "end must send status:\"available\" — iam-user-profile requires status on every call")
 }
 
 // TestHTTPClient_SetAvailability_5xx_WrapsErrDependencyUnavailable covers

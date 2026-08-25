@@ -310,8 +310,8 @@ func (r *DelegationRepository) FindDueForAutoEnd(ctx context.Context, now time.T
 		now, limitOrDefault(limit))
 }
 
-// MarkReviewWarned sets review_last_warned_bucket = bucket (7 or 3), with
-// the same optimistic-lock semantics as End/ExtendReview.
+// MarkReviewWarned sets review_last_warned_bucket = bucket (days_remaining:
+// 3, 2, or 1), with the same optimistic-lock semantics as End/ExtendReview.
 func (r *DelegationRepository) MarkReviewWarned(ctx context.Context, tenantID, id uuid.UUID, bucket int, expectedVersion int64) error {
 	return withPool(ctx, r.pool, func(tx pgx.Tx) error {
 		cmd, err := tx.Exec(ctx, `
@@ -359,7 +359,7 @@ func (r *DelegationRepository) EndForUser(ctx context.Context, tenantID, userID 
 	return out, err
 }
 
-// SoftDeleteTenant cascades on TenantOffboarded — soft-deletes every
+// SoftDeleteTenant cascades on TenantMembershipsPurged — soft-deletes every
 // non-deleted delegation row for the tenant (LLD §11.6). No event emission.
 func (r *DelegationRepository) SoftDeleteTenant(ctx context.Context, tenantID uuid.UUID) error {
 	return withPool(ctx, r.pool, func(tx pgx.Tx) error {

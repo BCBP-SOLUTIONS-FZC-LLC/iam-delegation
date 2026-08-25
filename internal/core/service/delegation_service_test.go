@@ -532,7 +532,25 @@ func TestDelegationService_Reassign_DefaultsFromExistingDelegation(t *testing.T)
 	require.NotNil(t, inserted.ScopeID)
 	assert.Equal(t, *d.ScopeID, *inserted.ScopeID)
 	assert.Equal(t, "orig reason", inserted.Reason)
-	assert.Nil(t, inserted.EndsAt, "reassign with no ends_at override must be open-ended regardless of the old delegation's ends_at")
+	require.NotNil(t, inserted.EndsAt, "reassign with no ends_at override must preserve the old delegation's ends_at (LLD §8.4 DLG-5)")
+	assert.Equal(t, *d.EndsAt, *inserted.EndsAt)
+	assert.Nil(t, inserted.ReviewDueAt, "a fixed-ends_at reassign must not set a review due date")
+}
+
+func TestDelegationService_Reassign_OmittedEndsAtOpenEndedPreservesOpenEnded(t *testing.T) {
+	h := newDelegationHarness()
+	tenantID := uuid.New()
+	d, delegatorID, delegateID := seedReassignable(h, tenantID)
+	d.EndsAt = nil
+	h.repo.seed(d)
+	h.activeBoth(delegatorID, delegateID)
+
+	_, err := h.svc.Reassign(context.Background(), tenantID, d.ID, d.RecordVersion, ReassignInput{})
+	require.NoError(t, err)
+
+	require.Len(t, h.repo.insertCalls, 1)
+	inserted := h.repo.insertCalls[0]
+	assert.Nil(t, inserted.EndsAt, "an already open-ended delegation must stay open-ended when ends_at is omitted")
 	assert.NotNil(t, inserted.ReviewDueAt, "open-ended reassign must set a review due date")
 }
 

@@ -31,6 +31,34 @@ type config struct {
 
 	CascadeQueueURL string
 
+	// Outbox runner tunables (outbox.Config) — env-configurable to match
+	// iam-org-membership's/iam-user-profile's identical OUTBOX_* surface;
+	// defaults match platform-events' own library defaults where iam-org-
+	// membership's are the same, and iam-org-membership's otherwise (the
+	// fuller of the two sibling configs, and this service's original
+	// source).
+	OutboxPollInterval       time.Duration
+	OutboxBatchSize          int
+	OutboxMaxAttempts        int
+	OutboxDrainTimeout       time.Duration
+	OutboxPublishConcurrency int
+	OutboxPublishTimeout     time.Duration
+	OutboxStartupJitter      time.Duration
+	OutboxClaimLeaseDuration time.Duration
+
+	// Outbox prune sweep — platform-events' own outbox.Runner.PrunePublished
+	// is never called without this: published outbox_events rows are never
+	// deleted automatically (per pkg/outbox's own doc comment) and the table
+	// grows unbounded otherwise. Mirrors iam-user-profile's runMaintenanceSweep
+	// (daily ticker, 7-day retention, 1000-row batches) — iam-org-membership
+	// instead hand-rolls the equivalent DELETE in a reconciler job rather than
+	// calling PrunePublished; this service calls the library method directly,
+	// matching user-profile and every other "pass through platform-events"
+	// fix made this session.
+	OutboxPruneInterval  time.Duration
+	OutboxPruneRetention time.Duration
+	OutboxPruneLimit     int
+
 	OTELExporterOTLPEndpoint string
 
 	DocsEnabled   bool
@@ -80,6 +108,39 @@ func loadConfig() (config, error) {
 	if cfg.PolicyDefaultReviewWindowDays, err = getEnvInt("POLICY_DEFAULT_REVIEW_WINDOW_DAYS", 90); err != nil {
 		return cfg, err
 	}
+	if cfg.OutboxPollInterval, err = getEnvDurationStr("OUTBOX_POLL_INTERVAL", 500*time.Millisecond); err != nil {
+		return cfg, err
+	}
+	if cfg.OutboxBatchSize, err = getEnvInt("OUTBOX_BATCH_SIZE", 50); err != nil {
+		return cfg, err
+	}
+	if cfg.OutboxMaxAttempts, err = getEnvInt("OUTBOX_MAX_ATTEMPTS", 5); err != nil {
+		return cfg, err
+	}
+	if cfg.OutboxDrainTimeout, err = getEnvDurationStr("OUTBOX_DRAIN_TIMEOUT", 30*time.Second); err != nil {
+		return cfg, err
+	}
+	if cfg.OutboxPublishConcurrency, err = getEnvInt("OUTBOX_PUBLISH_CONCURRENCY", 4); err != nil {
+		return cfg, err
+	}
+	if cfg.OutboxPublishTimeout, err = getEnvDurationStr("OUTBOX_PUBLISH_TIMEOUT", 10*time.Second); err != nil {
+		return cfg, err
+	}
+	if cfg.OutboxStartupJitter, err = getEnvDurationStr("OUTBOX_STARTUP_JITTER", 2*time.Second); err != nil {
+		return cfg, err
+	}
+	if cfg.OutboxClaimLeaseDuration, err = getEnvDurationStr("OUTBOX_CLAIM_LEASE_DURATION", 10*time.Minute); err != nil {
+		return cfg, err
+	}
+	if cfg.OutboxPruneInterval, err = getEnvDurationStr("OUTBOX_PRUNE_INTERVAL", 24*time.Hour); err != nil {
+		return cfg, err
+	}
+	if cfg.OutboxPruneRetention, err = getEnvDurationStr("OUTBOX_PRUNE_RETENTION", 7*24*time.Hour); err != nil {
+		return cfg, err
+	}
+	if cfg.OutboxPruneLimit, err = getEnvInt("OUTBOX_PRUNE_LIMIT", 1000); err != nil {
+		return cfg, err
+	}
 
 	// Fail-fast on empty base URLs for the two data-bearing outbound clients
 	// (LLD §15 "base URLs required, fail-fast on empty") — deferred to the
@@ -112,6 +173,23 @@ func getEnvDuration(key string, fallback time.Duration) (time.Duration, error) {
 		return 0, fmt.Errorf("%s: %w", key, err)
 	}
 	return time.Duration(ms) * time.Millisecond, nil
+}
+
+// getEnvDurationStr parses key as a Go duration string (e.g. "500ms", "5s",
+// "10m") — distinct from getEnvDuration, which treats its env var as a bare
+// millisecond integer. Used for the OUTBOX_* tunables, matching
+// iam-org-membership's/iam-user-profile's identical env-var format for
+// those same names.
+func getEnvDurationStr(key string, fallback time.Duration) (time.Duration, error) {
+	v := os.Getenv(key)
+	if v == "" {
+		return fallback, nil
+	}
+	d, err := time.ParseDuration(v)
+	if err != nil {
+		return 0, fmt.Errorf("%s: %w", key, err)
+	}
+	return d, nil
 }
 
 func getEnvDurationSeconds(key string, fallback time.Duration) (time.Duration, error) {

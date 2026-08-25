@@ -5,20 +5,25 @@ import (
 	"net/http"
 
 	"github.com/gin-gonic/gin"
+	"github.com/google/uuid"
 	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/propagation"
 
 	"github.com/BCBP-SOLUTIONS-FZC-LLC/platform-gincommon/pkg/gincommon"
 )
 
-// setInternalHeaders authenticates as the reserved iam-system principal —
-// iam-user-profile's internal_handler.go/middleware.go require the caller
-// to present the "iam-system" role (rc.HasRole("iam-system")), populated
-// from X-User-Roles; X-User-Id: iam-system is the documented system
-// principal for the identity itself.
-func setInternalHeaders(req *http.Request) {
-	req.Header.Set("X-User-Id", "iam-system")
-	req.Header.Set("X-User-Roles", "iam-system")
+// setInternalHeaders authenticates as the reserved iam-system principal.
+// iam-user-profile is built on platform-gincommon's ProtectedMiddlewares +
+// GUCBridgeMiddleware (internal/adapter/inbound/http/middleware.go), which
+// requires a well-formed UUID in x-tenant-id (hard 401 otherwise, per
+// GUCBridgeMiddleware's uuid.Parse(platformRc.TenantID) check) and reads
+// roles from x-tenant-roles via rc.HasRole — there is no X-User-Roles
+// special-casing anywhere in that service's middleware. tenantID must be
+// the real tenant the delegation belongs to.
+func setInternalHeaders(req *http.Request, tenantID uuid.UUID) {
+	req.Header.Set("x-user-id", "iam-system")
+	req.Header.Set("x-tenant-id", tenantID.String())
+	req.Header.Set("x-tenant-roles", "iam-system")
 }
 
 // propagate copies the caller's trace context onto the outbound request.

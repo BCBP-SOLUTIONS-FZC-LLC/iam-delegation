@@ -5,7 +5,7 @@
 // DelegationReviewRequested. These are payload-only schemas (they describe
 // the shape of the envelope's `data` field, not the envelope itself); see
 // api/asyncapi.yaml for the full documented contract including the envelope
-// and the two consumed message types (MembershipRevoked, TenantOffboarded),
+// and the two consumed message types (MembershipRevoked, TenantMembershipsPurged),
 // which are not validated by this package — this service only produces the
 // three schemas embedded here.
 package eventschema

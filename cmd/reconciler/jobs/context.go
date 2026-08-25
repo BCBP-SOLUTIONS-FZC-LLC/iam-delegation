@@ -1,15 +1,16 @@
 // Package jobs implements the three CronJob entry points (LLD §6/§16.1):
 // delegation-expiry (DLG-I1, */5 * * * *), delegation-review (DLG-I2,
-// hourly, dual 7d/3d warn then auto-end), and delegation-cleanup (monthly
-// hard-purge). Per this build's DLG-D17, these are plain functions taking
-// already-constructed dependencies so BOTH cmd/reconciler/main.go (the
-// CronJob binary, calling them directly) and cmd/server's DLG-I1/I2 HTTP
-// handlers (calling them through a thin adapter) share one implementation.
+// hourly, 3-day daily cascade warn then auto-end), and delegation-cleanup
+// (monthly hard-purge). Per this build's DLG-D17, these are plain functions
+// taking already-constructed dependencies so BOTH cmd/reconciler/main.go
+// (the CronJob binary, calling them directly) and cmd/server's DLG-I1/I2
+// HTTP handlers (calling them through a thin adapter) share one
+// implementation.
 //
 // Lifted in spirit from iam-org-membership's cmd/reconciler/jobs/
-// delegation_{expiry,review}.go (LLD §6 "History"), adapted for the dual
-// review_last_warned_bucket warning design (DLG-D7) and the local
-// delegation_tenant_settings policy read.
+// delegation_{expiry,review}.go (LLD §6 "History"), adapted for the
+// review_last_warned_bucket daily-cascade warning design (DLG-D7) and the
+// local delegation_tenant_settings policy read.
 package jobs
 
 import (
@@ -44,6 +45,16 @@ type ProcessedEventsStore interface {
 	CleanupExpired(ctx context.Context, olderThan time.Duration) error
 }
 
+// Metrics is the minimal recorder seam the expiry/review jobs need to close
+// GAP-27 (DLG-D19 partial closure): the deferred-counter metrics must
+// actually be incremented on every UP failure, not just registered.
+// Satisfied by *metrics.Metrics. Optional — nil means metrics are skipped,
+// so existing callers/tests that don't wire it keep working.
+type Metrics interface {
+	RecordExpiryDeferred()
+	RecordReviewDeferred()
+}
+
 // Context carries every dependency a job needs. Delegations must be backed
 // by a BYPASSRLS pool (delegation_migrator) for the cross-tenant sweep
 // finder methods (ListExpiringBefore, FindDueForDailyWarn, FindDueForAutoEnd,
@@ -59,6 +70,7 @@ type Context struct {
 	BatchLimit      int
 	RetentionDays   int                  // delegation-cleanup only (LLD §18.4, default 90)
 	ProcessedEvents ProcessedEventsStore // delegation-cleanup only — purges the idempotency ledger (LLD §18.4, GAP-09); nil means skip
+	Metrics         Metrics              // expiry/review deferred counters (LLD §11.4, GAP-27); nil means skip
 }
 
 // Result aggregates every job's outcome counters. Unused fields stay zero —

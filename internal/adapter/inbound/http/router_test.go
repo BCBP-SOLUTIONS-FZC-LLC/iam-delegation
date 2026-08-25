@@ -3,8 +3,6 @@ package http
 import (
 	"context"
 	"encoding/json"
-	"io"
-	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"testing"
@@ -16,8 +14,17 @@ import (
 	pgcommon "github.com/BCBP-SOLUTIONS-FZC-LLC/platform-pgcommon/pkg/pgcommon"
 )
 
-func testLogger() *slog.Logger {
-	return slog.New(slog.NewTextHandler(io.Discard, nil))
+// fakeLogger is a no-op Logger for tests that need to pass one to NewRouter
+// but don't assert on log output.
+type fakeLogger struct{}
+
+func (fakeLogger) Debug(string, map[string]interface{}) {}
+func (fakeLogger) Info(string, map[string]interface{})  {}
+func (fakeLogger) Warn(string, map[string]interface{})  {}
+func (fakeLogger) Error(string, map[string]interface{}) {}
+
+func testLogger() Logger {
+	return fakeLogger{}
 }
 
 func newTestRouter(docs DocsConfig) (*Router, *fakeDelegationService, *fakeDelegationReader, *fakeSettingsService) {
@@ -80,18 +87,6 @@ func TestTenantGUCMiddleware_NoIdentity(t *testing.T) {
 	require.False(t, called)
 	require.False(t, c.IsAborted())
 	require.Equal(t, http.StatusOK, w.Code)
-}
-
-// TestSlogPlatformLogger exercises every method of the small adapter that
-// bridges *slog.Logger onto platform-gincommon's/platform-events' Logger
-// interface shape.
-func TestSlogPlatformLogger(t *testing.T) {
-	a := slogPlatformLogger{l: testLogger()}
-	fields := map[string]interface{}{"k": "v"}
-	a.Debug("debug", fields)
-	a.Info("info", fields)
-	a.Warn("warn", fields)
-	a.Error("error", fields)
 }
 
 func TestDocsConfig_Active(t *testing.T) {

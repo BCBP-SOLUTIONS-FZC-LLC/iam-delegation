@@ -5,20 +5,28 @@ import (
 	"net/http"
 
 	"github.com/gin-gonic/gin"
+	"github.com/google/uuid"
 	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/propagation"
 
 	"github.com/BCBP-SOLUTIONS-FZC-LLC/platform-gincommon/pkg/gincommon"
 )
 
-// setInternalHeaders authenticates as the reserved iam-system principal —
-// the same internal-call convention iam-tender-acl's membershipcheck client
-// and iam-group-mapping's catalogclient use against internal-route callees
-// (iam-user-profile's middleware.go: RequireInternalRole checks
-// rc.HasRole("iam-system"), populated from X-User-Roles).
-func setInternalHeaders(req *http.Request) {
-	req.Header.Set("X-User-Id", "iam-system")
-	req.Header.Set("X-User-Roles", "iam-system")
+// setInternalHeaders authenticates as the reserved iam-system principal.
+// Core (iam-org-membership) is built on platform-gincommon's
+// ProtectedMiddlewares, which requires a well-formed UUID in x-tenant-id
+// (hard 401 otherwise) and reads roles from x-tenant-roles, not
+// X-User-Roles — confirmed directly against
+// platform-gincommon@v1.3.0/internal/core/domain/transport.go and Core's
+// own outbound clients (e.g. internal/adapter/outbound/delegationcheck),
+// which all send x-user-id/x-tenant-id/x-tenant-roles, lowercase. This
+// endpoint is tenant-scoped (unlike iam-catalog-admin's tenant-agnostic
+// internal routes), so tenantID must be the real tenant being checked, not
+// a placeholder.
+func setInternalHeaders(req *http.Request, tenantID uuid.UUID) {
+	req.Header.Set("x-user-id", "iam-system")
+	req.Header.Set("x-tenant-id", tenantID.String())
+	req.Header.Set("x-tenant-roles", "iam-system")
 }
 
 // propagate copies the caller's trace context onto the outbound request.

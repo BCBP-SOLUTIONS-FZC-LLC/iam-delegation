@@ -16,7 +16,7 @@ It has **two** synchronous outbound dependencies of its own — grant-time membe
 checks against `iam-org-membership` (DLG-D3, replacing two composite foreign keys Core no longer
 enforces) and availability-first pointer-set/clear calls against `iam-user-profile` (DEL-6,
 `user_availability.delegate_id`) — and **one** inbound async subscription, `delegation-cascade-q`
-(fed by Core's `MembershipRevoked` and `TenantOffboarded`, §11.5/§11.6). It publishes its own events
+(fed by Core's `MembershipRevoked` and `TenantMembershipsPurged`, §11.5/§11.6). It publishes its own events
 (`DelegationStarted`/`DelegationEnded`/`DelegationReviewRequested`) to a dedicated topic,
 `iam.delegation.events` — this service is both a producer and a consumer, unlike most of its O&M
 extraction siblings.
@@ -77,7 +77,7 @@ pattern):
 | DLG-1 | `GET /api/v1/delegations` | self (gateway identity) | List active delegations for the caller. Cached (`del:list`, advisory — correctness never depends on it). |
 | DLG-2 | `POST /api/v1/delegations` | self = delegator | Create. Requires `Idempotency-Key` (24h dedup, DLG-D8). Runs two concurrent grant-time membership-existence checks against `iam-org-membership` (DLG-D3) — fails `422`/`503` if either check fails or reports inactive. |
 | DLG-3 | `DELETE /api/v1/delegations/{id}` | self or admin | Cancel. Pointer-clear against `iam-user-profile` is fail-open (DEL-6) — cancellation always succeeds even if the availability pointer-clear call fails. |
-| DLG-4 | `POST /api/v1/delegations/{id}/extend` | self or admin | Extend the review window (`extend_days` in `[1,180]`). Resets the dual-warning bucket (DLG-D7). |
+| DLG-4 | `POST /api/v1/delegations/{id}/extend` | self or admin | Extend the review window (`extend_days` in `[1,180]`). Resets the daily-cascade warn bucket (DLG-D7). |
 | DLG-5 | `POST /api/v1/delegations/{id}/reassign` | self or admin | End the current delegation and create a new one to a different delegate in one call (fuller body — DLG-D11). |
 | DLG-6 | `GET /api/v1/delegations/settings` | any authenticated tenant member | Read the tenant's delegation policy (`delegation_tenant_settings`, falling back to `POLICY_DEFAULT_*` env defaults, DLG-D2). |
 | DLG-7 | `PUT /api/v1/delegations/settings` | `tenant_admin`/`tenant_owner` | Set the tenant's delegation policy. |
@@ -172,18 +172,22 @@ Notable variables:
 
 | Variable | Purpose | Default |
 |---|---|---|
-| `DATABASE_URL` | `delegation_app` (RLS-bound) connection string | *(required)* |
-| `MIGRATION_DATABASE_URL` | `delegation_migrator` (BYPASSRLS) connection string for the startup migration run (`postgres.Migrate`, LLD §7.4/§16.4) | falls back to `DATABASE_URL` |
-| `USER_PROFILE_BASE_URL` | `iam-user-profile`'s base URL, consulted for DEL-6 availability-first pointer set/clear | `http://iam-user-profile.iam.svc.cluster.local` |
-| `ORG_MEMBERSHIP_BASE_URL` | `iam-org-membership`'s base URL, consulted for the two DLG-D3 grant-time membership checks | `http://iam-org-membership.iam.svc.cluster.local` |
+| `DATABASE_URL` | `delegation_app` (RLS-bound) connection string — or set `PG_HOST`/`PG_PORT`/`PG_USER`/`PG_PASSWORD`/`PG_DBNAME`/`PG_SSLMODE` individually; both are read by `pgcommon.ConfigFromEnv` via `postgres.DSNFromEnv` | *(required, one form or the other)* |
+| `MIGRATION_DATABASE_URL` | `delegation_migrator` (BYPASSRLS) connection string for the startup migration run (`postgres.Migrate`, LLD §7.4/§16.4); must bypass PgBouncer | falls back to `postgres.DSNFromEnv()` |
+| `SYSTEM_DATABASE_URL` | BYPASSRLS connection string for the reconciler/cascade consumer's cross-tenant sweep pool (`postgres.SystemDSNFromEnv`) | falls back to `postgres.DSNFromEnv()`, with a startup warning that cross-tenant sweeps will be RLS-filtered |
+| `PG_STATEMENT_TIMEOUT` | Server-side `statement_timeout` appended to the app DSN (Go duration string, e.g. `5s`) so a hung query releases its pool connection instead of holding it for the full request deadline; ignored when `DATABASE_URL` is set verbatim | — |
+| `PG_MAX_CONNS` / `PG_MIN_CONNS` / `PG_SLOW_QUERY_THRESHOLD` / `PG_BOUNCER_MODE` | Standard `pgcommon.ConfigFromEnv` pool-sizing vars | pgcommon defaults |
+| `USER_PROFILE_BASE_URL` | `iam-user-profile`'s base URL, consulted for DEL-6 availability-first pointer set/clear | *(required)* |
+| `ORG_MEMBERSHIP_BASE_URL` | `iam-org-membership`'s base URL, consulted for the two DLG-D3 grant-time membership checks | *(required)* |
 | `VALKEY_ADDR` | `del:` keyspace — DLG-1 list cache + create-idempotency-key store (DLG-Q3) | `localhost:6379` |
-| `SQS_QUEUE_URL` | `delegation-cascade-q` (inbound `MembershipRevoked`/`TenantOffboarded` cascade) | *(required)* |
-| `SQS_CONCURRENCY` | `delegation-cascade-q`'s consumer concurrency | `4` |
-| `EVENTS_TOPIC` / `EVENTS_SOURCE` | Outbound topic (`iam.delegation.events`) the outbox publishes `DelegationStarted`/`DelegationEnded`/`DelegationReviewRequested` to | `iam-delegation-events` / `iam-delegation` |
+| `SNS_TOPIC_ARN` | Outbound topic (`iam.delegation.events`) the outbox publishes `DelegationStarted`/`DelegationEnded`/`DelegationReviewRequested` to | *(required)* |
+| `CASCADE_QUEUE_URL` | `delegation-cascade-q` (inbound `MembershipRevoked`/`TenantMembershipsPurged` cascade) | *(required)* |
+| `GLUE_REGISTRY_NAME` | Set to `iam-delegation-events` to activate `GlueCodec` on the outbound publish path; empty uses `NoopCodec` | `""` |
 | `POLICY_DEFAULT_MAX_DURATION_DAYS` / `POLICY_DEFAULT_REVIEW_WINDOW_DAYS` | Fallback tenant policy (DLG-D2) when a tenant has no `delegation_tenant_settings` row | `90` / `90` |
-| `REVIEW_WARN_EARLY_DAYS` / `REVIEW_WARN_LATE_DAYS` | Dual review-warning bucket (DLG-D7/DLG-Q6) | `7` / `3` |
-| `DOCS_ENABLED` | Opt-in to serving `/swagger` and `/asyncapi`/`/asyncapi.yaml` in production | `false` |
+| `DOCS_ENABLED` | Opt-in to serving `/swagger` and `/asyncapi`/`/asyncapi.yaml` in production | `true` outside `production` |
 | `DOCS_AUTH_TOKEN` | If set, requires `Authorization: Bearer <token>` on the docs routes in production | — |
+
+See `.claude/operations.md`'s Configuration section for the complete, verified env-var table, including `cmd/reconciler`-only vars (`CRON_BATCH_LIMIT`/`DELEGATION_RETENTION_DAYS`).
 
 ## Testing
 
@@ -393,7 +397,7 @@ Three event types, all on one SNS topic (`iam.delegation.events`, wire-format de
 |---|---|---|
 | `DelegationStarted` | DLG-2 create, and the create leg of DLG-5 reassign | **Workflow Service** (reroute), Notification, Audit |
 | `DelegationEnded` | Cancel, `ends_at` expiry, review auto-end, the end leg of reassign, delegate-removed cascade | **Workflow Service** (restore), Notification, Audit |
-| `DelegationReviewRequested` | The review sweep at the 7-day and 3-day marks | Notification, Audit |
+| `DelegationReviewRequested` | The review sweep's 3-day daily cascade (once per calendar day at days_remaining ∈ {3,2,1}) | Notification, Audit |
 
 `DelegationStarted`/`DelegationEnded` are the *authoritative* routing signal the Workflow Service
 acts on — this is a different, stronger contract than a presentation-only availability change.
@@ -427,8 +431,9 @@ services). Requests are subject only to whatever the API gateway/mesh enforces a
 
 The three CronJobs described under [Binaries](#binaries) run independently of the HTTP path and
 have externally-visible side effects worth knowing about: the `delegation-review` sweep emits
-`DelegationReviewRequested` at the 7-day and 3-day marks *before* an open-ended delegation lapses,
-then auto-ends it with `ended_reason: review_expired` if nobody extends it in time; the
+`DelegationReviewRequested` once per calendar day for each of the 3 days *before* an open-ended
+delegation lapses (days_remaining ∈ {3,2,1}), then auto-ends it with `ended_reason: review_expired`
+if nobody extends it in time; the
 `delegation-expiry` sweep ends fixed-`ends_at` delegations the moment they lapse. Both defer and
 retry (rather than fail) if `iam-user-profile` is unreachable when they try to clear the
 availability pointer (DEL-6) — so a transient User Profile outage delays, but never loses, an
@@ -460,8 +465,8 @@ Per LLD §3 (Non-goals), this service does **not** handle:
 - [`docs/runbook-schema-registry.md`](docs/runbook-schema-registry.md) — operational runbook for
   the AWS Glue Schema Registry integration (startup contract, failure modes, adding a new event
   type).
-- [`IMPLEMENTATION_NOTES.md`](IMPLEMENTATION_NOTES.md) — where each LLD section landed in code,
-  plus every as-built deviation (DLG-D13 onward) not in the original LLD.
+- [`ARCHITECTURE.md`](ARCHITECTURE.md)'s "Session-specific decisions" section — every as-built
+  deviation (DLG-D13 onward) not in the original LLD.
 - Sibling IAM services with the same Clean Architecture layout: `iam-org-membership` (Core —
   the service this was extracted from), `iam-user-profile`, `iam-catalog-admin`,
   `iam-group-mapping`, `iam-tender-acl`.

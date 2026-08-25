@@ -6,6 +6,7 @@ REVOKE ALL PRIVILEGES ON ALL TABLES IN SCHEMA public FROM delegation_migrator;
 REVOKE ALL PRIVILEGES ON SCHEMA public FROM delegation_migrator;
 DROP ROLE IF EXISTS delegation_migrator;
 
+REVOKE SELECT, INSERT, UPDATE, DELETE ON public.outbox_events FROM delegation_app;
 REVOKE EXECUTE ON FUNCTION public.rls_check_tenant(uuid, text)        FROM delegation_app;
 REVOKE EXECUTE ON FUNCTION public.log_rls_violation(text, uuid, text) FROM delegation_app;
 REVOKE EXECUTE ON FUNCTION public.app_tenant_id()                     FROM delegation_app;

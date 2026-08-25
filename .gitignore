@@ -24,6 +24,9 @@ profile.cov
 go.work
 go.work.sum
 
+# Compiled binaries (make build / build-server / build-reconciler)
+/bin/
+
 # env file
 .env
 

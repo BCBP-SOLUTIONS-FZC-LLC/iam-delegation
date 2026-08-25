@@ -10,47 +10,95 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"time"
 
 	"github.com/BCBP-SOLUTIONS-FZC-LLC/iam-delegation/internal/core/domain"
 	"github.com/BCBP-SOLUTIONS-FZC-LLC/iam-delegation/internal/core/port"
 	"github.com/BCBP-SOLUTIONS-FZC-LLC/platform-events/pkg/events"
 	"github.com/BCBP-SOLUTIONS-FZC-LLC/platform-events/pkg/outbox"
-	pgcdomain "github.com/BCBP-SOLUTIONS-FZC-LLC/platform-pgcommon/pkg/domain"
 	"github.com/BCBP-SOLUTIONS-FZC-LLC/platform-pgcommon/pkg/pgcommon"
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
 )
 
-// SystemDSNFromEnv returns SYSTEM_DATABASE_URL — the delegation_migrator
-// (BYPASSRLS) role's DSN, required by the reconciler's cross-tenant sweep
-// queries (ListExpiringBefore, FindDueForWarning7d/3d, FindDueForAutoEnd,
-// HardPurgeSoftDeletedBefore, LLD §11.3/§11.4/§18.4) and the cascade
-// consumer's processed_events ledger (RLS-exempt, LLD §7.2.3). Falls back
-// to DATABASE_URL (with a caller-logged warning) so a misconfigured
-// environment degrades to RLS-filtered — and therefore incomplete — sweep
-// results rather than failing to start, mirroring iam-user-profile's
-// identical SystemDSNFromEnv.
-func SystemDSNFromEnv() (dsn string, usedFallback bool) {
-	if v := os.Getenv("SYSTEM_DATABASE_URL"); v != "" {
-		return v, false
+// DSNFromEnv builds a PostgreSQL connection URL for the application pool by
+// delegating host/port/user/password/dbname/sslmode parsing and DSN
+// assembly to pgcommon.ConfigFromEnv() — the same env vars
+// (DATABASE_URL/PG_HOST/PG_PORT/PG_USER/PG_PASSWORD/PG_DBNAME/PG_SSLMODE)
+// platform-pgcommon itself reads to build the pool Config used by main.go,
+// so there is exactly one DSN-assembly implementation instead of two
+// drifting in parallel. Warnings from ConfigFromEnv (invalid/insecure
+// settings replaced by defaults) are surfaced at the call site that owns a
+// logger (see cmd/server/main.go); this helper only returns the DSN string.
+// Mirrors iam-user-profile's/iam-org-membership's identical DSNFromEnv.
+//
+// URL format is required because the migration runner (pgmigrate.Runner)
+// calls url.Parse on the DSN after prepending "pgx5://"; a keyword/value DSN
+// would produce invalid URL escapes (%20 for spaces) and fail at startup.
+// pgcommon builds the DSN via net/url, which already produces this format.
+func DSNFromEnv() string {
+	cfg, _ := pgcommon.ConfigFromEnv()
+	if os.Getenv("DATABASE_URL") != "" {
+		// DATABASE_URL is returned verbatim by pgcommon.ConfigFromEnv — set
+		// statement_timeout via its own query string, not appended here.
+		return cfg.DSN
 	}
-	return os.Getenv("DATABASE_URL"), true
+	return ApplyStatementTimeout(cfg.DSN)
 }
 
-// NewPool builds the runtime app pool from the standard PG_*/DATABASE_URL
-// environment variables via pgcommon.ConfigFromEnv, wiring GUCSetFromContext
-// so every connection checkout injects app.tenant_id/app.user_id from
-// whatever GUCSet is bound on ctx (requestctx middleware for handlers,
-// WithTenantGUC for the reconciler jobs and cascade consumer). Returned
-// warnings describe invalid/insecure env values that were replaced by safe
-// defaults — log them at startup.
-func NewPool(ctx context.Context, logger pgcdomain.Logger) (*pgcommon.Pool, []pgcommon.ConfigWarning, error) {
-	cfg, warnings := pgcommon.ConfigFromEnv()
-	cfg.GUCProvider = pgcommon.GUCSetFromContext
-	cfg.Logger = logger
-	pool, err := pgcommon.NewPool(ctx, cfg)
-	return pool, warnings, err
+// ApplyStatementTimeout appends a server-side statement_timeout option to dsn
+// so hung queries release pool connections instead of holding them for the
+// full request deadline. PG_STATEMENT_TIMEOUT accepts a Go duration string
+// (e.g. "5s", "500ms"). This has no pgcommon equivalent — pgcommon.Config has
+// no statement-timeout field — so it remains a small extension layered on
+// top of the pgcommon-built DSN rather than a full DSN builder. Ignored when
+// dsn is empty or PG_STATEMENT_TIMEOUT is unset.
+func ApplyStatementTimeout(dsn string) string {
+	if dsn == "" {
+		return dsn
+	}
+	if t := os.Getenv("PG_STATEMENT_TIMEOUT"); t != "" {
+		if d, err := time.ParseDuration(t); err == nil && d > 0 {
+			// PostgreSQL expects milliseconds as an integer.
+			dsn += fmt.Sprintf("&options=-c%%20statement_timeout%%3D%d", d.Milliseconds())
+		}
+	}
+	return dsn
+}
+
+// SystemDSNFromEnv returns the DSN to use for the delegation_migrator
+// (BYPASSRLS) role's privileged cross-tenant pool — required by the
+// reconciler's cross-tenant sweep queries (ListExpiringBefore,
+// FindDueForDailyWarn, FindDueForAutoEnd, HardPurgeSoftDeletedBefore, LLD
+// §11.3/§11.4/§18.4) and the cascade consumer's processed_events ledger
+// (RLS-exempt, LLD §7.2.3).
+//
+// Falls back to DSNFromEnv() when SYSTEM_DATABASE_URL is unset — safe for
+// local dev where RLS is not enforced. In production the two DSNs MUST
+// differ so the app pool remains scoped to the RLS-enforced role. Mirrors
+// iam-user-profile's/iam-org-membership's identical SystemDSNFromEnv — the
+// caller compares the returned DSN against DSNFromEnv()'s to detect the
+// fallback and log a warning, rather than a second bool return value.
+func SystemDSNFromEnv() string {
+	if dsn := os.Getenv("SYSTEM_DATABASE_URL"); dsn != "" {
+		return dsn
+	}
+	return DSNFromEnv()
+}
+
+// MigrationDSNFromEnv returns the DSN to use for schema migrations.
+// Migrations must bypass PgBouncer (transaction pooling) because
+// golang-migrate uses pg_advisory_lock which is session-scoped and breaks
+// across pooled connections. MIGRATION_DATABASE_URL overrides to a direct
+// Postgres connection; falls back to DSNFromEnv() when not set (safe for
+// direct-Postgres setups). Mirrors iam-user-profile's/iam-org-membership's
+// identical MigrationDSNFromEnv.
+func MigrationDSNFromEnv() string {
+	if dsn := os.Getenv("MIGRATION_DATABASE_URL"); dsn != "" {
+		return dsn
+	}
+	return DSNFromEnv()
 }
 
 // WithTenantGUC binds app.tenant_id (and, when userID is non-empty,
@@ -135,6 +183,7 @@ func (p *txBoundPublisher) EnqueueCtx(ctx context.Context, evt *domain.DomainEve
 		domain.Source,
 		json.RawMessage(payload),
 		events.WithTenantID(evt.TenantID.String()),
+		events.WithSchemaVersion("1"),
 		events.WithTraceID(events.TraceIDFromContext(ctx)),
 		events.WithActor(evt.Actor),
 		events.WithIPAddress(evt.IPAddress),

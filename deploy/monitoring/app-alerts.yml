@@ -155,11 +155,39 @@ groups:
         annotations:
           summary: iam-delegation cascade consumer is dead-lettering messages
           description: >-
-            {{ $value | humanize }} MembershipRevoked/TenantOffboarded
+            {{ $value | humanize }} MembershipRevoked/TenantMembershipsPurged
             message(s) landed on delegation-cascade-q-dlq in the last 30
             minutes (maxReceiveCount=5 exhausted). Inspect the DLQ — a
             malformed envelope or a persistent handler error needs manual
             replay/fix (LLD §10.1).
+
+  # ── Transactional outbox dead-letter table — outbox_dead_letters_total is
+  #    platform-events' own metric (registered automatically by
+  #    events.InitWithRegisterer, LLD §10.4), not something this service
+  #    defines itself. Mirrors iam-user-profile's/iam-org-membership's
+  #    identical IAMUserProfileOutboxStuck/IAMOrgMembershipOutboxDeadLetters
+  #    alert — keep in sync with templates/prometheusrule.yaml.
+  - name: iam_delegation_outbox
+    rules:
+
+      - alert: IAMDelegationOutboxStuck
+        expr: |
+          increase(outbox_dead_letters_total[30m]) > 0
+        for: 15m
+        labels:
+          severity: warning
+          team: platform
+        annotations:
+          summary: iam-delegation outbox events moved to the dead-letter table
+          description: >-
+            One or more DelegationStarted/DelegationEnded/DelegationReviewRequested
+            outbox records exhausted MaxAttempts and were moved to
+            outbox_dead_letters (LLD §10.4). Check the outbox runner logs for
+            SNS publish errors and verify SNS_TOPIC_ARN connectivity; the
+            outbox_dead_letters table is queryable/retryable via standard SQL.
+
+  - name: iam_delegation_membershipcheck
+    rules:
 
       # ── Membership-check failure rate ─────────────────────────────────────────
       - alert: IAMDelegationMembershipCheckHighFailureRate

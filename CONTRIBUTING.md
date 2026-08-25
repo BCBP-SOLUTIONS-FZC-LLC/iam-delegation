@@ -4,7 +4,7 @@ This is an internal IAM microservice for the XpertPMS platform. This guide cover
 
 ## Prerequisites
 
-- Go 1.26.6 (pinned exactly — matches `go.mod`'s `go 1.26.6`; DLG-D16 in `IMPLEMENTATION_NOTES.md` records this as intentionally newer than the LLD's stated "Go 1.23")
+- Go 1.26.6 (pinned exactly — matches `go.mod`'s `go 1.26.6`; DLG-D16 — intentionally newer than the LLD's stated "Go 1.23", which is stale relative to the platform's real toolchain)
 - Docker (required for the Postgres/Valkey/LocalStack-backed integration and RLS tests via `testcontainers-go`)
 - `GOPRIVATE=github.com/BCBP-SOLUTIONS-FZC-LLC/*` (private module access)
 
@@ -83,7 +83,7 @@ Tests are colocated with the code they cover (`*_test.go` next to the source fil
 
 ### Adding a new repository migration
 
-1. This repo currently ships a single migration pair, `000001_schema.{up,down}.sql`, under `internal/adapter/outbound/postgres/migrations/` — the next one is `000002_description.{up,down}.sql`. Numbering is monotonic; never reuse or re-order.
+1. This repo currently ships a single migration pair, `000001_schema.{up,down}.sql`, under `internal/adapter/outbound/postgres/migrations/` — the next one is `000002_description.{up,down}.sql`. Numbering is monotonic; never reuse or re-order. **Exception while this service remains undeployed:** a schema fix gets folded back into `000001` rather than layered as a new migration (there's no live data or applied history to preserve yet). That exception ends the moment this service is deployed anywhere — after that, every schema change is a new forward migration, full stop.
 2. The embedded FS is recompiled on next build — no code changes needed.
 3. Verify: `make docker-up && make run` (the server self-migrates at startup, LLD §7.4/§16.4).
 4. Add or update RLS policy tests (`-tags=rls`) if the migration touches `delegations` or `delegation_tenant_settings`.
@@ -131,12 +131,23 @@ make race
 
 ### Coverage gate
 
-CI enforces a single global statement-coverage gate of **≥ 70%** on the merged `coverage.out` (`.github/scripts/coverage-gate.sh`) — matching `iam-tender-acl`'s baseline, since the LLD specifies test *composition*, not a numeric threshold. This is a floor, not an aspiration; ratchet it up over time, never lower it to pass a failing PR. Actual coverage achieved per package as of the initial build is recorded in `IMPLEMENTATION_NOTES.md` § "Test coverage" (`internal/core/service` 84.7%, `internal/adapter/outbound/postgres` 73.9%, `internal/adapter/inbound/http` 90.4%, etc.) — well above the 70% floor in the packages that matter most.
+CI enforces a single global statement-coverage gate of **≥ 70%** on the merged `coverage.out` (`.github/scripts/coverage-gate.sh`) — matching `iam-tender-acl`'s baseline, since the LLD specifies test *composition*, not a numeric threshold. This is a floor, not an aspiration; ratchet it up over time, never lower it to pass a failing PR.
 
 ```bash
 make cover-func   # per-function summary in terminal
 make cover        # HTML report
 ```
+
+Coverage as of the initial build, well above the 70% floor in the packages that matter most (re-run `make cover-func` for current numbers rather than trusting this table as it ages):
+
+| Package | Coverage | Notes |
+|---|---|---|
+| `internal/core/service` | 84.7% | Full DEL-1…14 branch coverage, availability-first ordering, idempotency replay, reassign end-then-create, DEL-7 asymmetry |
+| `internal/adapter/outbound/postgres` | 73.9% | Full §17.5 RLS matrix (Cases 1–5, both tables), review-sweep boundary predicates, trigger, `processed_events` dedup |
+| `internal/adapter/inbound/http` | 90.4% | Every `domain.Err*` → HTTP status, role gates, DLG-5 raw-JSON presence detection |
+| `internal/adapter/inbound/consumer` | 59.0% | Dispatch, idempotency skip/mark-after-success, malformed/unknown envelope handling |
+| `cmd/reconciler/jobs` | 81.7%+ | Happy path, UP-failure defer, race-vs-failure distinction, daily-cascade warn+auto-end, GAP-27 deferred-metric assertions |
+| `internal/adapter/outbound/{userprofile,orgmembership,valkey,metrics,eventbus}` | 85–100% | HTTP client shapes, cache/idempotency TTL behavior, metric registration, schema validation, `GlueDecodeCodec` wire-format round-trip |
 
 Coverage is measured over `./internal/...` and `./pkg/...` (`COVER_PKG_LIST` in the Makefile).
 
@@ -182,7 +193,7 @@ Mirrors `.github/pull_request_template.md` — the PR template is the source of 
 - [ ] `make swag` run and `docs/swagger/` committed if any handler annotation changed
 - [ ] `api/asyncapi.yaml` and `internal/eventschema/*.json` updated together if the event contract changed, with `"additionalProperties": true` preserved
 - [ ] `CHANGELOG.md` `[Unreleased]` section updated
-- [ ] README.md / ARCHITECTURE.md / IMPLEMENTATION_NOTES.md updated per the checklist above, where applicable
+- [ ] README.md / ARCHITECTURE.md updated per the checklist above, where applicable (a new session-specific decision goes in `ARCHITECTURE.md`'s "Session-specific decisions" section)
 - [ ] No secrets or DSNs hardcoded
 
 ## Commit style

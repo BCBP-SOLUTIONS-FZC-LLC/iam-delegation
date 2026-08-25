@@ -1,5 +1,5 @@
 // Package consumer implements this service's single inbound event-driven
-// behavior: consuming Core's MembershipRevoked / TenantOffboarded signals
+// behavior: consuming Core's MembershipRevoked / TenantMembershipsPurged signals
 // off delegation-cascade-q and dispatching them to CascadeService (LLD
 // §10.1, §11.5/§11.6). There is no outbox/producer wiring here — this
 // package is inbound-only; the outbound side (transactional outbox →
@@ -24,7 +24,7 @@ import (
 // independently-idempotent cascade behaviors —
 //
 //   - "cascade"     — MembershipRevoked → CascadeService.EndForUser
-//   - "offboarding" — TenantOffboarded  → CascadeService.ScrubTenant
+//   - "offboarding" — TenantMembershipsPurged  → CascadeService.ScrubTenant
 //
 // Design choice (deliberately different from iam-tender-acl's
 // ProcessedEvents, which bakes one fixed consumer name into each instance

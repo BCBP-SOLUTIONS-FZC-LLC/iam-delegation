@@ -13,63 +13,81 @@ import (
 	"errors"
 	"flag"
 	"fmt"
-	"log/slog"
 	"os"
 	"os/signal"
 	"syscall"
 	"time"
 
+	"github.com/BCBP-SOLUTIONS-FZC-LLC/platform-gincommon/pkg/gincommon"
+	gclogger "github.com/BCBP-SOLUTIONS-FZC-LLC/platform-gincommon/pkg/logger"
 	pgcommon "github.com/BCBP-SOLUTIONS-FZC-LLC/platform-pgcommon/pkg/pgcommon"
 
 	"github.com/BCBP-SOLUTIONS-FZC-LLC/iam-delegation/cmd/reconciler/jobs"
+	"github.com/BCBP-SOLUTIONS-FZC-LLC/iam-delegation/internal/adapter/inbound/consumer"
+	"github.com/BCBP-SOLUTIONS-FZC-LLC/iam-delegation/internal/adapter/outbound/metrics"
 	pgadapter "github.com/BCBP-SOLUTIONS-FZC-LLC/iam-delegation/internal/adapter/outbound/postgres"
 	"github.com/BCBP-SOLUTIONS-FZC-LLC/iam-delegation/internal/adapter/outbound/userprofile"
 )
 
 func main() {
-	if err := run(); err != nil {
-		slog.Error("iam-delegation-reconciler exited with error", slog.String("error", err.Error()))
+	logger, err := gclogger.NewLogger(getEnv("ENVIRONMENT", "development"))
+	if err != nil {
+		panic("init logger: " + err.Error())
+	}
+	if err := run(logger); err != nil {
+		logger.Error("iam-delegation-reconciler exited with error", map[string]interface{}{"error": err.Error()})
 		os.Exit(1)
 	}
 }
 
-func run() error {
+func run(logger Logger) error {
 	jobName := flag.String("job", "", "one of: delegation-expiry, delegation-review, delegation-cleanup")
 	flag.Parse()
 	if *jobName == "" {
 		return errors.New("--job is required")
 	}
 
-	logger := newReconcilerLogger(getEnv("ENVIRONMENT", "development"))
-	slog.SetDefault(logger)
-	ml := mapLogger{l: logger}
-
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
-	// The reconciler never runs migrations itself (cmd/server's startup
-	// already applies them; running the same migration set from two
-	// binaries racing at deploy time would be redundant, not incorrect,
-	// but pointless) — it only needs the two pools.
-	appPool, _, err := pgadapter.NewPool(ctx, slogDomainLogger{l: logger})
+	// Database — pgcommon.ConfigFromEnv reads DATABASE_URL/PG_* directly —
+	// same source cmd/server/main.go uses — so pool sizing and DSN assembly
+	// have exactly one implementation instead of a second one hand-rolled
+	// here. The reconciler never runs migrations itself (cmd/server's
+	// startup already applies them; running the same migration set from two
+	// binaries racing at deploy time would be redundant, not incorrect, but
+	// pointless) — it only needs the two pools.
+	pgCfg, pgWarnings := pgcommon.ConfigFromEnv()
+	for _, w := range pgWarnings {
+		logger.Warn("postgres config warning", map[string]interface{}{"key": w.Key, "reason": w.Reason})
+	}
+	// DSNFromEnv (not a bare ApplyStatementTimeout(pgCfg.DSN)) so the
+	// DATABASE_URL bypass applies here too: PG_STATEMENT_TIMEOUT must be
+	// ignored when DATABASE_URL is set verbatim, per ApplyStatementTimeout's
+	// own contract.
+	dsn := pgadapter.DSNFromEnv()
+	pgCfg.DSN = dsn
+	pgCfg.GUCProvider = pgcommon.GUCSetFromContext
+	pgCfg.Logger = pgadapter.NewLoggerAdapter(logger)
+	appPool, err := pgcommon.NewPool(ctx, pgCfg)
 	if err != nil {
 		return fmt.Errorf("connect app pool: %w", err)
 	}
 	//nolint:errcheck // best-effort shutdown cleanup — an error here has no recovery action at process exit.
 	defer func() { _ = appPool.DrainAndClose(context.Background()) }()
 
-	sysDSN, usedFallback := pgadapter.SystemDSNFromEnv()
-	if usedFallback {
-		logger.Warn("SYSTEM_DATABASE_URL not set — sysPool reuses app DSN; cross-tenant sweeps will be RLS-filtered")
-	}
+	sysDSN := pgadapter.SystemDSNFromEnv()
 	sysPool, err := pgcommon.NewPool(ctx, pgcommon.Config{
-		DSN: sysDSN, Logger: slogDomainLogger{l: logger}, PGBouncerMode: true,
+		DSN: sysDSN, Logger: pgadapter.NewLoggerAdapter(logger), PGBouncerMode: true,
 	})
 	if err != nil {
 		return fmt.Errorf("connect system pool: %w", err)
 	}
 	//nolint:errcheck // best-effort shutdown cleanup — an error here has no recovery action at process exit.
 	defer func() { _ = sysPool.DrainAndClose(context.Background()) }()
+	if sysDSN == dsn {
+		logger.Warn("SYSTEM_DATABASE_URL not set — sysPool reuses app DSN; cross-tenant sweeps will be RLS-filtered", nil)
+	}
 
 	userProfileTimeout, err := getEnvDurationMS("USER_PROFILE_TIMEOUT_MS", 3000*time.Millisecond)
 	if err != nil {
@@ -97,14 +115,41 @@ func run() error {
 		return err
 	}
 
+	// jobs.Cleanup (delegation-cleanup, LLD §18.4/GAP-09) only ever runs
+	// through this binary — cmd/server has no HTTP entry point for it
+	// (unlike DLG-I1/I2's shared expiry/review path, DLG-D17) — so
+	// ProcessedEvents.CleanupExpired is wired here or nowhere.
+	processedEvents := consumer.NewProcessedEvents(sysPool)
+
+	// GAP-27 (DLG-D19 partial closure): registered here for jobs.Context
+	// symmetry with cmd/server's real *metrics.Metrics (both binaries call
+	// jobs.Expiry/ReviewSweep, which call jctx.Metrics unconditionally when
+	// non-nil). Registered through gincommon.MetricsRegisterer() — every
+	// Prometheus registration in this repo goes through platform-gincommon,
+	// never a hand-rolled prometheus.NewRegistry() — even though this binary
+	// never runs gincommon.ObservabilityMiddlewares/DefaultMiddlewares, so
+	// MetricsRegisterer() falls back to prometheus.DefaultRegisterer (see
+	// that function's doc comment). This binary is a one-shot batch process
+	// with no /metrics scrape endpoint of its own, so these increments are
+	// never exported anywhere regardless of which registry they land in —
+	// the alert-visible deferred counters reach Prometheus only via
+	// cmd/server's DLG-I1/I2 on-demand entry points, which do have a live
+	// scrape target. See .claude/operations.md's Metrics section.
+	reconcilerMetrics, err := metrics.Register(gincommon.MetricsRegisterer())
+	if err != nil {
+		return fmt.Errorf("register metrics: %w", err)
+	}
+
 	jctx := &jobs.Context{
-		Delegations:   pgadapter.NewDelegationRepository(sysPool),
-		UserProfile:   userProfileClient,
-		TxRunner:      txRunner,
-		BindTenantGUC: pgadapter.WithTenantGUC,
-		Logger:        ml,
-		BatchLimit:    batchLimit,
-		RetentionDays: retentionDays,
+		Delegations:     pgadapter.NewDelegationRepository(sysPool),
+		UserProfile:     userProfileClient,
+		TxRunner:        txRunner,
+		BindTenantGUC:   pgadapter.WithTenantGUC,
+		Logger:          logger,
+		BatchLimit:      batchLimit,
+		RetentionDays:   retentionDays,
+		ProcessedEvents: processedEvents,
+		Metrics:         reconcilerMetrics,
 	}
 
 	var result jobs.Result
@@ -121,11 +166,12 @@ func run() error {
 	if err != nil {
 		return fmt.Errorf("%s: %w", *jobName, err)
 	}
-	logger.Info("job complete", slog.String("job", *jobName),
-		slog.Int("attempted", result.Attempted), slog.Int("succeeded", result.Succeeded),
-		slog.Int("failed", result.Failed), slog.Int("warned_3d", result.Warned3d),
-		slog.Int("warned_2d", result.Warned2d), slog.Int("warned_1d", result.Warned1d),
-		slog.Int("expired", result.Expired), slog.Int("deferred", result.Deferred),
-		slog.Int("purged", result.Purged))
+	logger.Info("job complete", map[string]interface{}{
+		"job": *jobName, "attempted": result.Attempted, "succeeded": result.Succeeded,
+		"failed": result.Failed, "warned_3d": result.Warned3d,
+		"warned_2d": result.Warned2d, "warned_1d": result.Warned1d,
+		"expired": result.Expired, "deferred": result.Deferred,
+		"purged": result.Purged,
+	})
 	return nil
 }

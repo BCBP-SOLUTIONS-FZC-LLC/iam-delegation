@@ -97,6 +97,17 @@ func (f *fakeDelegationRepo) HardPurgeSoftDeletedBefore(_ context.Context, befor
 
 func noopBind(ctx context.Context, _ uuid.UUID, _ string) context.Context { return ctx }
 
+// fakeMetrics records calls to the two deferred-counter methods so tests can
+// assert GAP-27 closure: the reconciler jobs must actually call these, not
+// just have them registered (DLG-D19).
+type fakeMetrics struct {
+	expiryDeferred int
+	reviewDeferred int
+}
+
+func (f *fakeMetrics) RecordExpiryDeferred() { f.expiryDeferred++ }
+func (f *fakeMetrics) RecordReviewDeferred() { f.reviewDeferred++ }
+
 func newDelegation(delegatorID uuid.UUID) domain.Delegation {
 	return domain.Delegation{
 		ID: uuid.New(), TenantID: uuid.New(), DelegatorID: delegatorID, DelegateID: uuid.New(),
@@ -137,7 +148,8 @@ func TestExpiry_UPFailure_Defers_NoEndCall(t *testing.T) {
 	repo := &fakeDelegationRepo{expiring: []domain.Delegation{d}}
 	up := &fakeUserProfile{failFor: map[uuid.UUID]bool{d.DelegatorID: true}}
 	tx := &fakeTxRunner{}
-	jctx := &Context{Delegations: repo, UserProfile: up, TxRunner: tx, BindTenantGUC: noopBind, Logger: fakeLogger{}}
+	m := &fakeMetrics{}
+	jctx := &Context{Delegations: repo, UserProfile: up, TxRunner: tx, BindTenantGUC: noopBind, Logger: fakeLogger{}, Metrics: m}
 
 	res, err := Expiry(context.Background(), jctx)
 	if err != nil {
@@ -151,6 +163,21 @@ func TestExpiry_UPFailure_Defers_NoEndCall(t *testing.T) {
 	}
 	if len(tx.published) != 0 {
 		t.Fatalf("no event should be emitted when the row is deferred: %v", tx.published)
+	}
+	if m.expiryDeferred != 1 {
+		t.Fatalf("expected iam_delegation_expiry_deferred_total to be incremented once (GAP-27), got %d", m.expiryDeferred)
+	}
+}
+
+func TestExpiry_UPFailure_Defers_NilMetricsDoesNotPanic(t *testing.T) {
+	d := newDelegation(uuid.New())
+	repo := &fakeDelegationRepo{expiring: []domain.Delegation{d}}
+	up := &fakeUserProfile{failFor: map[uuid.UUID]bool{d.DelegatorID: true}}
+	tx := &fakeTxRunner{}
+	jctx := &Context{Delegations: repo, UserProfile: up, TxRunner: tx, BindTenantGUC: noopBind, Logger: fakeLogger{}}
+
+	if _, err := Expiry(context.Background(), jctx); err != nil {
+		t.Fatalf("unexpected error: %v", err)
 	}
 }
 
@@ -259,7 +286,8 @@ func TestReviewSweep_AutoEnd_UPFailure_Defers(t *testing.T) {
 	repo := &fakeDelegationRepo{autoEnd: []domain.Delegation{dEnd}}
 	up := &fakeUserProfile{failFor: map[uuid.UUID]bool{dEnd.DelegatorID: true}}
 	tx := &fakeTxRunner{}
-	jctx := &Context{Delegations: repo, UserProfile: up, TxRunner: tx, BindTenantGUC: noopBind, Logger: fakeLogger{}}
+	m := &fakeMetrics{}
+	jctx := &Context{Delegations: repo, UserProfile: up, TxRunner: tx, BindTenantGUC: noopBind, Logger: fakeLogger{}, Metrics: m}
 
 	res, err := ReviewSweep(context.Background(), jctx)
 	if err != nil {
@@ -270,6 +298,9 @@ func TestReviewSweep_AutoEnd_UPFailure_Defers(t *testing.T) {
 	}
 	if len(repo.endCalls) != 0 {
 		t.Fatalf("End must not be called when UP pointer-clear fails: %v", repo.endCalls)
+	}
+	if m.reviewDeferred != 1 {
+		t.Fatalf("expected iam_delegation_review_deferred_total to be incremented once (GAP-27), got %d", m.reviewDeferred)
 	}
 }
 

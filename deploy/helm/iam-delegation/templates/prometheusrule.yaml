@@ -92,11 +92,34 @@ spec:
           annotations:
             summary: iam-delegation delegation-cascade-q DLQ is receiving messages
             description: >-
-              One or more MembershipRevoked/TenantOffboarded cascade
+              One or more MembershipRevoked/TenantMembershipsPurged cascade
               deliveries (LLD §11.5/§11.6) were routed to
               delegation-cascade-q-dlq after exhausting retries (or failing
               schema decode). Inspect the DLQ payloads and consumer logs;
               once fixed, redrive them back to delegation-cascade-q.
+
+    # ── Transactional outbox dead-letter queue — outbox_dead_letters_total is
+    #    platform-events' own metric (registered automatically by
+    #    events.InitWithRegisterer, LLD §10.4), not something this service
+    #    defines itself. Mirrors iam-user-profile's/iam-org-membership's
+    #    identical IAMUserProfileOutboxStuck/IamOrgMembershipOutboxStuck alert.
+    - name: iam_delegation_outbox
+      rules:
+        - alert: IamDelegationOutboxStuck
+          expr: |
+            sum(increase(outbox_dead_letters_total{job={{ include "iam-delegation.fullname" . | quote }}}[30m])) > 0
+          for: 15m
+          labels:
+            severity: warning
+            team: platform
+          annotations:
+            summary: iam-delegation outbox events moved to the dead-letter table
+            description: >-
+              One or more DelegationStarted/DelegationEnded/DelegationReviewRequested
+              outbox records exhausted MaxAttempts and were moved to
+              outbox_dead_letters (LLD §10.4). Check the outbox runner logs for
+              SNS publish errors and verify SNS_TOPIC_ARN connectivity; the
+              outbox_dead_letters table is queryable/retryable via standard SQL.
 
     # ── Grant-time membership-check dependency — LLD §14.5
     #    "membership-check failure rate > 5% for 5 m (warning)" ────────────

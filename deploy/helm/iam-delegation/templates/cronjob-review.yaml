@@ -41,9 +41,10 @@ spec:
               command: ["/iam-delegation-reconciler"]
               securityContext:
                 {{- toYaml .Values.securityContext | nindent 16 }}
-              # --job=delegation-review selects DLG-I2 (LLD §11.4 — the dual
-              # 7d/3d review-window warning sweep, then auto-end with
-              # ended_reason=review_expired, DLG-D6/DLG-D7) out of the single
+              # --job=delegation-review selects DLG-I2 (LLD §11.4 — the
+              # 3-day daily-cascade review-window warning sweep, then
+              # auto-end with ended_reason=review_expired, DLG-D6/DLG-D7) out
+              # of the single
               # iam-delegation-reconciler binary, which also hosts the
               # expiry and cleanup entry points (cronjob-expiry.yaml /
               # cronjob-cleanup.yaml). cmd/reconciler/main.go MUST parse a

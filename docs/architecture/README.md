@@ -11,13 +11,13 @@ Standalone Mermaid source files for `ARCHITECTURE.md`. Each `.mmd` file is embed
 | [`create-flow.mmd`](mermaid/create-flow.mmd) | DLG-2 create — idempotency, dual membership checks, availability-first, outbox | ARCHITECTURE.md §Key request flows | LLD §11.1 |
 | [`cancel-flow.mmd`](mermaid/cancel-flow.mmd) | DLG-3 cancel — fail-open pointer-clear, optimistic lock | ARCHITECTURE.md §Key request flows | LLD §11.2 |
 | [`expiry-cron-flow.mmd`](mermaid/expiry-cron-flow.mmd) | DLG-I1 expiry CronJob — availability-first, self-retrying | ARCHITECTURE.md §Key request flows | LLD §11.3 |
-| [`review-cron-flow.mmd`](mermaid/review-cron-flow.mmd) | DLG-I2 review-window CronJob — dual 7d/3d warn, then auto-end | ARCHITECTURE.md §Key request flows | LLD §11.4 |
+| [`review-cron-flow.mmd`](mermaid/review-cron-flow.mmd) | DLG-I2 review-window CronJob — 3-day daily cascade warn, then auto-end | ARCHITECTURE.md §Key request flows | LLD §11.4 |
 | [`cascade-removal-flow.mmd`](mermaid/cascade-removal-flow.mmd) | Core `MembershipRevoked` → async row-end cascade | ARCHITECTURE.md §Key request flows | LLD §11.5 |
 | [`read-policy-flow.mmd`](mermaid/read-policy-flow.mmd) | DLG-1 list (cached), DLG-4 extend, DLG-5 reassign, DLG-6/7 settings | ARCHITECTURE.md §Key request flows | LLD §11.7 |
 | [`rls-guc-flow.mmd`](mermaid/rls-guc-flow.mmd) | Three tenant-GUC binding paths (public middleware, mesh-only per-call, injected job/consumer binder) converging on `postgres.WithTenantGUC` | ARCHITECTURE.md §Row-Level Security (RLS) and GUC injection | — (authored from `router.go`, `cmd/server/adapters.go`, `cmd/reconciler/jobs`; cross-references LLD §7.3/§13.1) |
 
 `request-preamble-flow.mmd` through `read-policy-flow.mmd` and `rls-guc-flow.mmd` are sequence/graph diagrams; `data-model.mmd` is an ER diagram; `layer-model.mmd` and `package-dependencies.mmd` are dependency graphs.
 
-No diagram exists for LLD §11.6 (tenant-lifecycle cleanup) — that flow is one sentence of prose in the LLD (cascade consumer soft-deletes on `TenantOffboarded`; monthly `delegation-cleanup` hard-purges after 90 days), not a sequence worth its own diagram.
+No diagram exists for LLD §11.6 (tenant-lifecycle cleanup) — that flow is one sentence of prose in the LLD (cascade consumer soft-deletes on `TenantMembershipsPurged`; monthly `delegation-cleanup` hard-purges after 90 days), not a sequence worth its own diagram.
 
 To render locally, open any `.mmd` file in a Mermaid-aware IDE (VS Code + Mermaid Preview, IntelliJ + Mermaid plugin) or paste into [mermaid.live](https://mermaid.live).

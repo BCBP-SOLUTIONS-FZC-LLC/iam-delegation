@@ -1,7 +1,7 @@
 {
   "$schema": "http://json-schema.org/draft-07/schema#",
   "title": "DelegationReviewRequestedPayload",
-  "description": "Payload of the DelegationReviewRequested event (LLD §10.3/§10.5). Emitted by the delegation-review sweep at the 7-day and 3-day marks (DLG-I2, DLG-D7). Carries days_remaining rather than review_due_at (DLG-Q6's dual-warning contract) — review_due_at does not exist in this service's shape.",
+  "description": "Payload of the DelegationReviewRequested event (LLD §10.3/§10.5). Emitted by the delegation-review sweep once per calendar day for each of the 3 days before review_due_at (DLG-I2, DLG-Q6's 3-day daily cascade). Carries days_remaining rather than review_due_at — review_due_at does not exist in this service's shape.",
   "type": "object",
   "required": [
     "delegation_id",
@@ -37,7 +37,7 @@
     },
     "days_remaining": {
       "type": "integer",
-      "enum": [7, 3]
+      "enum": [3, 2, 1]
     },
     "actor_id": {
       "type": "string",

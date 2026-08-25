@@ -44,11 +44,19 @@ const (
 	EventDelegationReviewRequested = "DelegationReviewRequested"
 )
 
-// Consumed event type constants — Core's removal/offboarding signals on
-// delegation-cascade-q (LLD §10.1, DLG-Q4/DLG-D14). Not produced here.
+// Consumed event type constants — Core's (iam-org-membership's)
+// removal/tenant-scrub signals on delegation-cascade-q (LLD §10.1,
+// DLG-Q4/DLG-D14). Not produced here.
+//
+// EventTenantMembershipsPurged is Core's own tenant-level cascade relay,
+// on iam.membership.events (NOT iam.tenant.events) — Core renamed it from
+// "TenantOffboarded" specifically because that name collided with Realm
+// Provisioner's own, differently-scoped TenantOffboarded event, which Core
+// only consumes and never re-emits ("one producer per event name"). This
+// service's cascade consumer must match Core's current name, not RP's.
 const (
-	EventMembershipRevoked = "MembershipRevoked"
-	EventTenantOffboarded  = "TenantOffboarded"
+	EventMembershipRevoked       = "MembershipRevoked"
+	EventTenantMembershipsPurged = "TenantMembershipsPurged"
 )
 
 // Topic is the single dedicated SNS topic this service publishes to

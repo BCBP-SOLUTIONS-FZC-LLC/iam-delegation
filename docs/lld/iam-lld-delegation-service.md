@@ -9,8 +9,8 @@
 | Parent decision | **ADR-0008** (`02-hld-delta-delegation.md`, v2 / Option C) — the fourth O&M extraction, authorised by ADR-0007's explicit deferral of `delegations` |
 | Subsystem | Identity & Access Management |
 | Wave | 4 of 4 (the deferred hot-path table; resolved by removing delegations from I-8 entirely) |
-| Version | 2.1 |
-| Date | 2026-08-20 |
+| Version | 2.3 |
+| Date | 2026-08-25 |
 | Status | Approved for implementation |
 | Audience | IAM platform engineering (owner), Core Org & Membership engineering (drops `delegations`; membership-existence + dept-delegate callee; removal-signal producer), Workflow Service (delegation-event consumer), User Profile (availability callee), AuthZ Enrichment (drops `active_delegations[]`), SRE |
 | Owner database | RDS PostgreSQL `delegation` (Multi-AZ, PgBouncer transaction pooling) |
@@ -24,6 +24,8 @@
 | 2.0 | 2026-08-20 | **Free-hand revision — the IAM subsystem is in development, nothing deployed.** With the backward-compatibility constraint lifted, DLG-Q9 resolves to **Option C**: `active_delegations[]` is removed from I-8 and **Core drops the `delegations` table entirely**, making the extraction symmetric with the three ADR-0007 cuts and leaving I-8 *faster* (four-table join). All other open questions are resolved as decisions (§19/§23): dedicated event topic `iam.delegation.events` (Q1); tenant delegation policy moves into this service as `delegation_tenant_settings` (Q2); mandatory create idempotency key (Q3); Core `MembershipRevoked`/`TenantOffboarded` signals (Q4); `ended_reason` gains `review_expired` (Q5); dual 7 d/3 d review warnings (Q6); fuller reassign body (Q7); canonical error taxonomy (Q8); active-at-create v1 scope (Q10). v1's projection is retained only as a documented fallback (§22). |
 | 2.1 | 2026-08-20 | **Depth/quality uplift to the `iam-lld-user-profile.md` standard.** No design change — this revision raises the document to the maturity bar of the User Profile LLD: §10 Event Architecture is expanded to that doc's §7 depth (inbound-consumer table with queue/DLQ/`maxReceiveCount`/filter policy; serialization; a full hand-authored `api/asyncapi.yaml` 3.0.0 skeleton with an `EventEnvelope` + `allOf` per-payload schemas; a Glue Schema Registry layout table, schema-evolution rules, and enqueue-vs-publish Go codec wiring; an outbound consumer→queue→DLQ fan-out table; a published-events catalogue; and an idempotency/ordering subsection). §7.3 RLS is expanded to the three-function fail-closed design (`app_tenant_id()`/`rls_check_tenant()`/`log_rls_violation()`) + `rls_violation_log` + per-table policies + roles + CI-verified RLS-1/2/4/6. §7.5 now shows the `touch_row()` trigger SQL + TRG-1/2/3. §11 gains a shared request preamble (§11.0) and per-endpoint diagrams for the remaining routes (§11.7). §14.1 gains a second SLO table (cache-vs-DB + background freshness) and a 99.9% availability target. No schema, API, or event *content* changed — this revision only brings the write-up to the sibling doc's standard. |
 | 2.2 | 2026-08-24 | **Bug-fix and notification-redesign revision.** Addresses five confirmed bugs (BUG-01…BUG-05) and fourteen LLD/design gaps (LLD-GAP-01…LLD-GAP-09, LLD-GAP-27, LLD-GAP-29) discovered during implementation review: (1) DLG-1 `ListByDelegator` must filter `status='active'` — currently returns cancelled/ended rows (BUG-02/GAP-01); (2) `EndForUser` cascade must add `AND status='active'` to prevent re-ending terminal rows and corrupting their `deleted_at` (GAP-02); (3) all time comparisons in Create use a single `now` capture (GAP-03); (4) `actor_id` in `DelegationEnded`/`DelegationReviewRequested` must reflect the actual triggering caller, not always the delegator (GAP-04); (5) DLG-4 Extend must invalidate the `del:list` Valkey cache and return `record_version` in its response (BUG-04/GAP-06); (6) `review_window_days` written on INSERT (GAP-07); (7) `DomainEvent.OccurredAt` must be set at enqueue time (GAP-08); (8) `processed_events.CleanupExpired` added to the monthly cleanup job (GAP-09); (9) deferred-counter metrics must be instrumented in reconciler jobs, not only registered (GAP-27); (10) error response `details` field must be included in HTTP responses for `delegation_window_too_long` and `optimistic_lock_conflict` (BUG-01); (11) `reason_too_long` cap is 500 Unicode characters (rune count), not 500 bytes (BUG-03); (12) compensating UP pointer-clear added to Create tx-failure path (BUG-05); (13) DLG-3 Cancel response body documented (GAP-29). **Notification redesign (DLG-Q6/DLG-D7):** the dual 7 d/3 d single-fire model is replaced by a **3-day daily cascade** — `DelegationReviewRequested` fires once per calendar-day in the 3-day window before `review_due_at` (`days_remaining ∈ {3,2,1}`), so delegators receive a notification on each of the three days leading up to auto-end rather than two single notices. `review_last_warned_bucket CHECK` updated accordingly. No code merges were blocked by this revision — all changes are spec corrections and the implementation must be updated to match. |
+| 2.3 | 2026-08-25 | **Post-implementation correction, confirmed by a direct cross-service compatibility audit against `iam-org-membership`'s actual (not just documented) code.** Two corrections to §10.1's Core-signal contract (DLG-Q4): (1) Core renamed `TenantOffboarded` to **`TenantMembershipsPurged`** (identical payload shape) to avoid colliding with Realm Provisioner's own, differently-scoped `TenantOffboarded` event, which Core only ever consumes and never re-emits; (2) both consumed event types are published on the **same** topic, `iam.membership.events` — there is no second upstream topic (`iam.tenant.events` was never actually used for this signal). §2, §10.1, §11.6, and §18.2 are updated to match; DLG-Q4's "requires Core to add the emission" cross-team-coordination note is closed — the audit confirmed Core ships `MembershipRevoked` and `TenantMembershipsPurged` today, both correctly enqueued atomically with the triggering write. Also newly documented: Core Glue-encodes both event types by default in its own committed deployment configuration, independently of this service's own outbound Glue configuration (§10.3.1) — the consumer side needs a decode-capable codec regardless of whether this service publishes with `NoopCodec` or `GlueCodec`; the as-built fix is `eventbus.GlueDecodeCodec` (`ARCHITECTURE.md`'s "Session-specific decisions" DLG-D21). No schema, API, or published-event content changed — this revision only corrects the consumed-event contract to match Core's actual production behavior. |
+| 2.4 | 2026-08-25 | **Post-implementation correction — logging/database/events pass-through audits against `iam-user-profile`'s/`iam-org-membership`'s actual code (DLG-D22/D23/D24), plus one genuine spec bug found while writing this revision.** (1) **`api/asyncapi.yaml`'s `EventEnvelope.specversion` declared `const: "1.0"`, but the actual (and both siblings') wire value is `"1"`** — `events.WithSchemaVersion("1")` was itself missing from this service's publish path until DLG-D24 fixed it (§10.3 corrected to match; DLG-EVT-2's "byte-identical to O&M" invariant now holds for `specversion` too, not just payload shape). (2) §10.4 now documents that `outbox.Runner`'s tunables are `OUTBOX_*`-env-configurable (previously hardcoded) and that a fourth `cmd/server` background goroutine calls `PrunePublished` on a retention ticker — without it `outbox_events` grew unbounded (DLG-D24). (3) §14.5 gains the `outbox_dead_letters_total` alert, previously undocumented and unalerted (DLG-D24). Logging (DLG-D22: switched to `platform-gincommon/pkg/logger.NewLogger`) and database/`pgcommon` pass-through (DLG-D23: `DSNFromEnv`/`MigrationDSNFromEnv`/`PG_STATEMENT_TIMEOUT` support) were implementation-conformance fixes with no LLD-visible design content and are documented only in `ARCHITECTURE.md`'s decision register and `CHANGELOG.md`, per this doc's existing convention (cf. 2.1's "no design change" precedent) — noted here only for revision-history completeness. No schema, API route, or published-event *payload* content changed in this revision. |
 
 ---
 
@@ -75,7 +77,7 @@ Delegation is a "two records, two owners" concern (O&M §2.3): this service owns
 - **Coordinate availability-first with User Profile** — DEL-6 two-phase write on create; pointer-clear-only (`{delegate_id:null}`) on every end path.
 - **Run the two reconcilers** — `delegation-expiry` and `delegation-review` (3-day daily-cascade warnings then auto-end — see §11.4), both availability-first and self-retrying.
 - **Produce the delegation events** on the dedicated topic `iam.delegation.events`, driving Workflow reroute/restore, Notification fan-out, and Audit.
-- **Run the removal / offboarding cascade** — consume Core's `MembershipRevoked` / `TenantOffboarded` and end affected delegations asynchronously.
+- **Run the removal / offboarding cascade** — consume Core's `MembershipRevoked` / `TenantMembershipsPurged` and end affected delegations asynchronously.
 - **Answer two internal reads for Core/consumers** — `GET /internal/delegations/dept-delegate` (Core's §8.8.4 removal precision) and `GET /internal/users/:id/active-delegations` (the escape hatch replacing I-8's removed field).
 
 ---
@@ -675,14 +677,16 @@ This service is **both a producer and a consumer** — the first of the four O&M
 
 ### 10.1 Inbound — SQS consumer
 
-The service has **one** active inbound subscription: Core's user-removal / tenant-offboarding signals, which drive the delegate-side cascade (§11.5, DLG-Q4).
+The service has **one** active inbound subscription: Core's user-removal / tenant-offboarding signals, which drive the delegate-side cascade (§11.5, DLG-Q4). Both consumed event types are published by Core on the **same** topic, `iam.membership.events` — there is no second upstream topic for this signal (corrected in v2.3; an earlier revision of this table assumed a separate `iam.tenant.events` source).
 
 | Source topic | Event type(s) | SQS queue | DLQ | `maxReceiveCount` | Filter policy | Dispatched to |
 |---|---|---|---|---|---|---|
 | `iam.membership.events` | `MembershipRevoked` | `delegation-cascade-q` | `delegation-cascade-q-dlq` | 5 | `EventType IN [MembershipRevoked]` | `CascadeService.EndForUser` (§11.5) |
-| `iam.tenant.events` | `TenantOffboarded` | `delegation-cascade-q` | `delegation-cascade-q-dlq` | 5 | `EventType IN [TenantOffboarded]` | `CascadeService.ScrubTenant` (§11.6) |
+| `iam.membership.events` | `TenantMembershipsPurged` | `delegation-cascade-q` | `delegation-cascade-q-dlq` | 5 | `EventType IN [TenantMembershipsPurged]` | `CascadeService.ScrubTenant` (§11.6) |
 
 The queue takes the `lifecycle`-adjacent naming used by the sibling services (`delegation-cascade-q`, not the plain `<topic>-<consumer>-q`, mirroring `iam-group-mapping`'s and User Profile's `tenant-lifecycle-*-q`). Idempotency is via `processed_events` keyed on the envelope `id` (§7.2.3); a redelivery is a no-op. A message whose payload fails schema-decode is routed to the DLQ rather than retried indefinitely.
+
+**Wire-format note (v2.3):** Core Glue-encodes both event types by default in its own committed deployment configuration (`GLUE_REGISTRY_MEMBERSHIP_NAME` set), independently of whether this service's own outbound publish path (§10.3.1) uses `GlueCodec` or `NoopCodec`. The SQS consumer must therefore always configure a decode-capable codec (`events.WithConsumerCodec`) regardless of its own publish-side Glue configuration — the as-built fix is a registry-agnostic decode-only codec, since the Glue wire header is self-describing and needs no schema-registry lookup to strip (`ARCHITECTURE.md`'s "Session-specific decisions" DLG-D21).
 
 ### 10.2 Serialization format
 
@@ -690,7 +694,7 @@ Event payloads are serialized as **JSON** (UTF-8) — the format registered in t
 
 ### 10.3 AsyncAPI contract
 
-The JSON envelope carries `id` (UUID v7, consumer dedup key), `type` (PascalCase event name, e.g. `DelegationStarted`), `source` (`iam-delegation`), `specversion` (`"1.0"`), `time` (RFC 3339), `data` (the payload), `tenant_id`, `trace_id`, plus optional `subject`, `actor` (who caused it — audit), `dataschema` (Glue schema-version UUID), and `ip_address`/`user_agent` (system sentinels on cron-origin events). SNS `MessageAttributes`: `EventType` (PascalCase, used by consumer filter policies), `TenantID`, `Source`, `EventID`, `Subject`.
+The JSON envelope carries `id` (UUID v7, consumer dedup key), `type` (PascalCase event name, e.g. `DelegationStarted`), `source` (`iam-delegation`), `specversion` (`"1"` — `events.WithSchemaVersion("1")`, matching `iam-user-profile`'s/`iam-org-membership`'s identical convention, DLG-D24), `time` (RFC 3339), `data` (the payload), `tenant_id`, `trace_id`, plus optional `subject`, `actor` (who caused it — audit), `dataschema` (Glue schema-version UUID), and `ip_address`/`user_agent` (system sentinels on cron-origin events). SNS `MessageAttributes`: `EventType` (PascalCase, used by consumer filter policies), `TenantID`, `Source`, `EventID`, `Subject`.
 
 Full `api/asyncapi.yaml` (hand-authored; the CI gate `schema-gov validate --asyncapi api/asyncapi.yaml` runs the pinned `platform-schemagov` image and fails the PR on any drift between this file and the Glue registry):
 
@@ -735,7 +739,7 @@ AWS Glue Schema Registry is free in all regions including ap-south-1.
 
 ### 10.4 Outbound — `iam.delegation.events` via the outbox
 
-A single SNS topic, `events.NewSNSPublisher` (no RoutingPublisher — one topic, three types). Every state change writes to `outbox_events` in the same transaction; the `outbox.Runner` polls at 500 ms (`BatchSize 50`, `MaxAttempts 5`, DLQ on exhaustion). Fan-out to consumer queues (each with a DLQ, `maxReceiveCount=5`):
+A single SNS topic, `events.NewSNSPublisher` (no RoutingPublisher — one topic, three types). Every state change writes to `outbox_events` in the same transaction; the `outbox.Runner` polls at 500 ms by default (`BatchSize 50`, `MaxAttempts 5`, DLQ on exhaustion) — all eight `outbox.Config` tunables are `OUTBOX_*`-env-configurable (DLG-D24, matching `iam-org-membership`'s identical surface) rather than hardcoded. A fourth `cmd/server` background goroutine calls `outbox.Runner.PrunePublished` on a daily ticker (`OUTBOX_PRUNE_INTERVAL`/`_RETENTION`/`_LIMIT`, default daily/7d/1000 rows, matching `iam-user-profile`'s `runMaintenanceSweep`) — without it, published `outbox_events` rows accumulate forever. Fan-out to consumer queues (each with a DLQ, `maxReceiveCount=5`):
 
 | Consumer | SQS queue | DLQ | Events consumed | Purpose |
 |---|---|---|---|---|
@@ -987,7 +991,7 @@ The stranding hazard is resolved synchronously in Core before removal (Workflow 
 
 ### 11.6 Tenant-lifecycle cleanup
 
-On `TenantOffboarded`, the cascade consumer soft-deletes the tenant's `delegations` (and `delegation_tenant_settings`); the monthly `delegation-cleanup` hard-purges rows soft-deleted > 90 days. No live gap (§7.6.5).
+On `TenantMembershipsPurged`, the cascade consumer soft-deletes the tenant's `delegations` (and `delegation_tenant_settings`); the monthly `delegation-cleanup` hard-purges rows soft-deleted > 90 days. No live gap (§7.6.5).
 
 ### 11.7 Read and policy endpoints (DLG-1 list, DLG-4 extend, DLG-5 reassign, DLG-6/7 settings)
 
@@ -1151,7 +1155,7 @@ W3C `traceparent` propagated on every outbound call; the outbox stamps `trace_id
 
 ### 14.4 Dashboards and 14.5 Alerts
 
-Grafana "IAM — Delegation": active gauge, create/end by reason, expiry/review defer, membership-check + UP latency/error, cascade throughput/DLQ, idempotency hits. Alerts: `expiry_deferred > 0` sustained 30 m (warning, UP dependency); `cascade_dlq > 0` (warning); membership-check failure rate > 5% for 5 m (warning). **No I-8/projection alert** — this service no longer touches the hot path.
+Grafana "IAM — Delegation": active gauge, create/end by reason, expiry/review defer, membership-check + UP latency/error, cascade throughput/DLQ, idempotency hits. Alerts: `expiry_deferred > 0` sustained 30 m (warning, UP dependency); `cascade_dlq > 0` (warning); membership-check failure rate > 5% for 5 m (warning); `outbox_dead_letters_total` increase > 0 over 30 m (warning — `platform-events`' own dead-letter metric, DLG-D24). **No I-8/projection alert** — this service no longer touches the hot path.
 
 ---
 
@@ -1232,7 +1236,7 @@ UPDATE delegations SET deleted_at = now() WHERE tenant_id = 'bbbbbbbb-...';  -- 
 
 **18.1 PII.** `delegations` references three user UUIDs (`delegator_id`, `delegate_id`, two `*_membership_id`) and an optional free-text `reason`. No names/emails/credentials.
 
-**18.2 Offboarding and erasure.** `TenantOffboarded` gives cascade soft-delete then monthly hard-purge (§11.6). Per-user erasure (Core/User Profile signal on the same queue) ends the user's rows and scrubs `reason` on hard-delete. Completeness asserted by a reconciliation report.
+**18.2 Offboarding and erasure.** `TenantMembershipsPurged` gives cascade soft-delete then monthly hard-purge (§11.6). Per-user erasure (Core/User Profile signal on the same queue) ends the user's rows and scrubs `reason` on hard-delete. Completeness asserted by a reconciliation report.
 
 **18.3 Residency.** Single-region RDS/ElastiCache (HLD §7.1).
 
@@ -1249,7 +1253,7 @@ All v1 open questions are **resolved as decisions** for this development-stage b
 - **DLG-Q1 — Event topic. RESOLVED:** dedicated `iam.delegation.events` (§10.1).
 - **DLG-Q2 — Tenant delegation policy. RESOLVED:** moved into this service as `delegation_tenant_settings` (§7.2.2); Core's `tenants` drops the two columns.
 - **DLG-Q3 — Create idempotency. RESOLVED:** mandatory `Idempotency-Key` on DLG-2, 24 h dedup (§9.2).
-- **DLG-Q4 — Core removal signal. RESOLVED:** Core emits `MembershipRevoked{tenant_id, user_id, actor_id}` + `TenantOffboarded`; consumed on `delegation-cascade-q` (§10.2). *(Requires the Core team to add the `MembershipRevoked` emission — a development task, tracked with Core.)*
+- **DLG-Q4 — Core removal signal. RESOLVED (revised in v2.3):** Core emits `MembershipRevoked{tenant_id, user_id, actor_id}` + ~~`TenantOffboarded`~~ **`TenantMembershipsPurged{tenant_id, actor_id}`** (renamed by Core to avoid colliding with Realm Provisioner's own `TenantOffboarded` event), both on `iam.membership.events`; consumed on `delegation-cascade-q` (§10.1). *Confirmed shipped and atomic (enqueued in the same transaction as the triggering write) by a direct cross-service compatibility audit against `iam-org-membership`'s code — the cross-team coordination item below is closed.*
 - **DLG-Q5 — `review_expired` end-reason. RESOLVED:** added to the enum, `[expired, cancelled, delegate_removed, review_expired]` (§7.1/§10).
 - **DLG-Q6 — Review cadence. RESOLVED (revised in v2.2):** ~~dual 7 d + 3 d single-fire warnings~~ replaced by a **3-day daily cascade** — `DelegationReviewRequested` fires once per calendar day for each of the 3 days before `review_due_at`; `days_remaining ∈ {3,2,1}`; `review_last_warned_bucket` CHECK updated to `BETWEEN 1 AND 3`; `review_warned_total{days_remaining}` label values updated accordingly (§7.2.1/§11.4). The 7-day warning is removed entirely.
 - **DLG-Q7 — Reassign surface. RESOLVED:** fuller body `{new_delegate_id?, scope?, scope_id?, ends_at?, reason?}` (§8.4).
@@ -1257,7 +1261,7 @@ All v1 open questions are **resolved as decisions** for this development-stage b
 - **DLG-Q9 — Drop the Core projection (Option C). RESOLVED:** yes — `active_delegations[]` removed from I-8, Core drops the `delegations` table (§6.1, ADR-0008 §13.1).
 - **DLG-Q10 — Future-dated activation. RESOLVED:** v1 scope is active-at-create (matches the OOO workflow); future-dating is an explicit v2 feature needing a start-scheduler (§22).
 
-The one item still requiring **cross-team coordination** (not a design open question) is DLG-Q4's Core-side `MembershipRevoked` emission, since it is a change in the Core codebase this service depends on.
+DLG-Q4's Core-side `MembershipRevoked`/`TenantMembershipsPurged` emission was the one item requiring cross-team coordination (not a design open question); as of v2.3 it is **confirmed shipped** in `iam-org-membership`, atomically and with the exact payload shapes this service expects — closed, no remaining coordination item.
 
 ---
 
@@ -1344,4 +1348,4 @@ The removal-gate errors (`409 workflow_resolution_required`, `503 workflow_servi
 | DLG-D11 | **Reassign takes the fuller body** (`new_delegate_id?/scope?/scope_id?/ends_at?/reason?`) and the error taxonomy is canonicalised (§8.4/§20, DLG-Q7/Q8). |
 | DLG-D12 | **v1 scope is active-at-create** (no future-dating); future-dated activation is a v2 feature needing a start-scheduler (§22, DLG-Q10). |
 
-*End of document. This v2 resolves all ten open questions as decisions for the development-stage build; the only remaining cross-team task is Core adding the `MembershipRevoked` emission this service's cascade consumes (DLG-Q4).*
+*End of document. This v2 resolves all ten open questions as decisions for the development-stage build; the DLG-Q4 cross-team task (Core adding the `MembershipRevoked`/`TenantMembershipsPurged` emission this service's cascade consumes) is confirmed shipped as of v2.3 — no open cross-team tasks remain.*

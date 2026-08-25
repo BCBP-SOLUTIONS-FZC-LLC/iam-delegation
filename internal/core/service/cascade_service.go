@@ -10,7 +10,7 @@ import (
 
 // CascadeService handles the two inbound signals from Core on
 // delegation-cascade-q (LLD §10.1, §11.5/§11.6): MembershipRevoked (a
-// user removed from a tenant) and TenantOffboarded (a whole tenant
+// user removed from a tenant) and TenantMembershipsPurged (a whole tenant
 // offboarded). Both are asynchronous — the stranding-hazard gate itself
 // stays synchronous in Core (LLD §11.5, DLG-D9); this service only ends the
 // now-inert rows.
@@ -81,7 +81,7 @@ func (s *CascadeService) EndForUser(ctx context.Context, tenantID, userID uuid.U
 	return nil
 }
 
-// ScrubTenant handles TenantOffboarded (LLD §11.6) — soft-deletes every
+// ScrubTenant handles TenantMembershipsPurged (LLD §11.6) — soft-deletes every
 // delegation and the tenant's delegation_tenant_settings row. No event
 // emission (stale rows are inert, §7.6.5); the monthly delegation-cleanup
 // job hard-purges after the 90-day retention window (§18.4).

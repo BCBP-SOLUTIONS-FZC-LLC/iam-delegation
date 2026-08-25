@@ -16,6 +16,14 @@ const (
 // delegation-cascade-q (LLD §10.1), wired to cascadeConsumer.Handle. client
 // satisfies events.SQSClientLike (the real *sqs.Client from aws-sdk-go-v2,
 // or a LocalStack/test double). queueURL is delegation-cascade-q's URL.
+// opts is forwarded verbatim to events.NewSQSConsumerWithClient — the
+// composition root (cmd/server/main.go) passes
+// events.WithConsumerCodec(eventbus.GlueDecodeCodec{}) here so a
+// Glue-encoded MembershipRevoked/TenantMembershipsPurged from Core decodes
+// correctly (LLD §10.1, DLG-D21); this package stays free of any outbound
+// adapter import by accepting the option opaquely rather than importing
+// eventbus itself (Clean Architecture — inbound adapters never depend on
+// outbound adapters directly).
 //
 // Kept separate from NewCascadeConsumer (cascade_consumer.go) so
 // CascadeConsumer itself has zero SQS/events-transport dependency and stays
@@ -23,7 +31,7 @@ const (
 // events.NewSQSConsumerWithClient. logger is passed straight through to
 // SQSConfig.Logger: this package's Logger interface has the same method
 // set as platform-events' internal port.Logger, so no adapter is needed.
-func NewCascadeSQSConsumer(client events.SQSClientLike, queueURL string, logger Logger, cascadeConsumer *CascadeConsumer) (events.Consumer, error) {
+func NewCascadeSQSConsumer(client events.SQSClientLike, queueURL string, logger Logger, cascadeConsumer *CascadeConsumer, opts ...events.ConsumerOption) (events.Consumer, error) {
 	return events.NewSQSConsumerWithClient(
 		events.SQSConfig{
 			QueueURL:    queueURL,
@@ -33,5 +41,6 @@ func NewCascadeSQSConsumer(client events.SQSClientLike, queueURL string, logger 
 		},
 		client,
 		cascadeConsumer.Handle,
+		opts...,
 	)
 }

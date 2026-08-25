@@ -77,7 +77,7 @@ func (r *SettingsRepository) Upsert(ctx context.Context, tenantID uuid.UUID, max
 	return out, err
 }
 
-// SoftDeleteTenant removes the tenant's policy row on TenantOffboarded
+// SoftDeleteTenant removes the tenant's policy row on TenantMembershipsPurged
 // (LLD §11.6). delegation_tenant_settings has no deleted_at column — it is
 // pure policy, not audit-relevant data — so "soft-delete" for this table
 // means a real DELETE: there is nowhere to mark the row deleted, and a

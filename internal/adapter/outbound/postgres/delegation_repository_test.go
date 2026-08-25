@@ -265,16 +265,16 @@ func TestDelegationRepository_MarkReviewWarned(t *testing.T) {
 	due := time.Now().UTC().Add(5 * 24 * time.Hour)
 	id := seedDelegation(t, ctx, db.Raw, seedDelegationOpts{TenantID: tenantID, Status: "active", ReviewDueAt: &due})
 
-	require.NoError(t, repo.MarkReviewWarned(ctxA, tenantID, id, 7, 1))
+	require.NoError(t, repo.MarkReviewWarned(ctxA, tenantID, id, 3, 1))
 
 	found, err := repo.FindByID(ctxA, tenantID, id)
 	require.NoError(t, err)
 	require.NotNil(t, found.ReviewLastWarnedBucket)
-	assert.Equal(t, 7, *found.ReviewLastWarnedBucket)
+	assert.Equal(t, 3, *found.ReviewLastWarnedBucket)
 	assert.Equal(t, int64(2), found.RecordVersion)
 
 	// Stale version -> conflict.
-	err = repo.MarkReviewWarned(ctxA, tenantID, id, 3, 1)
+	err = repo.MarkReviewWarned(ctxA, tenantID, id, 2, 1)
 	assert.ErrorIs(t, err, domain.ErrOptimisticLockConflict)
 }
 

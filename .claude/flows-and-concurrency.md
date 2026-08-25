@@ -66,18 +66,21 @@ Both jobs live in `cmd/reconciler/jobs/` **and** are reachable via `POST
 `ExpiryRunner`/`ReviewRunner` interfaces, so the CronJob binary and the on-demand HTTP trigger call
 the exact same implementation — not two independently-maintained code paths.
 
-- **Expiry**: per candidate, User Profile pointer-clear first; on failure, `Deferred++` and the row
-  is left active for the next tick (DEL-6 self-retry) — **it does not proceed to end the row on a UP
-  failure**. Only after a successful clear does it open a tenant-GUC-bound tx (`jctx.BindTenantGUC`)
-  to `End` + enqueue `DelegationEnded{expired}`. A concurrent end/cancel racing the same row
+- **Expiry**: per candidate, User Profile pointer-clear first; on failure, `Deferred++`, the row
+  is left active for the next tick (DEL-6 self-retry), and `iam_delegation_expiry_deferred_total` is
+  incremented (GAP-27) — **it does not proceed to end the row on a UP failure**. Only after a
+  successful clear does it open a tenant-GUC-bound tx (`jctx.BindTenantGUC`) to `End` + enqueue
+  `DelegationEnded{expired}`. A concurrent end/cancel racing the same row
   (`ErrDelegationNotFound`/`ErrOptimisticLockConflict`) is treated as `raced`, counted toward neither
   `Succeeded` nor `Failed`.
-- **Review-window**: three passes per tick, each independently GUC-bound per row — 7d warn
-  (`FindDueForWarning7d`, only when `review_last_warned_bucket IS NULL`), 3d warn
-  (`FindDueForWarning3d`, `IS DISTINCT FROM 3`), then auto-end (`FindDueForAutoEnd`). All three finder
-  queries filter `ends_at IS NULL` — a fixed-end-date delegation is never considered by this cron at
-  all. `warnBucket` marks-then-enqueues inside one tx per row; a race on the mark is skipped, not
-  failed. Auto-end follows the same User-Profile-first-then-defer pattern as Expiry.
+- **Review-window**: two passes per tick, each independently GUC-bound per row — daily cascade warn
+  (`FindDueForDailyWarn`, `review_due_at ∈ (now, now+3d]`; `days_remaining = CEIL((review_due_at−now())/1day)`
+  clamped to `[1,3]`, skipped when `review_last_warned_bucket` already equals that value — one notice
+  per calendar-day mark, 3 → 2 → 1 across consecutive daily ticks), then auto-end (`FindDueForAutoEnd`,
+  `review_due_at <= now`). Both finder queries filter `ends_at IS NULL` — a fixed-end-date delegation is
+  never considered by this cron at all. `MarkReviewWarned` marks-then-enqueues inside one tx per row; a
+  race on the mark is skipped, not failed. Auto-end follows the same User-Profile-first-then-defer
+  pattern as Expiry, and increments `iam_delegation_review_deferred_total` on every defer (GAP-27).
 - Cron-origin events are stamped with `ip_address="system"` and
   `user_agent="iam-delegation/<cron-name>-cron"` (`enqueueEvent` in `cmd/reconciler/jobs`) instead of
   a requestctx-derived actor — distinct from the HTTP-path `enqueue` helper in
@@ -94,7 +97,7 @@ outside the transaction, and is fire-and-forget (`//nolint:errcheck`) — the ro
 inert once the user has no membership (§7.6.5), so there's nothing to retry against; a failed clear
 here is not revisited by any cron (the expiry cron only scans still-*active* rows).
 
-## Cascade removal — `CascadeService.ScrubTenant` (`TenantOffboarded`)
+## Cascade removal — `CascadeService.ScrubTenant` (`TenantMembershipsPurged`)
 
 Two plain soft-delete calls (`delegations.SoftDeleteTenant`, `settings.SoftDeleteTenant`), no event
 emission at all — the LLD reasons that soft-deleted rows are inert, so nothing downstream needs to
@@ -128,8 +131,9 @@ to the caller. Don't assume retry-on-conflict semantics exist here without addin
 
 ## Shutdown ordering (`cmd/server/main.go`)
 
-The real order, inside an `errgroup` with one goroutine per: outbox runner, SQS consumer, HTTP
-server, and a shutdown-trigger goroutine that fires on `gCtx.Done()`:
+The real order, inside an `errgroup` with one goroutine per: outbox runner, SQS consumer, the
+outbox-prune sweep (DLG-D24), HTTP server, and a shutdown-trigger goroutine that fires on
+`gCtx.Done()`:
 
 1. `httpServer.Shutdown(shutdownCtx)` — stop accepting new requests, drain in-flight (30s budget).
    `shutdownCtx` is deliberately built from `context.Background()`, not derived from `gCtx` (which is
@@ -138,6 +142,12 @@ server, and a shutdown-trigger goroutine that fires on `gCtx.Done()`:
 3. `sqsConsumer.Stop()` — wait for in-flight cascade-consumer handlers.
 4. `g.Wait()` returns → the deferred `redisClient.Close()` in `run()` fires last.
 
-Simpler than a service with background sweep goroutines to cancel separately — this repo has no
-OOO-sweep-equivalent standalone background worker; expiry/review/cleanup are cron-triggered externally
-(CronJob → HTTP or CronJob binary), not long-running goroutines inside `cmd/server`.
+The outbox-prune goroutine has no explicit `Stop()` call in step 1-3: it's a plain
+`select { case <-gCtx.Done(): return nil; case <-ticker.C: ... }` loop, so it exits on its own the
+moment `gCtx` cancels (before the shutdown-trigger goroutine even starts running its steps) — there
+is nothing in-flight for it to drain, unlike the outbox runner/SQS consumer's explicit `Stop()`s.
+
+Since DLG-D24, this repo *does* have one long-running background sweep goroutine inside
+`cmd/server` (the outbox-prune sweep, matching `iam-user-profile`'s `runMaintenanceSweep`) — but
+expiry/review/cleanup are still cron-triggered externally (CronJob → HTTP or CronJob binary), not
+long-running goroutines inside `cmd/server`; only the outbox prune runs as a `cmd/server` ticker.

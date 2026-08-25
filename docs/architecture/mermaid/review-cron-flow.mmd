@@ -6,13 +6,14 @@ sequenceDiagram
     participant PG as Delegation Postgres
 
     CR->>DLG: POST /internal/delegations/review-sweep
-    DLG->>PG: Pass 1a (7d warn) WHERE ends_at IS NULL AND status=active AND review_due_at in (now()+3d, now()+7d] AND review_last_warned_bucket IS NULL
-    loop per 7d target
-        DLG->>PG: RunInTx { UPDATE review_last_warned_bucket=7, then outbox DelegationReviewRequested days_remaining=7 }
-    end
-    DLG->>PG: Pass 1b (3d warn) WHERE ends_at IS NULL AND status=active AND review_due_at in (now(), now()+3d] AND review_last_warned_bucket IS DISTINCT FROM 3
-    loop per 3d target
-        DLG->>PG: RunInTx { UPDATE review_last_warned_bucket=3, then outbox DelegationReviewRequested days_remaining=3 }
+    DLG->>PG: Pass 1 (daily cascade warn) WHERE ends_at IS NULL AND status=active AND review_due_at in (now(), now()+3d]
+    loop per target row
+        DLG->>DLG: days_remaining = CEIL((review_due_at - now()) / 1 day), clamped to [1,3]
+        alt review_last_warned_bucket IS DISTINCT FROM days_remaining
+            DLG->>PG: RunInTx { UPDATE review_last_warned_bucket=days_remaining AND status=active, then outbox DelegationReviewRequested{days_remaining} }
+        else already notified today
+            DLG->>DLG: skip (idempotent)
+        end
     end
     DLG->>PG: Pass 2 (auto-end) WHERE ends_at IS NULL AND status=active AND review_due_at <= now()
     loop per end target
@@ -23,4 +24,4 @@ sequenceDiagram
             DLG->>DLG: defer (DEL-6), retry next tick
         end
     end
-    DLG-->>CR: {warned_7d, warned_3d, expired, deferred}
+    DLG-->>CR: {warned_3d, warned_2d, warned_1d, expired, deferred}

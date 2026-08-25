@@ -27,12 +27,18 @@ cross-reference rather than duplicate here.
 
 ## Metrics — `internal/adapter/outbound/metrics/metrics.go`
 
-**KNOWN GAP (DLG-D19, `IMPLEMENTATION_NOTES.md`):** all ten instruments below are registered into
-`gincommon.MetricsRegisterer()` at `cmd/server` startup, but **no call site in
-`internal/core/service` or `cmd/reconciler/jobs` actually calls a `Metrics` method today.** The
-counters will report zero in any running environment until that wiring lands — do not assume they're
-live the way a fully-wired service's metrics would be. `cmd/reconciler` does not register or call any
-`Metrics` method at all (crons are short-lived processes with no Prometheus scrape endpoint).
+**PARTIALLY CLOSED (DLG-D19/GAP-27, `ARCHITECTURE.md`'s "Session-specific decisions"):** the two deferred-counter
+instruments (`iam_delegation_expiry_deferred_total`/`iam_delegation_review_deferred_total` — the
+ones the Prometheus alert actually watches) are wired: `cmd/reconciler/jobs.Context.Metrics` is
+called from `delegation_expiry.go`/`delegation_review.go` on every UP-failure defer, and
+`cmd/server/main.go` passes its real registered `*metrics.Metrics` in. The other eight instruments
+below still have **no call site in `internal/core/service`** — those counters will still report
+zero until a metrics-recorder parameter is threaded through `DelegationService`/`SettingsService`/
+`CascadeService`. `cmd/reconciler`'s standalone CronJob binary registers its own `*metrics.Metrics`
+too (for `jobs.Context` symmetry) but has no `/metrics` scrape endpoint, so its increments aren't
+exported anywhere — the alert-visible counters only actually reach Prometheus via `cmd/server`'s
+DLG-I1/I2 on-demand HTTP entry points (DLG-D17), which share the same `jobs.Context`-calling code
+and do have a live scrape target.
 
 | Metric | Type | Labels | Recorder method |
 |---|---|---|---|
@@ -84,10 +90,11 @@ IAM permission failures, and the `schema-gov` CLI (written this session, DLG-D20
 | Variable | Required | Default | Notes |
 |---|---|---|---|
 | `ENVIRONMENT` | No | `development` | |
-| `PORT` | No | `8080` | HTTP listen port — **not** `HTTP_PORT` (see Known dead config below) |
-| `DATABASE_URL` | Yes (via pgcommon) | — | App role (`delegation_app`, RLS-enforced, no BYPASSRLS) |
-| `MIGRATION_DATABASE_URL` | No | falls back to `DATABASE_URL` | BYPASSRLS role for the server's self-migration at startup |
-| `SYSTEM_DATABASE_URL` | No | falls back to `DATABASE_URL` with a startup warning | BYPASSRLS pool for cross-tenant reconciler/cron sweeps (`postgres.SystemDSNFromEnv`) — cross-tenant queries return 0 rows under RLS if unset |
+| `PORT` | No | `8080` | HTTP listen port — **not** `HTTP_PORT` (no dead config remains as of this pass, see below) |
+| `DATABASE_URL` | Yes (via pgcommon) | — | App role (`delegation_app`, RLS-enforced, no BYPASSRLS) — or set `PG_HOST`/`PG_PORT`/`PG_USER`/`PG_PASSWORD`/`PG_DBNAME`/`PG_SSLMODE` individually; both forms go through `pgcommon.ConfigFromEnv` via `postgres.DSNFromEnv` |
+| `MIGRATION_DATABASE_URL` | No | falls back to `postgres.DSNFromEnv()` | BYPASSRLS role for the server's self-migration at startup; must bypass PgBouncer |
+| `SYSTEM_DATABASE_URL` | No | falls back to `postgres.DSNFromEnv()` with a startup warning | BYPASSRLS pool for cross-tenant reconciler/cron sweeps (`postgres.SystemDSNFromEnv`) — cross-tenant queries return 0 rows under RLS if unset |
+| `PG_STATEMENT_TIMEOUT` | No | — | Go duration string (e.g. `5s`), appended to the app DSN's `options` query param as a millisecond `statement_timeout` (`postgres.ApplyStatementTimeout`); ignored when `DATABASE_URL` is set verbatim |
 | `PG_MAX_CONNS` / `PG_MIN_CONNS` / `PG_SLOW_QUERY_THRESHOLD` / `PG_BOUNCER_MODE` / `PG_SSLMODE` | No | pgcommon defaults | Standard `pgcommon.ConfigFromEnv` vars |
 | `VALKEY_ADDR` | No | `localhost:6379` | |
 | `IDEMPOTENCY_TTL_SECONDS` | No | `86400` (24h) | Create-idempotency-key TTL (DLG-Q3) — **not** `CACHE_IDEMPOTENCY_TTL_SECONDS` |
@@ -101,22 +108,21 @@ IAM permission failures, and the `schema-gov` CLI (written this session, DLG-D20
 | `AWS_REGION` | No | `us-east-1` | |
 | `AWS_ENDPOINT_URL` | No | — | LocalStack endpoint override, dev only |
 | `GLUE_REGISTRY_NAME` | No | `""` → `NoopCodec` | Set to `iam-delegation-events` to activate `GlueCodec` (added this session, DLG-D20) |
+| `OUTBOX_POLL_INTERVAL` / `OUTBOX_BATCH_SIZE` / `OUTBOX_MAX_ATTEMPTS` / `OUTBOX_DRAIN_TIMEOUT` / `OUTBOX_PUBLISH_CONCURRENCY` / `OUTBOX_PUBLISH_TIMEOUT` / `OUTBOX_STARTUP_JITTER` / `OUTBOX_CLAIM_LEASE_DURATION` | No | `500ms`/`50`/`5`/`30s`/`4`/`10s`/`2s`/`10m` | `outbox.Config` tunables — matches `iam-org-membership`'s identical env-var surface (DLG-D24) |
+| `OUTBOX_PRUNE_INTERVAL` / `OUTBOX_PRUNE_RETENTION` / `OUTBOX_PRUNE_LIMIT` | No | `24h` / `168h` (7d) / `1000` | Daily sweep calling `outbox.Runner.PrunePublished` — matches `iam-user-profile`'s `runMaintenanceSweep`; without it `outbox_events` grows unbounded (DLG-D24) |
 | `OTEL_EXPORTER_OTLP_ENDPOINT` | No | — | |
 | `DOCS_ENABLED` | No | `true` outside `production` | Gates `/swagger`, `/asyncapi` |
 | `DOCS_AUTH_TOKEN` | No | — | Bearer-gates docs routes when `DOCS_ENABLED=true` in production |
 | `POLICY_DEFAULT_MAX_DURATION_DAYS` / `POLICY_DEFAULT_REVIEW_WINDOW_DAYS` | No | `90` / `90` | Fallback tenant policy (DLG-D2) when no `delegation_tenant_settings` row exists |
 | `SCHEMA_GOV_IMAGE` | CI-only | pinned per workflow | `platform-schemagov` CLI image — see Schema Governance below |
 
-**Known dead config — set somewhere in the repo, read by NOTHING in Go code.** Found this session;
-not fixed as part of this doc pass:
-
-| Variable | Where it's set | Why it's dead |
-|---|---|---|
-| `HTTP_PORT`, `METRICS_PORT` | `deploy/helm/iam-delegation/values.yaml` | The real var is `PORT` (see table above); no separate metrics listener exists — `/metrics` is served on the same port as the API |
-| `CACHE_KEYSPACE`, `DATABASE_LOGICAL_NAME` | `values.yaml` | The `del:` keyspace prefix is hardcoded in Go, not env-configurable; `DATABASE_LOGICAL_NAME` has no reader |
-| `REVIEW_WARN_EARLY_DAYS`, `REVIEW_WARN_LATE_DAYS` | `values.yaml` | The 7-day/3-day warning buckets are **hardcoded literals** in `cmd/reconciler/jobs/delegation_review.go` (`warnBucket(ctx, jctx, 7, ...)` / `warnBucket(ctx, jctx, 3, ...)`) — these env vars do not parameterize anything |
-| `SQS_CONCURRENCY` | `values.yaml` | `consumer.NewCascadeSQSConsumer` uses hardcoded `cascadeQMaxMessages`/`cascadeQWaitSeconds` constants |
-| `EVENTS_TOPIC`, `EVENTS_SOURCE`, `SQS_QUEUE_URL`, `SQS_DLQ_URL` | `values.yaml` | **This is the same class of bug already fixed in `docker-compose.yml` this session** (renamed to `SNS_TOPIC_ARN`/`CASCADE_QUEUE_URL`, which `config.go` actually reads) — `deploy/helm/iam-delegation/values.yaml` was **not** updated to match and still sets these dead names instead of the two REQUIRED real ones. **As checked in, the production Helm chart's `env:` block does not set `SNS_TOPIC_ARN` or `CASCADE_QUEUE_URL` at all — `loadConfig()` will fail fast and the pod will crash-loop.** This needs the same fix `docker-compose.yml` got, applied to `values.yaml`; flagging here rather than fixing it as a side effect of writing this doc.
+**No known dead config as of this pass** — `deploy/helm/iam-delegation/values.yaml`'s `env:` block
+sets `SNS_TOPIC_ARN`/`CASCADE_QUEUE_URL` (the two `config.go` fail-fast-requires) and every other key
+in it has a live Go reader; the previously-flagged dead `HTTP_PORT`/`METRICS_PORT`/`CACHE_KEYSPACE`/
+`DATABASE_LOGICAL_NAME`/`REVIEW_WARN_EARLY_DAYS`/`REVIEW_WARN_LATE_DAYS`/`SQS_CONCURRENCY`/
+`EVENTS_TOPIC`/`EVENTS_SOURCE`/`SQS_QUEUE_URL`/`SQS_DLQ_URL` keys this section used to list have all
+been removed from `values.yaml`. Re-audit if `values.yaml` grows a new key — this note is a
+point-in-time finding, not a standing guarantee.
 
 # CI/CD
 
@@ -155,7 +161,7 @@ Read this before touching anything in `scripts/`, `.github/workflows/schema-regi
 Glue or event-schema validation.
 
 **Status: this repo is on the shared `platform-schemagov` tool as of this session (DLG-D20,
-`IMPLEMENTATION_NOTES.md`).** Before this session, `schema-registry.yml` ran a bespoke inline Python
+`ARCHITECTURE.md`'s "Session-specific decisions").** Before this session, `schema-registry.yml` ran a bespoke inline Python
 structural check (JSON Schema syntax + AsyncAPI shape only, no live Glue registry) — that has been
 fully replaced with the `platform-schemagov` CLI, invoked via `docker run schema-gov <command>`,
 mirroring `iam-user-profile`'s pipeline. This repo's registry is **`iam-delegation-events`** — a

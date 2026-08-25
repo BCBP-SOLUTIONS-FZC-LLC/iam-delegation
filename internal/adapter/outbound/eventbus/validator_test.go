@@ -58,7 +58,7 @@ func TestSchemaValidator_ValidPayloads(t *testing.T) {
 				"tenant_id":      "018f4c3e-a1b2-7000-9d3e-4f8c1a2b3d4f",
 				"delegator_id":   "018f4c3e-a1b2-7000-9d3e-4f8c1a2b3d50",
 				"delegate_id":    "018f4c3e-a1b2-7000-9d3e-4f8c1a2b3d51",
-				"days_remaining": 7,
+				"days_remaining": 3,
 				"actor_id":       "018f4c3e-a1b2-7000-9d3e-4f8c1a2b3d52"
 			}`,
 		},
@@ -123,11 +123,11 @@ func TestValidatePayload_MatchesMethodForm(t *testing.T) {
 		"actor_id":  "018f4c3e-a1b2-7000-9d3e-4f8c1a2b3d52"
 	}`)
 
-	// TenantOffboarded is a consumed type, deliberately not registered in
-	// this validator — confirms ValidatePayload surfaces the same
-	// "unregistered" error as calling v.Validate directly, rather than
+	// TenantMembershipsPurged is a consumed type, deliberately not
+	// registered in this validator — confirms ValidatePayload surfaces the
+	// same "unregistered" error as calling v.Validate directly, rather than
 	// silently succeeding.
-	err := ValidatePayload(ctx, v, domain.EventTenantOffboarded, payload)
+	err := ValidatePayload(ctx, v, domain.EventTenantMembershipsPurged, payload)
 	if err == nil {
 		t.Fatal("ValidatePayload() expected error for unregistered (consumed) event type, got nil")
 	}

@@ -140,6 +140,13 @@ func (g *GlueCodec) Encode(ctx context.Context, eventType string, payload json.R
 // encoded bytes at offset 2:18 — so it is not cross-checked against
 // anything here.
 func (g *GlueCodec) Decode(_ context.Context, _ string, encoded []byte) (json.RawMessage, error) {
+	return stripGlueHeader(encoded)
+}
+
+// stripGlueHeader removes the 18-byte Glue wire-format header, shared by
+// GlueCodec.Decode and GlueDecodeCodec.Decode below — stripping needs no
+// registry/schema-name context, only the fixed header layout.
+func stripGlueHeader(encoded []byte) (json.RawMessage, error) {
 	if len(encoded) < glueHeaderSize {
 		return nil, fmt.Errorf("glue codec: encoded payload is %d bytes — shorter than the %d-byte Glue header", len(encoded), glueHeaderSize)
 	}
@@ -147,6 +154,43 @@ func (g *GlueCodec) Decode(_ context.Context, _ string, encoded []byte) (json.Ra
 		return nil, fmt.Errorf("glue codec: unexpected header version byte 0x%02x — want 0x%02x", encoded[0], glueHeaderVersion)
 	}
 	return json.RawMessage(encoded[glueHeaderSize:]), nil
+}
+
+// GlueDecodeCodec decodes Glue-wire-format payloads WITHOUT a Glue client,
+// registry name, or schema names — stripping the header is fully
+// self-describing (see stripGlueHeader), so no registry lookup is needed to
+// decode, only to encode.
+//
+// This exists for the inbound delegation-cascade-q consumer: Core
+// (iam-org-membership) Glue-encodes MembershipRevoked/TenantMembershipsPurged
+// whenever ITS OWN GLUE_REGISTRY_MEMBERSHIP_NAME is set — which it is by
+// default in iam-org-membership's committed Helm values
+// (deploy/helm/values.yaml: GLUE_REGISTRY_MEMBERSHIP_NAME:
+// "iam-membership-events") — independently of whether THIS service's own
+// GLUE_REGISTRY_NAME (outbound publish side) is set. platform-events' SQS
+// consumer decodes an inbound envelope only when that envelope's SchemaID is
+// non-empty (internal/adapter/outbound/sqs/consumer.go); with no
+// events.WithConsumerCodec configured, a Glue-encoded message would fail
+// decode with "message has schema_id ... but no Codec is configured" on
+// every single delivery, retry to exhaustion, and land in
+// delegation-cascade-q-dlq — silently breaking the removal/tenant-purge
+// cascade (DEL-6/DEL-7). Wiring this codec unconditionally (cmd/server/
+// main.go) is safe in every environment: when the producer uses NoopCodec
+// (SchemaID empty, e.g. local/dev), Decode is never invoked at all.
+type GlueDecodeCodec struct{}
+
+var _ events.Codec = GlueDecodeCodec{}
+
+// Encode always errors — this codec is decode-only. The inbound SQS
+// consumer never calls Encode; a caller reaching this path has mistakenly
+// wired GlueDecodeCodec as a publish-time codec instead of GlueCodec.
+func (GlueDecodeCodec) Encode(_ context.Context, eventType string, _ json.RawMessage) (encoded []byte, schemaVersionID string, err error) {
+	return nil, "", fmt.Errorf("glue decode codec: Encode is not supported (decode-only, event type %q) — use GlueCodec to publish", eventType)
+}
+
+// Decode strips the 18-byte Glue wire-format header; see stripGlueHeader.
+func (GlueDecodeCodec) Decode(_ context.Context, _ string, encoded []byte) (json.RawMessage, error) {
+	return stripGlueHeader(encoded)
 }
 
 func (g *GlueCodec) versionID(ctx context.Context, eventType string) (string, error) {

@@ -205,7 +205,7 @@ func (h *DelegationHandler) Cancel(c *gin.Context) {
 // delegations only.
 //
 // @Summary      DLG-4 — Extend delegation review window
-// @Description  Pushes review_due_at forward and resets review_last_warned_bucket to NULL, re-arming both 7d/3d warnings. Open-ended delegations only (422 not_review_tracked otherwise).
+// @Description  Pushes review_due_at forward and resets review_last_warned_bucket to NULL, re-arming the 3-day daily cascade. Open-ended delegations only (422 not_review_tracked otherwise).
 // @Tags         delegations
 // @Accept       json
 // @Produce      json

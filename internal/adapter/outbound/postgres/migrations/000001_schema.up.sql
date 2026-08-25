@@ -3,7 +3,10 @@
 -- fail-closed RLS design (mirroring iam-user-profile's
 -- app_tenant_id()/rls_check_tenant()/log_rls_violation()/rls_violation_log
 -- pattern, NOT iam-tender-acl's simpler plain-policy pattern), the touch_row()
--- trigger, and the delegation_app / delegation_migrator roles.
+-- trigger, the delegation_app / delegation_migrator roles, and delegation_app's
+-- grant on platform-events' outbox_events table (created by outbox.ApplySchema,
+-- which cmd/server and cmd/reconciler both run before this migration — see
+-- postgres.Migrate).
 
 -- ── Extensions ────────────────────────────────────────────────────────────
 CREATE EXTENSION IF NOT EXISTS pgcrypto WITH SCHEMA public;
@@ -31,8 +34,9 @@ $$;
 -- ── delegations (LLD §7.2.1) ──────────────────────────────────────────────
 -- From O&M, with the three cross-database FKs removed and
 -- review_notice_sent_at replaced by review_last_warned_bucket (DLG-Q6): an
--- int (7|3|NULL) rather than a timestamp — which review notice fired this
--- cycle, reset to NULL on extend/reassign to re-arm both warnings.
+-- int (3|2|1|NULL) rather than a timestamp — the last days_remaining value
+-- notified in the 3-day daily cascade, reset to NULL on extend/reassign to
+-- re-arm the cascade.
 CREATE TABLE public.delegations (
     id                        uuid NOT NULL DEFAULT gen_random_uuid(),
     tenant_id                 uuid NOT NULL,
@@ -46,7 +50,7 @@ CREATE TABLE public.delegations (
     starts_at                 timestamp with time zone NOT NULL DEFAULT now(),
     ends_at                   timestamp with time zone,          -- NULL = open-ended (DEL-8)
     review_due_at             timestamp with time zone,          -- open-ended only (DEL-13)
-    review_last_warned_bucket int,                                -- 7 | 3 | NULL — which review notice fired this cycle (DLG-Q6)
+    review_last_warned_bucket int,                                -- 3 | 2 | 1 | NULL — last days_remaining value notified (DLG-Q6)
     review_window_days        int,                                -- per-delegation override (DEL-14)
     status                    public.delegation_status NOT NULL DEFAULT 'active',
     record_version            bigint NOT NULL DEFAULT 1,
@@ -55,7 +59,7 @@ CREATE TABLE public.delegations (
     deleted_at                timestamp with time zone,
     CONSTRAINT delegations_pkey                     PRIMARY KEY (id),
     CONSTRAINT delegations_record_version_check     CHECK (record_version > 0),
-    CONSTRAINT chk_review_last_warned_bucket         CHECK (review_last_warned_bucket IS NULL OR review_last_warned_bucket IN (7, 3)),
+    CONSTRAINT chk_review_last_warned_bucket         CHECK (review_last_warned_bucket IS NULL OR review_last_warned_bucket BETWEEN 1 AND 3),
     CONSTRAINT chk_review_window_days                CHECK (review_window_days IS NULL OR review_window_days BETWEEN 1 AND 180),
     CONSTRAINT chk_scope_id CHECK (
         (scope = 'all' AND scope_id IS NULL)
@@ -247,6 +251,13 @@ GRANT SELECT, INSERT, UPDATE, DELETE ON
 GRANT EXECUTE ON FUNCTION public.app_tenant_id()                     TO delegation_app;
 GRANT EXECUTE ON FUNCTION public.log_rls_violation(text, uuid, text) TO delegation_app;
 GRANT EXECUTE ON FUNCTION public.rls_check_tenant(uuid, text)        TO delegation_app;
+
+-- outbox_events is created by platform-events' own migration (outbox.ApplySchema),
+-- which postgres.Migrate runs before this one — so the table already exists by
+-- the time this GRANT runs. Without it the outbox runner (SELECT/UPDATE) and
+-- the application's INSERT both fail with "permission denied for table
+-- outbox_events" (SQLSTATE 42501).
+GRANT SELECT, INSERT, UPDATE, DELETE ON public.outbox_events TO delegation_app;
 
 -- delegation_migrator: applies schema migrations and backs the reconciler
 -- jobs / cascade consumer's cross-tenant reads (LLD §7.4). Holds BYPASSRLS.

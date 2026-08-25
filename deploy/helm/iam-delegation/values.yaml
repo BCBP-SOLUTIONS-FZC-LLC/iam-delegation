@@ -88,9 +88,10 @@ env:
   POLICY_DEFAULT_MAX_DURATION_DAYS: "90"
   POLICY_DEFAULT_REVIEW_WINDOW_DAYS: "90"
 
-  # Dual review-warning bucket (DLG-D7/DLG-Q6, §11.4) — the 7d/3d marks are
-  # compile-time literals in cmd/reconciler/jobs/delegation_review.go, not
-  # env-driven; no config knob exists for them.
+  # 3-day daily-cascade review warning (DLG-D7/DLG-Q6, §11.4) — the
+  # days_remaining ∈ {3,2,1} window is a compile-time literal in
+  # cmd/reconciler/jobs/delegation_review.go, not env-driven; no config knob
+  # exists for it.
 
   # Dedicated event topic (DLG-D5/DLG-Q1) — Core's AsyncAPI drops these
   # events entirely; this service is both producer and consumer (§6.3).
@@ -334,7 +335,7 @@ cronJobs:
         memory: 256Mi
   review:
     enabled: true
-    schedule: "0 * * * *"        # DLG-I2 (LLD §11.4) — dual 7d/3d warn, then auto-end
+    schedule: "0 * * * *"        # DLG-I2 (LLD §11.4) — 3-day daily-cascade warn, then auto-end
     jobName: delegation-review
     concurrencyPolicy: Forbid
     successfulJobsHistoryLimit: 3

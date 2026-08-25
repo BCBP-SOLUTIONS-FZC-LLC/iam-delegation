@@ -94,16 +94,22 @@ Unlike most O&M-extraction siblings, this is a structural highlight of the servi
 |---|---|---|
 | `DelegationStarted` | DLG-2 create, create-leg of DLG-5 reassign | **Workflow Service** (reroute — authoritative signal), Notification, Audit |
 | `DelegationEnded` | DLG-3 cancel, `ends_at` expiry (DLG-I1), review auto-end (DLG-I2), end-leg of DLG-5, delegate-removed cascade (§11.5) — `ended_reason ∈ {expired, cancelled, delegate_removed, review_expired}` | **Workflow Service** (restore), Notification, Audit |
-| `DelegationReviewRequested` | `delegation-review` sweep at 7d/3d marks — `days_remaining ∈ {7,3}` | Notification, Audit |
+| `DelegationReviewRequested` | `delegation-review` sweep — once per calendar day for each of the 3 days before `review_due_at` — `days_remaining ∈ {3,2,1}` | Notification, Audit |
 
 Cron-origin events carry system sentinels: `ip_address: "system"`, `user_agent: "iam-delegation/<job>-cron"`, `actor: SystemActorID`. The delegator-side end of a removal cascade is intentionally **silent — no event** (DEL-7 asymmetry, DLG-EVT-4) — only the delegate-side row emits `DelegationEnded`.
 
-## Consumed — `delegation-cascade-q` (one SQS queue, two upstream producers, two event types)
+Every published envelope carries `specversion: "1"` (`postgres.txBoundPublisher.EnqueueCtx` → `events.WithSchemaVersion("1")`, DLG-D24) — matching `iam-user-profile`/`iam-org-membership` exactly; this was missing before DLG-D24 and silently omitted from every event this service ever published.
+
+`outbox.Runner`'s own tunables (`PollInterval`/`BatchSize`/`MaxAttempts`/`DrainTimeout`/`PublishConcurrency`/`PublishTimeout`/`StartupJitter`/`ClaimLeaseDuration`) are `OUTBOX_*`-env-configurable (DLG-D24, matching `iam-org-membership`'s surface) rather than hardcoded. A fourth `cmd/server` background goroutine calls `outboxRunner.PrunePublished` on a ticker (`OUTBOX_PRUNE_INTERVAL`/`_RETENTION`/`_LIMIT`, default daily/7d/1000 rows, matching `iam-user-profile`'s `runMaintenanceSweep`) — without it, published `outbox_events` rows accumulate forever. `outbox_dead_letters_total` (the library's own dead-letter metric) is alerted on in both `deploy/helm/iam-delegation/templates/prometheusrule.yaml` and `deploy/monitoring/app-alerts.yml`.
+
+## Consumed — `delegation-cascade-q` (one SQS queue, one upstream producer, two event types)
 
 | Source topic | Event | Dispatched to | `processed_events.consumer` bucket |
 |---|---|---|---|
 | `iam.membership.events` | `MembershipRevoked` | `CascadeService.EndForUser` (§11.5) | `"cascade"` |
-| `iam.tenant.events` | `TenantOffboarded` | `CascadeService.ScrubTenant` (§11.6) | `"offboarding"` |
+| `iam.membership.events` | `TenantMembershipsPurged` | `CascadeService.ScrubTenant` (§11.6) | `"offboarding"` |
+
+Both event types are produced by Core / Org & Membership on the same topic. `TenantMembershipsPurged` was renamed from `TenantOffboarded` by Core to avoid colliding with Realm Provisioner's own, differently-scoped `TenantOffboarded` event on `iam.tenant.events`, which this service does not consume.
 
 Two distinct idempotency buckets (not one hardcoded consumer name like `iam-user-profile`'s single-subscription case) — `internal/adapter/inbound/consumer/cascade_consumer.go`'s `consumerCascade = "cascade"` / offboarding equivalent, keyed into `processed_events (event_id, consumer)`. DLQ: `delegation-cascade-q-dlq`, `maxReceiveCount=5`.
 

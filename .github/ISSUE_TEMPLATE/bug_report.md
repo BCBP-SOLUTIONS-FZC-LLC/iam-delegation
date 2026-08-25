@@ -25,7 +25,7 @@ A clear description of the bug.
 - [ ] HTTP API (endpoint: `METHOD /api/v1/delegations...`)
 - [ ] Internal API (endpoint: `METHOD /internal/...`)
 - [ ] Event publishing (event type: `Delegation*`)
-- [ ] Cascade consumer (`delegation-cascade-q` — `MembershipRevoked`/`TenantOffboarded`)
+- [ ] Cascade consumer (`delegation-cascade-q` — `MembershipRevoked`/`TenantMembershipsPurged`)
 - [ ] Reconciler (`delegation-expiry` / `delegation-review` / `delegation-cleanup`)
 - [ ] Cache (Valkey)
 - [ ] Database / migrations / RLS

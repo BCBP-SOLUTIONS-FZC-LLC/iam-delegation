@@ -2,7 +2,6 @@ package http
 
 import (
 	"context"
-	"log/slog"
 	"net/http"
 	"strings"
 
@@ -64,31 +63,16 @@ type Router struct {
 	engine *gin.Engine
 }
 
-// slogPlatformLogger adapts *slog.Logger to the map[string]interface{}-based
-// Logger interface both platform-gincommon's and platform-events' Config
-// structs expect (identical method shape in both libraries, structurally
-// satisfied here without importing either library's internal port package).
-type slogPlatformLogger struct{ l *slog.Logger }
-
-func (a slogPlatformLogger) Debug(msg string, fields map[string]interface{}) {
-	a.l.Debug(msg, mapToArgs(fields)...)
-}
-func (a slogPlatformLogger) Info(msg string, fields map[string]interface{}) {
-	a.l.Info(msg, mapToArgs(fields)...)
-}
-func (a slogPlatformLogger) Warn(msg string, fields map[string]interface{}) {
-	a.l.Warn(msg, mapToArgs(fields)...)
-}
-func (a slogPlatformLogger) Error(msg string, fields map[string]interface{}) {
-	a.l.Error(msg, mapToArgs(fields)...)
-}
-
-func mapToArgs(fields map[string]interface{}) []any {
-	args := make([]any, 0, len(fields)*2)
-	for k, v := range fields {
-		args = append(args, k, v)
-	}
-	return args
+// Logger is the map[string]interface{}-based logging interface both
+// platform-gincommon's and platform-events' Config structs expect
+// (identical method shape in both libraries, structurally satisfied by the
+// Zap-backed logger platform-gincommon/pkg/logger.NewLogger returns without
+// any adapter — cmd/server passes that value straight through here).
+type Logger interface {
+	Debug(msg string, fields map[string]interface{})
+	Info(msg string, fields map[string]interface{})
+	Warn(msg string, fields map[string]interface{})
+	Error(msg string, fields map[string]interface{})
 }
 
 // NewRouter wires every route: the public delegation API (DLG-1…7,
@@ -102,7 +86,7 @@ func NewRouter(
 	postgres PostgresHealth,
 	cache Pinger,
 	outbox Pinger,
-	logger *slog.Logger,
+	logger Logger,
 	tracing *gincommon.TracingOptions,
 	docs DocsConfig,
 	bindTenantGUC BindTenantGUC,
@@ -110,8 +94,7 @@ func NewRouter(
 	gin.SetMode(gin.ReleaseMode)
 	engine := gin.New()
 
-	platformLogger := slogPlatformLogger{l: logger}
-	cfg := gincommon.Config{Logger: platformLogger, ServiceName: "delegation", Tracing: tracing}
+	cfg := gincommon.Config{Logger: logger, ServiceName: "delegation", Tracing: tracing}
 
 	// Observability (recovery/request-id/tracing/metrics/correlation/
 	// logging) applies to every route, including /internal/*. Auth
