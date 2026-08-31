@@ -1,12 +1,14 @@
 package http
 
 import (
+	"encoding/json"
 	"errors"
 	"net/http"
 	"net/http/httptest"
 	"testing"
 
 	"github.com/gin-gonic/gin"
+	"github.com/stretchr/testify/require"
 
 	"github.com/BCBP-SOLUTIONS-FZC-LLC/iam-delegation/internal/core/domain"
 )
@@ -79,6 +81,22 @@ func TestHandleError_UnrecognizedError(t *testing.T) {
 	}
 }
 
+// TestHandleError_DetailsPassedThrough confirms BUG-01 is NOT a bug:
+// HandleError correctly passes WithDetails data through to the response.
+func TestHandleError_DetailsPassedThrough(t *testing.T) {
+	c, w := newTestGinContext()
+	err := domain.NewError(domain.ErrDelegationWindowTooLong, "too long").
+		WithDetails(map[string]any{"max_duration_days": 90})
+	HandleError(c, err)
+	require.Equal(t, http.StatusUnprocessableEntity, w.Code)
+
+	var body map[string]any
+	require.NoError(t, json.Unmarshal(w.Body.Bytes(), &body))
+	details, ok := body["details"].(map[string]any)
+	require.True(t, ok, "response must include 'details' field when set on the error")
+	require.Equal(t, float64(90), details["max_duration_days"])
+}
+
 // TestHandleError_WrappedSentinel asserts errors.As still finds the
 // *domain.Error even when it has been wrapped by an intermediate caller
 // (fmt.Errorf("...: %w", derr)).
@@ -88,5 +106,16 @@ func TestHandleError_WrappedSentinel(t *testing.T) {
 	HandleError(c, wrapped)
 	if w.Code != http.StatusNotFound {
 		t.Fatalf("got status %d, want %d", w.Code, http.StatusNotFound)
+	}
+}
+
+// TestHandleError_UnknownDomainCode_Returns500 covers the fallback branch in
+// HandleError when a *domain.Error carries a code not present in errorStatusByCode
+// (e.g. a future sentinel added before the map is updated).
+func TestHandleError_UnknownDomainCode_Returns500(t *testing.T) {
+	c, w := newTestGinContext()
+	HandleError(c, &domain.Error{Code: "some_future_code_not_in_map", Message: "future"})
+	if w.Code != http.StatusInternalServerError {
+		t.Fatalf("got status %d, want 500 for unrecognized code", w.Code)
 	}
 }

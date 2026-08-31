@@ -2,6 +2,7 @@ package postgres
 
 import (
 	"context"
+	"errors"
 	"testing"
 	"time"
 
@@ -344,4 +345,166 @@ func TestDelegationRepository_HardPurgeSoftDeletedBefore(t *testing.T) {
 
 	require.NoError(t, db.Raw.QueryRow(ctx, `SELECT count(*) FROM delegations WHERE id IN ($1, $2)`, recent, notDeleted).Scan(&count))
 	assert.Equal(t, 2, count, "recent and non-deleted rows must survive")
+}
+
+// ── Context-cancellation tests (covers scan/query error paths) ────────────
+
+func TestDelegationRepository_FindByID_CancelledContext_ReturnsError(t *testing.T) {
+	db := setupTestDB(t)
+	repo := NewDelegationRepository(db.App)
+	tenantID := uuid.New()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel() // pre-cancelled
+
+	_, err := repo.FindByID(withTenant(ctx, tenantID), tenantID, uuid.New())
+	require.Error(t, err)
+}
+
+func TestDelegationRepository_ListWhere_CancelledContext_ReturnsError(t *testing.T) {
+	db := setupTestDB(t)
+	repo := NewDelegationRepository(db.App)
+	tenantID := uuid.New()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	_, err := repo.ListByDelegator(withTenant(ctx, tenantID), tenantID, uuid.New())
+	require.Error(t, err)
+}
+
+func TestDelegationRepository_EndForUser_CancelledContext_ReturnsError(t *testing.T) {
+	db := setupTestDB(t)
+	repo := NewDelegationRepository(db.App)
+	tenantID := uuid.New()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	_, err := repo.EndForUser(withTenant(ctx, tenantID), tenantID, uuid.New())
+	require.Error(t, err)
+}
+
+func TestDelegationRepository_HardPurgeSoftDeletedBefore_CancelledContext_ReturnsError(t *testing.T) {
+	db := setupTestDB(t)
+	repo := NewDelegationRepository(db.Bypass)
+	tenantID := uuid.New()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	_, err := repo.HardPurgeSoftDeletedBefore(withTenant(ctx, tenantID), time.Now(), 100)
+	require.Error(t, err)
+}
+
+func TestDelegationRepository_ExtendReview_NotFound_ReturnsError(t *testing.T) {
+	db := setupTestDB(t)
+	ctx := context.Background()
+	repo := NewDelegationRepository(db.App)
+	tenantID := uuid.New()
+	gucCtx := withTenant(ctx, tenantID)
+
+	// Non-existent delegation → probe returns ErrNoRows → ErrDelegationNotFound
+	_, err := repo.ExtendReview(gucCtx, tenantID, uuid.New(), 30, 1)
+	require.Error(t, err)
+	var de *domain.Error
+	if errors.As(err, &de) {
+		require.Equal(t, domain.ErrDelegationNotFound.Error(), de.Code)
+	}
+}
+
+func TestDelegationRepository_ExtendReview_WrongVersion_ReturnsConflict(t *testing.T) {
+	db := setupTestDB(t)
+	ctx := context.Background()
+	repo := NewDelegationRepository(db.App)
+	tenantID := uuid.New()
+	gucCtx := withTenant(ctx, tenantID)
+
+	// Seed an open-ended active delegation (ExtendReview requires ends_at IS NULL)
+	id := seedDelegation(t, ctx, db.Raw, seedDelegationOpts{
+		TenantID: tenantID, Status: "active",
+	})
+
+	// Use wrong version (99) → UPDATE affects zero rows → probe → OCC conflict
+	_, err := repo.ExtendReview(gucCtx, tenantID, id, 30, 99)
+	require.Error(t, err)
+	var de *domain.Error
+	if errors.As(err, &de) {
+		require.Equal(t, domain.ErrOptimisticLockConflict.Error(), de.Code)
+	}
+}
+
+func TestDelegationRepository_MarkReviewWarned_NotFound_ReturnsError(t *testing.T) {
+	db := setupTestDB(t)
+	ctx := context.Background()
+	repo := NewDelegationRepository(db.App)
+	tenantID := uuid.New()
+	gucCtx := withTenant(ctx, tenantID)
+
+	// Non-existent row → zero rows → probe → ErrDelegationNotFound
+	err := repo.MarkReviewWarned(gucCtx, tenantID, uuid.New(), 3, 1)
+	require.Error(t, err)
+}
+
+func TestDelegationRepository_Insert_Duplicate_ReturnsError(t *testing.T) {
+	db := setupTestDB(t)
+	ctx := context.Background()
+	repo := NewDelegationRepository(db.App)
+	tenantID := uuid.New()
+	gucCtx := withTenant(ctx, tenantID)
+	id := uuid.New()
+
+	first := &domain.Delegation{
+		ID: id, TenantID: tenantID, DelegatorID: uuid.New(), DelegateID: uuid.New(),
+		Scope: domain.ScopeAll, Status: domain.DelegationActive,
+		StartsAt: time.Now().UTC(),
+	}
+	_, err := repo.Insert(gucCtx, first)
+	require.NoError(t, err)
+
+	second := *first
+	_, err = repo.Insert(gucCtx, &second)
+	require.Error(t, err, "duplicate insert must fail")
+}
+
+func TestDelegationRepository_ExtendReview_HasEndsAt_ReturnsNotReviewTracked(t *testing.T) {
+	db := setupTestDB(t)
+	ctx := context.Background()
+	repo := NewDelegationRepository(db.App)
+	tenantID := uuid.New()
+	gucCtx := withTenant(ctx, tenantID)
+
+	// Seed a delegation WITH ends_at set (not open-ended) — ExtendReview should fail
+	endsAt := time.Now().Add(48 * time.Hour).UTC()
+	id := seedDelegation(t, ctx, db.Raw, seedDelegationOpts{
+		TenantID: tenantID, Status: "active", EndsAt: &endsAt,
+	})
+
+	// Use wrong version so the UPDATE fails → probe reveals ends_at != nil
+	_, err := repo.ExtendReview(gucCtx, tenantID, id, 30, 99)
+	require.Error(t, err)
+	var de *domain.Error
+	if errors.As(err, &de) {
+		require.Equal(t, domain.ErrNotReviewTracked.Error(), de.Code)
+	}
+}
+
+func TestDelegationRepository_ExtendReview_EndedStatus_ReturnsNotFound(t *testing.T) {
+	db := setupTestDB(t)
+	ctx := context.Background()
+	repo := NewDelegationRepository(db.App)
+	tenantID := uuid.New()
+	gucCtx := withTenant(ctx, tenantID)
+
+	// Seed a delegation with status=ended and no ends_at → probe reveals s != 'active'
+	id := seedDelegation(t, ctx, db.Raw, seedDelegationOpts{
+		TenantID: tenantID, Status: "ended",
+	})
+
+	_, err := repo.ExtendReview(gucCtx, tenantID, id, 30, 99)
+	require.Error(t, err)
+	var de *domain.Error
+	if errors.As(err, &de) {
+		require.Equal(t, domain.ErrDelegationNotFound.Error(), de.Code)
+	}
 }

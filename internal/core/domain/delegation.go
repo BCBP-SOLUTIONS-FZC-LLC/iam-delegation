@@ -35,10 +35,11 @@ const (
 // added over the pre-extraction O&M enum.
 type EndReason string
 
-// The four ended_reason values (DEL-7, DLG-D6/DLG-Q5).
+// The five ended_reason values (DEL-7, DLG-D6/DLG-Q5).
 const (
 	EndReasonExpired         EndReason = "expired"
 	EndReasonCancelled       EndReason = "cancelled"
+	EndReasonReassigned      EndReason = "reassigned"
 	EndReasonDelegateRemoved EndReason = "delegate_removed"
 	EndReasonReviewExpired   EndReason = "review_expired"
 )

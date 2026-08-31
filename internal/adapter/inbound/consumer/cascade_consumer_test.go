@@ -244,3 +244,194 @@ func TestHandle_UnknownEventType_AcksWithoutDispatching(t *testing.T) {
 		t.Fatalf("MarkProcessed should not have been called for an unknown event type")
 	}
 }
+
+// FM-CASC-01: MembershipRevoked with zero active delegations → cascade is no-op
+func TestHandle_MembershipRevoked_NoActiveDelegations_NoOp(t *testing.T) {
+	cascade := &fakeCascadeService{} // EndForUser returns nil (no error, no delegations ended)
+	idem := newFakeIdempotencyStore()
+	c := NewCascadeConsumer(cascade, idem, fakeGUCBinder(&[]gucBindCall{}), noopLogger{})
+
+	tenantID, userID := uuid.New(), uuid.New()
+	eventID := uuid.New().String()
+	env := mustEnvelope(t, eventID, domain.EventMembershipRevoked, domain.MembershipRevokedPayload{
+		TenantID: tenantID, UserID: userID, ActorID: uuid.New(),
+	})
+
+	if err := c.Handle(context.Background(), env); err != nil {
+		t.Fatalf("Handle must not error when there are no active delegations: %v", err)
+	}
+	if len(cascade.endForUserCalls) != 1 {
+		t.Fatalf("EndForUser must still be called even when there are no rows: got %d calls", len(cascade.endForUserCalls))
+	}
+	if !idem.processed[consumerCascade+":"+eventID] {
+		t.Fatalf("event must be marked processed even on a no-op cascade")
+	}
+}
+
+// CASC-MR-03: delegator-side delegations are silently ended by the cascade service;
+// the consumer's job is to correctly dispatch to EndForUser and trust the service.
+func TestHandle_MembershipRevoked_DelegateSideEmitsEvent_DelegatorSideDoesNot(t *testing.T) {
+	// This test exercises the consumer dispatch path. The asymmetric event logic
+	// (delegate-side emits DelegationEnded, delegator-side is silent) lives in
+	// CascadeService.EndForUser and is covered by cascade_service_test.go.
+	// Here we verify the consumer always dispatches to EndForUser without
+	// second-guessing which rows are affected.
+	cascade := &fakeCascadeService{}
+	idem := newFakeIdempotencyStore()
+	c := NewCascadeConsumer(cascade, idem, fakeGUCBinder(&[]gucBindCall{}), noopLogger{})
+
+	tenantID, userID := uuid.New(), uuid.New()
+	env := mustEnvelope(t, uuid.New().String(), domain.EventMembershipRevoked, domain.MembershipRevokedPayload{
+		TenantID: tenantID, UserID: userID, ActorID: uuid.New(),
+	})
+
+	if err := c.Handle(context.Background(), env); err != nil {
+		t.Fatalf("Handle returned error: %v", err)
+	}
+	if len(cascade.endForUserCalls) != 1 || cascade.endForUserCalls[0].userID != userID {
+		t.Fatalf("consumer must dispatch EndForUser with the revoked userID; got %+v", cascade.endForUserCalls)
+	}
+}
+
+// CASC-TO-02 / FM-CASC-02: TenantOffboarded → no DelegationEnded event emitted by consumer
+// (events are the cascade service's responsibility; consumer only dispatches).
+func TestHandle_TenantMembershipsPurged_ConsumerOnlyDispatches(t *testing.T) {
+	cascade := &fakeCascadeService{}
+	idem := newFakeIdempotencyStore()
+	c := NewCascadeConsumer(cascade, idem, fakeGUCBinder(&[]gucBindCall{}), noopLogger{})
+
+	tenantID := uuid.New()
+	eventID := uuid.New().String()
+	env := mustEnvelope(t, eventID, domain.EventTenantMembershipsPurged, domain.TenantMembershipsPurgedPayload{
+		TenantID: tenantID, ActorID: uuid.New(),
+	})
+
+	if err := c.Handle(context.Background(), env); err != nil {
+		t.Fatalf("Handle returned error: %v", err)
+	}
+	if len(cascade.scrubTenantCalls) != 1 || cascade.scrubTenantCalls[0] != tenantID {
+		t.Fatalf("consumer must dispatch ScrubTenant with tenantID; got %+v", cascade.scrubTenantCalls)
+	}
+	if len(cascade.endForUserCalls) != 0 {
+		t.Fatalf("consumer must not call EndForUser for TenantMembershipsPurged")
+	}
+}
+
+// FM-CASC-05: IsProcessed DB error → Handle returns error, cascade NOT applied
+func TestHandle_IsProcessedError_ReturnsError(t *testing.T) {
+	cascade := &fakeCascadeService{}
+	idem := newFakeIdempotencyStore()
+	idem.isProcessedErr = errors.New("valkey unavailable")
+	c := NewCascadeConsumer(cascade, idem, fakeGUCBinder(&[]gucBindCall{}), noopLogger{})
+
+	env := mustEnvelope(t, uuid.New().String(), domain.EventMembershipRevoked, domain.MembershipRevokedPayload{
+		TenantID: uuid.New(), UserID: uuid.New(), ActorID: uuid.New(),
+	})
+
+	if err := c.Handle(context.Background(), env); err == nil {
+		t.Fatalf("Handle must return an error when IsProcessed fails (idempotency check is mandatory)")
+	}
+	if len(cascade.endForUserCalls) != 0 {
+		t.Fatalf("cascade must not proceed when idempotency check fails; got %d calls", len(cascade.endForUserCalls))
+	}
+}
+
+// FM-CASC-06: malformed MembershipRevoked JSON payload → Handle returns error (routes to DLQ)
+func TestHandle_MalformedPayload_ReturnsError(t *testing.T) {
+	cascade := &fakeCascadeService{}
+	idem := newFakeIdempotencyStore()
+	c := NewCascadeConsumer(cascade, idem, fakeGUCBinder(&[]gucBindCall{}), noopLogger{})
+
+	// valid envelope ID (UUID), valid type, but payload is malformed JSON
+	env := events.Envelope[json.RawMessage]{
+		ID:      uuid.New().String(),
+		Type:    domain.EventMembershipRevoked,
+		Payload: json.RawMessage(`{"not valid json`),
+	}
+
+	if err := c.Handle(context.Background(), env); err == nil {
+		t.Fatalf("Handle must return an error for a malformed payload so SQS routes it to the DLQ")
+	}
+	if len(cascade.endForUserCalls) != 0 {
+		t.Fatalf("cascade must not proceed with a malformed payload")
+	}
+}
+
+// FM-CASC-10: MarkProcessed error propagates out of Handle
+func TestHandle_MarkProcessedError_Propagates(t *testing.T) {
+	cascade := &fakeCascadeService{}
+	idem := newFakeIdempotencyStore()
+	idem.markProcessedErr = errors.New("db error on mark")
+	c := NewCascadeConsumer(cascade, idem, fakeGUCBinder(&[]gucBindCall{}), noopLogger{})
+
+	tenantID, userID := uuid.New(), uuid.New()
+	payload, _ := json.Marshal(domain.MembershipRevokedPayload{TenantID: tenantID, UserID: userID})
+	env := events.Envelope[json.RawMessage]{
+		ID:      uuid.New().String(),
+		Type:    domain.EventMembershipRevoked,
+		Payload: payload,
+	}
+
+	if err := c.Handle(context.Background(), env); err == nil {
+		t.Fatal("Handle must propagate MarkProcessed error")
+	}
+	// The cascade DID run (dispatch happened before MarkProcessed)
+	if len(cascade.endForUserCalls) == 0 {
+		t.Fatal("EndForUser must be called before MarkProcessed fails")
+	}
+}
+
+// FM-CASC-07: invalid/empty envelope ID → Handle acknowledges without dispatching
+func TestHandle_InvalidEnvelopeID_AcknowledgesWithoutDispatch(t *testing.T) {
+	cascade := &fakeCascadeService{}
+	idem := newFakeIdempotencyStore()
+	c := NewCascadeConsumer(cascade, idem, fakeGUCBinder(&[]gucBindCall{}), noopLogger{})
+
+	env := events.Envelope[json.RawMessage]{
+		ID:   "not-a-uuid",
+		Type: domain.EventMembershipRevoked,
+	}
+	if err := c.Handle(context.Background(), env); err != nil {
+		t.Fatalf("Handle with invalid envelope ID must ack (return nil), got: %v", err)
+	}
+	if len(cascade.endForUserCalls) != 0 {
+		t.Fatalf("cascade must not be called for an envelope with an invalid ID")
+	}
+}
+
+// FM-CASC-08: malformed TenantMembershipsPurged payload → Handle returns error
+func TestHandle_TenantMembershipsPurged_MalformedPayload_ReturnsError(t *testing.T) {
+	cascade := &fakeCascadeService{}
+	idem := newFakeIdempotencyStore()
+	c := NewCascadeConsumer(cascade, idem, fakeGUCBinder(&[]gucBindCall{}), noopLogger{})
+
+	env := events.Envelope[json.RawMessage]{
+		ID:      uuid.New().String(),
+		Type:    domain.EventTenantMembershipsPurged,
+		Payload: json.RawMessage(`{bad json`),
+	}
+	if err := c.Handle(context.Background(), env); err == nil {
+		t.Fatal("Handle must return error for malformed TenantMembershipsPurged payload")
+	}
+	if len(cascade.scrubTenantCalls) != 0 {
+		t.Fatalf("ScrubTenant must not be called on bad payload")
+	}
+}
+
+// FM-CASC-09: ScrubTenant error propagates through Handle
+func TestHandle_TenantMembershipsPurged_ScrubTenantError_Propagates(t *testing.T) {
+	cascade := &fakeCascadeService{scrubTenantErr: errors.New("db error")}
+	idem := newFakeIdempotencyStore()
+	c := NewCascadeConsumer(cascade, idem, fakeGUCBinder(&[]gucBindCall{}), noopLogger{})
+
+	tenantID := uuid.New()
+	payload, _ := json.Marshal(domain.TenantMembershipsPurgedPayload{TenantID: tenantID})
+	env := events.Envelope[json.RawMessage]{
+		ID:      uuid.New().String(),
+		Type:    domain.EventTenantMembershipsPurged,
+		Payload: payload,
+	}
+	if err := c.Handle(context.Background(), env); err == nil {
+		t.Fatal("Handle must propagate ScrubTenant error")
+	}
+}

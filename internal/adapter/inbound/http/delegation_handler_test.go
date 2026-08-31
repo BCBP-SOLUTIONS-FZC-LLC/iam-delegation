@@ -84,6 +84,26 @@ func TestDelegationHandler_List(t *testing.T) {
 		require.Equal(t, d.ID, resp.Items[0].DelegationID)
 		require.Equal(t, "all", resp.Items[0].Scope)
 	})
+
+	// USER-12: DLG-1 only returns what the service returns (active-only, scope-limited)
+	t.Run("DLG-1 returns only what service provides - no history (USER-12)", func(t *testing.T) {
+		active := domain.Delegation{ID: uuid.New(), TenantID: tenantID, DelegatorID: userID, DelegateID: uuid.New(),
+			Scope: domain.ScopeAll, Status: domain.DelegationActive, StartsAt: time.Now(), RecordVersion: 2}
+		svc := &fakeDelegationService{
+			listFn: func(ctx context.Context, gotTenant, gotDelegator uuid.UUID) ([]domain.Delegation, error) {
+				// service is responsible for filtering; handler passes through whatever it returns
+				return []domain.Delegation{active}, nil
+			},
+		}
+		h := NewDelegationHandler(svc, &fakeDelegationReader{})
+		c, w := newRequestWithIdentity(http.MethodGet, "/api/v1/delegations", nil, selfRC(userID, tenantID))
+		h.List(c)
+		require.Equal(t, http.StatusOK, w.Code)
+		var resp DelegationListResponse
+		require.NoError(t, json.Unmarshal(w.Body.Bytes(), &resp))
+		require.Len(t, resp.Items, 1)
+		require.Equal(t, string(domain.DelegationActive), resp.Items[0].Status)
+	})
 }
 
 // ── Create (DLG-2) ──────────────────────────────────────────────────────
@@ -117,6 +137,43 @@ func TestDelegationHandler_Create(t *testing.T) {
 		c, w := newRequestWithIdentity(http.MethodPost, "/api/v1/delegations", bytes.NewReader(raw), selfRC(userID, tenantID))
 		h.Create(c)
 		require.Equal(t, http.StatusUnprocessableEntity, w.Code)
+	})
+
+	// FM-HDR-01: idempotency replay returns 201, not 200
+	t.Run("idempotency replay returns 201 (FM-HDR-01)", func(t *testing.T) {
+		existing := domain.Delegation{
+			ID: uuid.New(), TenantID: tenantID, DelegatorID: userID, DelegateID: delegateID,
+			Scope: domain.ScopeAll, Status: domain.DelegationActive, RecordVersion: 1,
+		}
+		svc := &fakeDelegationService{
+			createFn: func(ctx context.Context, gotTenant, gotDelegator uuid.UUID, idempotencyKey string, req service.CreateInput) (*domain.Delegation, error) {
+				return &existing, nil // simulate idempotency replay returning same delegation
+			},
+		}
+		h := NewDelegationHandler(svc, &fakeDelegationReader{})
+		body, _ := json.Marshal(DelegationCreateRequest{DelegateID: delegateID, Scope: "all"})
+		c, w := newRequestWithIdentity(http.MethodPost, "/api/v1/delegations", bytes.NewReader(body), selfRC(userID, tenantID))
+		c.Request.Header.Set("Idempotency-Key", "replay-key")
+		h.Create(c)
+		require.Equal(t, http.StatusCreated, w.Code) // 201, not 200
+	})
+
+	// TEST-01: wire field is 'ooo_note', not 'reason'
+	t.Run("ooo_note wire field maps to reason (TEST-01)", func(t *testing.T) {
+		var gotReason string
+		svc := &fakeDelegationService{
+			createFn: func(ctx context.Context, gotTenant, gotDelegator uuid.UUID, idempotencyKey string, req service.CreateInput) (*domain.Delegation, error) {
+				gotReason = req.Reason
+				return &domain.Delegation{ID: uuid.New(), TenantID: tenantID, DelegatorID: userID, DelegateID: delegateID, Scope: domain.ScopeAll, Status: domain.DelegationActive}, nil
+			},
+		}
+		h := NewDelegationHandler(svc, &fakeDelegationReader{})
+		raw := []byte(`{"delegate_id":"` + delegateID.String() + `","scope":"all","ooo_note":"annual leave"}`)
+		c, w := newRequestWithIdentity(http.MethodPost, "/api/v1/delegations", bytes.NewReader(raw), selfRC(userID, tenantID))
+		c.Request.Header.Set("Idempotency-Key", "k1")
+		h.Create(c)
+		require.Equal(t, http.StatusCreated, w.Code)
+		require.Equal(t, "annual leave", gotReason)
 	})
 
 	t.Run("happy path -> 201 with exact shape, idempotency key forwarded", func(t *testing.T) {
@@ -259,6 +316,47 @@ func TestDelegationHandler_Cancel(t *testing.T) {
 		h.Cancel(c)
 		require.Equal(t, http.StatusConflict, w.Code)
 	})
+
+	// FM-HDR-02: absent record_version defaults to 0 → OCC → 409
+	t.Run("absent record_version defaults to 0 gives OCC 409 (FM-HDR-02)", func(t *testing.T) {
+		reader := &fakeDelegationReader{
+			findByIDFn: func(ctx context.Context, tenantID, id uuid.UUID) (*domain.Delegation, error) {
+				return &domain.Delegation{ID: id, TenantID: tenantID, DelegatorID: delegatorID}, nil
+			},
+		}
+		svc := &fakeDelegationService{
+			cancelFn: func(ctx context.Context, tenantID, id uuid.UUID, expectedVersion int64) (*domain.Delegation, error) {
+				require.Equal(t, int64(0), expectedVersion)
+				return nil, domain.NewError(domain.ErrOptimisticLockConflict, "version 0 is stale")
+			},
+		}
+		h := NewDelegationHandler(svc, reader)
+		// no ?record_version query param
+		c, w := newRequestWithIdentity(http.MethodDelete, "/api/v1/delegations/"+delegationID.String(), nil, selfRC(delegatorID, tenantID))
+		setPathParam(c, "id", delegationID.String())
+		h.Cancel(c)
+		require.Equal(t, http.StatusConflict, w.Code)
+	})
+
+	// TEST-03 / FM-HDR-03: non-integer record_version defaults to 0 → OCC → 409
+	t.Run("non-integer record_version defaults to 0 gives OCC 409 (TEST-03/FM-HDR-03)", func(t *testing.T) {
+		reader := &fakeDelegationReader{
+			findByIDFn: func(ctx context.Context, tenantID, id uuid.UUID) (*domain.Delegation, error) {
+				return &domain.Delegation{ID: id, TenantID: tenantID, DelegatorID: delegatorID}, nil
+			},
+		}
+		svc := &fakeDelegationService{
+			cancelFn: func(ctx context.Context, tenantID, id uuid.UUID, expectedVersion int64) (*domain.Delegation, error) {
+				require.Equal(t, int64(0), expectedVersion)
+				return nil, domain.NewError(domain.ErrOptimisticLockConflict, "version 0 is stale")
+			},
+		}
+		h := NewDelegationHandler(svc, reader)
+		c, w := newRequestWithIdentity(http.MethodDelete, "/api/v1/delegations/"+delegationID.String()+"?record_version=abc", nil, selfRC(delegatorID, tenantID))
+		setPathParam(c, "id", delegationID.String())
+		h.Cancel(c)
+		require.Equal(t, http.StatusConflict, w.Code)
+	})
 }
 
 // ── Extend (DLG-4) ──────────────────────────────────────────────────────
@@ -327,6 +425,22 @@ func TestDelegationHandler_Extend(t *testing.T) {
 		require.NotNil(t, resp.ReviewDueAt)
 	})
 
+	// FM-HDR-05 / TEST-13: missing record_version in body defaults to 0 → OCC → 409
+	t.Run("absent record_version in body defaults to 0 gives OCC 409 (FM-HDR-05/TEST-13)", func(t *testing.T) {
+		svc := &fakeDelegationService{
+			extendFn: func(ctx context.Context, tenantID, id uuid.UUID, extendDays *int, expectedVersion int64) (*domain.Delegation, error) {
+				require.Equal(t, int64(0), expectedVersion)
+				return nil, domain.NewError(domain.ErrOptimisticLockConflict, "stale")
+			},
+		}
+		h := NewDelegationHandler(svc, readerFor(delegatorID))
+		// empty body {} → record_version defaults to 0
+		c, w := newRequestWithIdentity(http.MethodPost, "/api/v1/delegations/"+delegationID.String()+"/extend", bytes.NewReader([]byte(`{}`)), selfRC(delegatorID, tenantID))
+		setPathParam(c, "id", delegationID.String())
+		h.Extend(c)
+		require.Equal(t, http.StatusConflict, w.Code)
+	})
+
 	t.Run("service error mapped (not_review_tracked)", func(t *testing.T) {
 		svc := &fakeDelegationService{
 			extendFn: func(ctx context.Context, tenantID, id uuid.UUID, extendDays *int, expectedVersion int64) (*domain.Delegation, error) {
@@ -339,6 +453,26 @@ func TestDelegationHandler_Extend(t *testing.T) {
 		setPathParam(c, "id", delegationID.String())
 		h.Extend(c)
 		require.Equal(t, http.StatusUnprocessableEntity, w.Code)
+	})
+
+	// BUG-04 / DEV-09: extend response includes record_version so client can immediately cancel
+	t.Run("extend response includes record_version field (BUG-04/DEV-09)", func(t *testing.T) {
+		due := time.Now().Add(90 * 24 * time.Hour)
+		svc := &fakeDelegationService{
+			extendFn: func(ctx context.Context, tenantID, id uuid.UUID, extendDays *int, expectedVersion int64) (*domain.Delegation, error) {
+				return &domain.Delegation{ID: id, TenantID: tenantID, DelegatorID: delegatorID,
+					ReviewDueAt: &due, RecordVersion: 5}, nil
+			},
+		}
+		h := NewDelegationHandler(svc, readerFor(delegatorID))
+		reqBody, _ := json.Marshal(DelegationExtendRequest{RecordVersion: 4})
+		c, w := newRequestWithIdentity(http.MethodPost, "/api/v1/delegations/"+delegationID.String()+"/extend", bytes.NewReader(reqBody), selfRC(delegatorID, tenantID))
+		setPathParam(c, "id", delegationID.String())
+		h.Extend(c)
+		require.Equal(t, http.StatusOK, w.Code)
+		var resp DelegationExtendResponse
+		require.NoError(t, json.Unmarshal(w.Body.Bytes(), &resp))
+		require.Equal(t, int64(5), resp.RecordVersion)
 	})
 }
 
@@ -507,6 +641,22 @@ func TestDelegationHandler_Reassign(t *testing.T) {
 		require.Equal(t, scopeID, *captured.ScopeID)
 	})
 
+	// TEST-09: empty body → record_version=0 → OCC → 409
+	t.Run("empty body gives record_version=0 → OCC 409 (TEST-09)", func(t *testing.T) {
+		svc := &fakeDelegationService{
+			reassignFn: func(ctx context.Context, tenantID, id uuid.UUID, expectedVersion int64, req service.ReassignInput) (*domain.Delegation, error) {
+				require.Equal(t, int64(0), expectedVersion)
+				return nil, domain.NewError(domain.ErrOptimisticLockConflict, "stale")
+			},
+		}
+		h := NewDelegationHandler(svc, readerFor(delegatorID))
+		c, w := newRequestWithIdentity(http.MethodPost, "/api/v1/delegations/"+delegationID.String()+"/reassign",
+			bytes.NewReader([]byte(`{}`)), selfRC(delegatorID, tenantID))
+		setPathParam(c, "id", delegationID.String())
+		h.Reassign(c)
+		require.Equal(t, http.StatusConflict, w.Code)
+	})
+
 	t.Run("scope_id omitted entirely -> ScopeIDSet false", func(t *testing.T) {
 		var captured service.ReassignInput
 		svc := &fakeDelegationService{
@@ -524,4 +674,65 @@ func TestDelegationHandler_Reassign(t *testing.T) {
 		require.False(t, captured.ScopeIDSet)
 		require.Nil(t, captured.ScopeID)
 	})
+}
+
+// ── Invalid-UUID coverage for Create/Cancel/Extend/Reassign ───────────────
+// These cover the uuid.Parse(rc.TenantID/UserID) → 401 branches that the
+// handler tests above didn't reach because selfRC() / adminRC() always pass
+// well-formed UUIDs.
+
+func badTenantRC(userID uuid.UUID) *requestctx.Context {
+	return &requestctx.Context{TenantID: "not-a-uuid", UserID: userID.String(), Roles: []string{"tenant_member"}}
+}
+
+func badUserRC(tenantID uuid.UUID) *requestctx.Context {
+	return &requestctx.Context{TenantID: tenantID.String(), UserID: "not-a-uuid", Roles: []string{"tenant_member"}}
+}
+
+func TestDelegationHandler_Create_InvalidTenantID_Returns401(t *testing.T) {
+	h := NewDelegationHandler(&fakeDelegationService{}, &fakeDelegationReader{})
+	c, w := newRequestWithIdentity(http.MethodPost, "/api/v1/delegations",
+		bytes.NewReader([]byte(`{}`)), badTenantRC(uuid.New()))
+	h.Create(c)
+	require.Equal(t, http.StatusUnauthorized, w.Code)
+}
+
+func TestDelegationHandler_Create_InvalidUserID_Returns401(t *testing.T) {
+	h := NewDelegationHandler(&fakeDelegationService{}, &fakeDelegationReader{})
+	c, w := newRequestWithIdentity(http.MethodPost, "/api/v1/delegations",
+		bytes.NewReader([]byte(`{}`)), badUserRC(uuid.New()))
+	h.Create(c)
+	require.Equal(t, http.StatusUnauthorized, w.Code)
+}
+
+func TestDelegationHandler_Cancel_InvalidTenantID_Returns401(t *testing.T) {
+	h := NewDelegationHandler(&fakeDelegationService{}, &fakeDelegationReader{})
+	delegationID := uuid.New()
+	c, w := newRequestWithIdentity(http.MethodDelete,
+		"/api/v1/delegations/"+delegationID.String(), nil, badTenantRC(uuid.New()))
+	setPathParam(c, "id", delegationID.String())
+	h.Cancel(c)
+	require.Equal(t, http.StatusUnauthorized, w.Code)
+}
+
+func TestDelegationHandler_Extend_InvalidTenantID_Returns401(t *testing.T) {
+	h := NewDelegationHandler(&fakeDelegationService{}, &fakeDelegationReader{})
+	delegationID := uuid.New()
+	c, w := newRequestWithIdentity(http.MethodPatch,
+		"/api/v1/delegations/"+delegationID.String()+"/extend",
+		bytes.NewReader([]byte(`{}`)), badTenantRC(uuid.New()))
+	setPathParam(c, "id", delegationID.String())
+	h.Extend(c)
+	require.Equal(t, http.StatusUnauthorized, w.Code)
+}
+
+func TestDelegationHandler_Reassign_InvalidTenantID_Returns401(t *testing.T) {
+	h := NewDelegationHandler(&fakeDelegationService{}, &fakeDelegationReader{})
+	delegationID := uuid.New()
+	c, w := newRequestWithIdentity(http.MethodPost,
+		"/api/v1/delegations/"+delegationID.String()+"/reassign",
+		bytes.NewReader([]byte(`{}`)), badTenantRC(uuid.New()))
+	setPathParam(c, "id", delegationID.String())
+	h.Reassign(c)
+	require.Equal(t, http.StatusUnauthorized, w.Code)
 }

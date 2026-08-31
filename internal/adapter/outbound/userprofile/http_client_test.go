@@ -153,3 +153,34 @@ func TestHTTPClient_SetAvailability_NetworkError_WrapsErrDependencyUnavailable(t
 	require.Error(t, err)
 	assert.True(t, errors.Is(err, port.ErrDependencyUnavailable))
 }
+
+// TestHTTPClient_SetAvailability_4xx_NonJSONBody covers the fallback status-error
+// path when the response body is not valid JSON (no `error` field to decode).
+func TestHTTPClient_SetAvailability_4xx_NonJSONBody(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusBadRequest)
+		_, _ = w.Write([]byte("plain text error"))
+	}))
+	defer server.Close()
+
+	c, err := NewHTTPClient(server.URL, nil, 0)
+	require.NoError(t, err)
+	err = c.SetAvailability(t.Context(), port.SetAvailabilityRequest{TenantID: uuid.New(), UserID: uuid.New(), ClearDelegate: true})
+	require.Error(t, err)
+	assert.False(t, errors.Is(err, port.ErrDependencyUnavailable))
+	assert.Contains(t, err.Error(), "400")
+}
+
+// TestBuildBody_WithOOOUntil covers the req.OOOUntil != nil branch.
+func TestBuildBody_WithOOOUntil(t *testing.T) {
+	var oooTime = time.Date(2026, 9, 1, 12, 0, 0, 0, time.UTC)
+	req := port.SetAvailabilityRequest{
+		TenantID:      uuid.New(),
+		UserID:        uuid.New(),
+		OOOUntil:      &oooTime,
+		ClearDelegate: false,
+	}
+	body := buildBody(req)
+	require.NotNil(t, body["ooo_until"])
+	assert.Equal(t, oooTime.UTC().Format(time.RFC3339), body["ooo_until"])
+}

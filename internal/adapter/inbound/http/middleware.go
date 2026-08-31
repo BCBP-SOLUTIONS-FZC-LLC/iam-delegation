@@ -1,12 +1,18 @@
 package http
 
 import (
+	"strings"
+
 	"github.com/gin-gonic/gin"
 
 	"github.com/BCBP-SOLUTIONS-FZC-LLC/iam-delegation/internal/core/domain"
 	"github.com/BCBP-SOLUTIONS-FZC-LLC/iam-delegation/pkg/requestctx"
 	gincommon "github.com/BCBP-SOLUTIONS-FZC-LLC/platform-gincommon/pkg/gincommon"
 )
+
+// maxIdempotencyKeyLen is a sanity cap — UUID v4 is 36 chars; 1 KiB allows
+// any reasonable opaque token while rejecting obvious DoS payloads.
+const maxIdempotencyKeyLen = 1024
 
 // ContextMiddleware must run after gincommon.ProtectedMiddlewares (which
 // populates gincommon's own, unexported-type domain.RequestContext from the
@@ -76,7 +82,8 @@ func RequireAnyRole(roles ...string) gin.HandlerFunc {
 // among the existing 400-mapped sentinels.
 func requireIdempotencyKey() gin.HandlerFunc {
 	return func(c *gin.Context) {
-		if c.GetHeader("Idempotency-Key") == "" {
+		key := c.GetHeader("Idempotency-Key")
+		if strings.TrimSpace(key) == "" || len(key) > maxIdempotencyKeyLen {
 			HandleError(c, domain.NewError(domain.ErrValidation, "Idempotency-Key header is required"))
 			return
 		}

@@ -271,9 +271,9 @@ func (s *DelegationService) checkBothMemberships(ctx context.Context, tenantID, 
 	return dgt.id, dt.id, nil
 }
 
-// Cancel is DLG-3. Pointer-clear-only, fail-open on UP (LLD §11.2): if UP
-// is down, log and proceed — the expiry cron re-clears later (DEL-6).
-func (s *DelegationService) Cancel(ctx context.Context, tenantID, id uuid.UUID, expectedVersion int64) (*domain.Delegation, error) {
+// cancelInternal is the shared end-path for Cancel (reason=cancelled) and
+// Reassign (reason=reassigned). UP pointer-clear is always fail-open.
+func (s *DelegationService) cancelInternal(ctx context.Context, tenantID, id uuid.UUID, expectedVersion int64, endReason domain.EndReason) (*domain.Delegation, error) {
 	d, err := s.delegations.FindByID(ctx, tenantID, id)
 	if err != nil {
 		return nil, err
@@ -283,7 +283,6 @@ func (s *DelegationService) Cancel(ctx context.Context, tenantID, id uuid.UUID, 
 	_ = s.userProfile.SetAvailability(ctx, port.SetAvailabilityRequest{
 		TenantID: tenantID, UserID: d.DelegatorID, ClearDelegate: true,
 	})
-	// use actual caller if available in context, fall back to delegator
 	actorID := d.DelegatorID
 	if rc, ok := requestctx.FromContext(ctx); ok {
 		if parsed, err := uuid.Parse(rc.UserID); err == nil {
@@ -303,7 +302,7 @@ func (s *DelegationService) Cancel(ctx context.Context, tenantID, id uuid.UUID, 
 				DelegationID: id, TenantID: tenantID,
 				DelegatorID: d.DelegatorID, DelegateID: d.DelegateID,
 				Scope: d.Scope, ScopeID: d.ScopeID,
-				EndedReason: domain.EndReasonCancelled,
+				EndedReason: endReason,
 				ActorID:     actorID,
 			})
 	})
@@ -314,6 +313,12 @@ func (s *DelegationService) Cancel(ctx context.Context, tenantID, id uuid.UUID, 
 		s.cache.InvalidateDelegatorList(ctx, tenantID, d.DelegatorID)
 	}
 	return ended, nil
+}
+
+// Cancel is DLG-3. Pointer-clear-only, fail-open on UP (LLD §11.2): if UP
+// is down, log and proceed — the expiry cron re-clears later (DEL-6).
+func (s *DelegationService) Cancel(ctx context.Context, tenantID, id uuid.UUID, expectedVersion int64) (*domain.Delegation, error) {
+	return s.cancelInternal(ctx, tenantID, id, expectedVersion, domain.EndReasonCancelled)
 }
 
 // Extend is DLG-4. Open-ended only; resets ReviewLastWarnedBucket to nil,
@@ -382,7 +387,7 @@ func (s *DelegationService) Reassign(ctx context.Context, tenantID, id uuid.UUID
 	if existing.Status != domain.DelegationActive {
 		return nil, domain.NewError(domain.ErrDelegationNotFound, "delegation not found")
 	}
-	if _, err := s.Cancel(ctx, tenantID, id, expectedVersion); err != nil {
+	if _, err := s.cancelInternal(ctx, tenantID, id, expectedVersion, domain.EndReasonReassigned); err != nil {
 		return nil, err
 	}
 

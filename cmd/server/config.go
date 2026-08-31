@@ -76,7 +76,7 @@ func loadConfig() (config, error) {
 		OrgMembershipBaseURL: os.Getenv("ORG_MEMBERSHIP_BASE_URL"),
 		ValkeyAddr:           getEnv("VALKEY_ADDR", "localhost:6379"),
 		SNSTopicARN:          os.Getenv("SNS_TOPIC_ARN"),
-		AWSRegion:            getEnv("AWS_REGION", "us-east-1"),
+		AWSRegion:            getEnv("AWS_REGION", "ap-south-1"),
 		AWSEndpointURL:       os.Getenv("AWS_ENDPOINT_URL"),
 		GlueRegistryName:     os.Getenv("GLUE_REGISTRY_NAME"),
 		CascadeQueueURL:      os.Getenv("CASCADE_QUEUE_URL"),

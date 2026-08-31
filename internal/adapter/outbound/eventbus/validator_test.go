@@ -4,6 +4,8 @@ import (
 	"context"
 	"testing"
 
+	"github.com/stretchr/testify/require"
+
 	"github.com/BCBP-SOLUTIONS-FZC-LLC/iam-delegation/internal/core/domain"
 )
 
@@ -112,6 +114,35 @@ func TestSchemaValidator_UnregisteredEventType(t *testing.T) {
 	if err := v.Validate(ctx, "SomethingElse", []byte(`{}`)); err == nil {
 		t.Fatal("Validate() expected error for unregistered event type, got nil")
 	}
+}
+
+// TestNewSchemaValidatorFromEntries_BadJSON covers the json.Unmarshal error path.
+func TestNewSchemaValidatorFromEntries_BadJSON(t *testing.T) {
+	_, err := newSchemaValidatorFromEntries([]schemaEntry{
+		{name: "Bad", src: []byte("not json at all {")},
+	})
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "load event schema")
+}
+
+// TestNewSchemaValidatorFromEntries_InvalidSchema covers the Compile error path
+// by passing a valid JSON that is an invalid JSON Schema (type must be a string,
+// not an integer).
+func TestNewSchemaValidatorFromEntries_InvalidSchema(t *testing.T) {
+	_, err := newSchemaValidatorFromEntries([]schemaEntry{
+		{name: "Bad", src: []byte(`{"type": 42}`)}, // type must be string/array per JSON Schema
+	})
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "compile event schema")
+}
+
+// TestSchemaValidator_Validate_MalformedPayload covers the json.Unmarshal
+// error path inside Validate when the payload is not valid JSON.
+func TestSchemaValidator_Validate_MalformedPayload(t *testing.T) {
+	v := mustValidator(t)
+	err := v.Validate(context.Background(), domain.EventDelegationStarted, []byte("{not json"))
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "unmarshal")
 }
 
 func TestValidatePayload_MatchesMethodForm(t *testing.T) {

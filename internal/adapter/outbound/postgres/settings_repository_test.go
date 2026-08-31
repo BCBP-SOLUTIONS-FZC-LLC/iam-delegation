@@ -90,3 +90,27 @@ func TestSettingsRepository_SoftDeleteTenant_DeletesRow(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, 90, got.MaxDurationDays)
 }
+
+func TestSettingsRepository_Get_CancelledContext_ReturnsError(t *testing.T) {
+	db := setupTestDB(t)
+	repo := NewSettingsRepository(db.App)
+	tenantID := uuid.New()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	_, err := repo.Get(withTenant(ctx, tenantID), tenantID)
+	require.Error(t, err)
+}
+
+func TestSettingsRepository_Upsert_CancelledContext_ReturnsError(t *testing.T) {
+	db := setupTestDB(t)
+	repo := NewSettingsRepository(db.App)
+	tenantID := uuid.New()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	_, err := repo.Upsert(withTenant(ctx, tenantID), tenantID, 90, 30)
+	require.Error(t, err)
+}

@@ -67,6 +67,37 @@ func TestCascadeService_EndForUser_DelegatorDelegateAsymmetry(t *testing.T) {
 	}
 }
 
+// TestCascadeService_EndForUser_RepoError covers the repo.EndForUser error path.
+func TestCascadeService_EndForUser_RepoError(t *testing.T) {
+	repo, _, _, _, svc := newCascadeHarness()
+	wantErr := errors.New("db error")
+	repo.endForUserErr = wantErr
+
+	err := svc.EndForUser(context.Background(), uuid.New(), uuid.New())
+	require.ErrorIs(t, err, wantErr)
+}
+
+// TestCascadeService_EndForUser_DelegatorSideSkipsUPClear covers the
+// d.DelegatorID == userID continue branch: the removed user is the delegator,
+// so their own pointer must never be cleared.
+func TestCascadeService_EndForUser_DelegatorSideSkipsUPClear(t *testing.T) {
+	repo, _, up, _, svc := newCascadeHarness()
+	tenantID := uuid.New()
+	removedUser := uuid.New()
+
+	// Only row: removed user is the delegator (not delegate)
+	repo.endForUserResult = []domain.Delegation{{
+		ID: uuid.New(), TenantID: tenantID,
+		DelegatorID: removedUser, // removed user is delegator
+		DelegateID:  uuid.New(),
+		Scope:       domain.ScopeAll, Status: domain.DelegationEnded,
+	}}
+
+	err := svc.EndForUser(context.Background(), tenantID, removedUser)
+	require.NoError(t, err)
+	require.Empty(t, up.calls, "delegator-side removal must not trigger UP pointer-clear")
+}
+
 func TestCascadeService_ScrubTenant_OrderAndShortCircuit(t *testing.T) {
 	t.Run("delegation repository error short-circuits before settings", func(t *testing.T) {
 		repo, settings, _, _, svc := newCascadeHarness()

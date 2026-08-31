@@ -31,7 +31,7 @@
 set -euo pipefail
 
 AWS_ACCOUNT=000000000000
-AWS_REGION=us-east-1
+AWS_REGION=ap-south-1
 MAX_RECEIVES=5
 
 queue_arn() { printf 'arn:aws:sqs:%s:%s:%s' "$AWS_REGION" "$AWS_ACCOUNT" "$1"; }
@@ -86,7 +86,9 @@ EOF
 
 # ── Helper: provision queue + DLQ + SNS subscription with optional filter ─────
 # $1 = queue name   $2 = SNS filter policy JSON (empty string = no filter)
-# Uses Python to set the filter policy to avoid shell JSON-quoting issues.
+# RawMessageDelivery=true so consumers receive the event envelope directly,
+# not wrapped in an SNS notification object — mirrors iam-org-membership's
+# subscribe_queue helper.
 provision_subscriber() {
   local queue="$1"
   local filter_policy="$2"
@@ -96,25 +98,24 @@ provision_subscriber() {
   local queue_arn_val
   queue_arn_val=$(queue_arn "$queue")
 
-  # Subscribe to SNS topic (no filter first, then set filter via Python)
   local sub_arn
   sub_arn=$(awslocal sns subscribe \
     --topic-arn "$TOPIC_ARN" \
     --protocol sqs \
     --notification-endpoint "$queue_arn_val" \
+    --attributes RawMessageDelivery=true \
     --query SubscriptionArn --output text)
 
   if [ -n "$filter_policy" ]; then
-    python3 -c "
-import boto3, json, sys
-sns = boto3.client('sns', endpoint_url='http://localhost:4566',
-    region_name='us-east-1', aws_access_key_id='test', aws_secret_access_key='test')
-sns.set_subscription_attributes(
-    SubscriptionArn='${sub_arn}',
-    AttributeName='FilterPolicy',
-    AttributeValue='${filter_policy}')
-print('  Subscribed: ${queue}  filter=${filter_policy}')
-"
+    local attrs
+    attrs=$(mktemp)
+    printf '%s' "$filter_policy" > "$attrs"
+    awslocal sns set-subscription-attributes \
+      --subscription-arn "$sub_arn" \
+      --attribute-name FilterPolicy \
+      --attribute-value "file://$attrs" >/dev/null
+    rm -f "$attrs"
+    echo "  Subscribed: $queue  filter=$filter_policy"
   else
     echo "  Subscribed: $queue  (no filter — receives all event types)"
   fi

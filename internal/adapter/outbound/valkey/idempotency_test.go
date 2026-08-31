@@ -70,3 +70,53 @@ func TestIdempotencyStore_DownValkey(t *testing.T) {
 	err = s.Save(ctx, tenantID, "key-1", port.IdempotencyRecord{DelegationID: uuid.New(), Status: "created"})
 	require.Error(t, err)
 }
+
+// TestIdempotencyStore_DownValkey_NilLogger verifies that Get and Save with a
+// nil logger degrade gracefully without panicking when Redis is unavailable.
+func TestIdempotencyStore_DownValkey_NilLogger(t *testing.T) {
+	mr := miniredis.RunT(t)
+	addr := mr.Addr()
+	mr.Close()
+
+	s := NewIdempotencyStore(NewClient("redis://"+addr), nil) // no logger
+	ctx := context.Background()
+	tenantID := uuid.New()
+
+	_, found, err := s.Get(ctx, tenantID, "key-nil")
+	require.Error(t, err)
+	require.False(t, found)
+
+	err = s.Save(ctx, tenantID, "key-nil", port.IdempotencyRecord{DelegationID: uuid.New()})
+	require.Error(t, err)
+}
+
+// TestIdempotencyStore_Get_CorruptValue covers the json.Unmarshal failure in Get.
+func TestIdempotencyStore_Get_CorruptValue(t *testing.T) {
+	mr := miniredis.RunT(t)
+	fl := &fakeLogger{}
+	s := NewIdempotencyStore(NewClient("redis://"+mr.Addr()), fl)
+	ctx := context.Background()
+	tenantID := uuid.New()
+
+	k := idempotencyKey(tenantID, "corrupt-key")
+	mr.Set(k, "not-json-at-all")
+
+	_, found, err := s.Get(ctx, tenantID, "corrupt-key")
+	require.Error(t, err)
+	require.False(t, found)
+	require.NotEmpty(t, fl.msg, "corrupt value must be logged")
+}
+
+// TestIdempotencyStore_Save_NilLogger_RedisError verifies Save with nil logger
+// and a failing Redis returns the error without panicking.
+func TestIdempotencyStore_Save_NilLogger_RedisError(t *testing.T) {
+	mr := miniredis.RunT(t)
+	addr := mr.Addr()
+	// Don't close yet — we need to build the store first
+	s := NewIdempotencyStore(NewClient("redis://"+addr), nil)
+	mr.Close() // take it down after construction
+
+	ctx := context.Background()
+	err := s.Save(ctx, uuid.New(), "k", port.IdempotencyRecord{DelegationID: uuid.New()})
+	require.Error(t, err)
+}

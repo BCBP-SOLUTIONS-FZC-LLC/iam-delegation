@@ -109,11 +109,11 @@ func run(logger Logger) error {
 	// Migrations run at startup against the delegation_migrator (BYPASSRLS)
 	// role — MIGRATION_DATABASE_URL, falling back to DSNFromEnv() (LLD §7.4).
 	migratorDSN := pgadapter.MigrationDSNFromEnv()
-	if err := pgadapter.RunMigrations(baseCtx, migratorDSN, pgadapter.NewLoggerAdapter(logger)); err != nil {
-		return fmt.Errorf("run migrations: %w", err)
-	}
 	if err := outbox.ApplySchema(baseCtx, &pgmigrate.Runner{DSN: migratorDSN}); err != nil {
 		return fmt.Errorf("apply outbox schema: %w", err)
+	}
+	if err := pgadapter.RunMigrations(baseCtx, migratorDSN, pgadapter.NewLoggerAdapter(logger)); err != nil {
+		return fmt.Errorf("run migrations: %w", err)
 	}
 
 	// The RLS-scoped delegation_app pool — every public-route write and

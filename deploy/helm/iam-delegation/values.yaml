@@ -100,7 +100,7 @@ env:
   # depends on the environment's AWS account) — set per environment.
   SNS_TOPIC_ARN: ""
   CASCADE_QUEUE_URL: ""
-  AWS_REGION: "us-east-1"
+  AWS_REGION: "ap-south-1"
   # Set to the Glue Schema Registry name (iam-delegation-events) to activate
   # eventbus.GlueCodec at publish time; empty → NoopCodec (dev/test only).
   # See docs/runbook-schema-registry.md.

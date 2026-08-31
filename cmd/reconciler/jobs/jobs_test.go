@@ -387,3 +387,128 @@ func containsInt(xs []int, v int) bool {
 	}
 	return false
 }
+
+// ── computeDaysRemaining ─────────────────────────────────────────────────
+
+// NOTIF-TC-16: computeDaysRemaining returns 3 when review_due_at is 3 days away
+func TestComputeDaysRemaining_Returns3ForThreeDays(t *testing.T) {
+	now := time.Now().UTC()
+	due := now.Add(3 * 24 * time.Hour)
+	got := computeDaysRemaining(&due, now)
+	if got != 3 {
+		t.Fatalf("expected 3, got %d", got)
+	}
+}
+
+// NOTIF-TC-17: computeDaysRemaining returns 1 (minimum) when review_due_at is past but > 0
+func TestComputeDaysRemaining_ReturnsMinimum1WhenPast(t *testing.T) {
+	now := time.Now().UTC()
+	past := now.Add(-1 * time.Hour) // past, but auto-end handles exactly <= now
+	got := computeDaysRemaining(&past, now)
+	if got != 1 {
+		t.Fatalf("expected minimum 1, got %d", got)
+	}
+}
+
+// FM-NOTIF-03: review_due_at = now+48h+1s → days_remaining = ceil((48h+1s)/24h) = 3
+func TestComputeDaysRemaining_BucketCeil3(t *testing.T) {
+	now := time.Now().UTC()
+	due := now.Add(48*time.Hour + time.Second) // slightly over 2 days → ceil = 3
+	got := computeDaysRemaining(&due, now)
+	if got != 3 {
+		t.Fatalf("expected 3 (ceil of 48h+1s), got %d", got)
+	}
+}
+
+// FM-NOTIF-04: review_due_at exactly now+48h → days_remaining = ceil(2.0) = 2
+func TestComputeDaysRemaining_BucketCeil2(t *testing.T) {
+	now := time.Now().UTC()
+	due := now.Add(48 * time.Hour) // exactly 2 days → ceil = 2
+	got := computeDaysRemaining(&due, now)
+	if got != 2 {
+		t.Fatalf("expected 2 (ceil of exactly 48h), got %d", got)
+	}
+}
+
+// NOTIF-TC-12: sequential state machine 3d→2d→1d each fires exactly once
+func TestReviewSweep_SequentialStateMachine(t *testing.T) {
+	now := time.Now().UTC()
+
+	// Run 1: delegation at bucket 3 (3 days remaining)
+	due3d := now.Add(3 * 24 * time.Hour)
+	d := newDelegation(uuid.New())
+	d.ReviewDueAt = &due3d
+	repo := &fakeDelegationRepo{dailyWarn: []domain.Delegation{d}}
+	tx := &fakeTxRunner{}
+	jctx := &Context{Delegations: repo, UserProfile: &fakeUserProfile{}, TxRunner: tx, BindTenantGUC: noopBind, Logger: fakeLogger{}}
+
+	res, err := ReviewSweep(context.Background(), jctx)
+	if err != nil {
+		t.Fatalf("run 1: unexpected error: %v", err)
+	}
+	if res.Warned3d != 1 {
+		t.Fatalf("run 1: expected Warned3d=1, got %+v", res)
+	}
+
+	// Run 2: same delegation now at bucket 2 (bucket=3 already set, 2 days left)
+	due2d := now.Add(2 * 24 * time.Hour)
+	bucket3 := 3
+	d2 := newDelegation(d.DelegatorID)
+	d2.ID = d.ID
+	d2.ReviewDueAt = &due2d
+	d2.ReviewLastWarnedBucket = &bucket3
+	repo2 := &fakeDelegationRepo{dailyWarn: []domain.Delegation{d2}}
+	tx2 := &fakeTxRunner{}
+	jctx2 := &Context{Delegations: repo2, UserProfile: &fakeUserProfile{}, TxRunner: tx2, BindTenantGUC: noopBind, Logger: fakeLogger{}}
+
+	res2, err := ReviewSweep(context.Background(), jctx2)
+	if err != nil {
+		t.Fatalf("run 2: unexpected error: %v", err)
+	}
+	if res2.Warned2d != 1 {
+		t.Fatalf("run 2: expected Warned2d=1, got %+v", res2)
+	}
+
+	// Run 3: same delegation at bucket 1 (bucket=2 already set, 1 day left)
+	due1d := now.Add(24 * time.Hour)
+	bucket2 := 2
+	d3 := newDelegation(d.DelegatorID)
+	d3.ID = d.ID
+	d3.ReviewDueAt = &due1d
+	d3.ReviewLastWarnedBucket = &bucket2
+	repo3 := &fakeDelegationRepo{dailyWarn: []domain.Delegation{d3}}
+	tx3 := &fakeTxRunner{}
+	jctx3 := &Context{Delegations: repo3, UserProfile: &fakeUserProfile{}, TxRunner: tx3, BindTenantGUC: noopBind, Logger: fakeLogger{}}
+
+	res3, err := ReviewSweep(context.Background(), jctx3)
+	if err != nil {
+		t.Fatalf("run 3: unexpected error: %v", err)
+	}
+	if res3.Warned1d != 1 {
+		t.Fatalf("run 3: expected Warned1d=1, got %+v", res3)
+	}
+
+	// Run 4: auto-end (review_due_at passed)
+	repo4 := &fakeDelegationRepo{autoEnd: []domain.Delegation{d}}
+	tx4 := &fakeTxRunner{}
+	jctx4 := &Context{Delegations: repo4, UserProfile: &fakeUserProfile{}, TxRunner: tx4, BindTenantGUC: noopBind, Logger: fakeLogger{}}
+
+	res4, err := ReviewSweep(context.Background(), jctx4)
+	if err != nil {
+		t.Fatalf("run 4: unexpected error: %v", err)
+	}
+	if res4.Expired != 1 {
+		t.Fatalf("run 4: expected Expired=1, got %+v", res4)
+	}
+}
+
+// GAP09-TC-03: Cleanup purge error is non-fatal — job returns the error for logging but doesn't panic
+func TestCleanup_PurgeErrorIsNonFatal(t *testing.T) {
+	repo := &fakeDelegationRepo{purgeErr: errors.New("db timeout"), purgeCount: 0}
+	jctx := &Context{Delegations: repo, Logger: fakeLogger{}, RetentionDays: 90}
+
+	_, err := Cleanup(context.Background(), jctx)
+	if err == nil {
+		t.Fatalf("expected Cleanup to surface the purge error so the caller can log it")
+	}
+}

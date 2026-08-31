@@ -57,7 +57,7 @@ services:
     environment:
       SERVICES: sqs,sns
       DEBUG: 0
-      AWS_DEFAULT_REGION: us-east-1
+      AWS_DEFAULT_REGION: ap-south-1
     volumes:
       - localstack-data:/var/lib/localstack
       - ./scripts/init-localstack.sh:/etc/localstack/init/ready.d/init-localstack.sh
@@ -127,14 +127,14 @@ services:
       # SNS_TOPIC_ARN/CASCADE_QUEUE_URL are required (cmd/server/config.go
       # fails fast if either is empty). Names/topic match
       # scripts/init-localstack.sh and api/asyncapi.yaml.
-      SNS_TOPIC_ARN: arn:aws:sns:us-east-1:000000000000:iam-delegation-events
+      SNS_TOPIC_ARN: arn:aws:sns:ap-south-1:000000000000:iam-delegation-events
 
       # LocalStack — container-internal port is always 4566 regardless of
       # the host-side mapping above. AWS_ENDPOINT_URL is honored
       # automatically by aws-sdk-go-v2's default config loader; no code
       # change is needed to redirect SNS/SQS calls here instead of real AWS.
       CASCADE_QUEUE_URL: http://localstack:4566/000000000000/delegation-cascade-q
-      AWS_REGION: us-east-1
+      AWS_REGION: ap-south-1
       # Empty → NoopCodec (LocalStack Community has no Glue). Set only when
       # running against docker-compose.pro.yml.
       GLUE_REGISTRY_NAME: ""

@@ -65,6 +65,30 @@ func TestRequireIdempotencyKey(t *testing.T) {
 		require.True(t, c.IsAborted())
 	})
 
+	// FM-HDR-12: whitespace-only value is treated as absent → 400
+	t.Run("whitespace-only header → 400 (FM-HDR-12)", func(t *testing.T) {
+		mw := requireIdempotencyKey()
+		c, w := newRequestWithIdentity(http.MethodPost, "/api/v1/delegations", nil, nil)
+		c.Request.Header.Set("Idempotency-Key", "   \t  ")
+		mw(c)
+		require.Equal(t, http.StatusBadRequest, w.Code)
+		require.True(t, c.IsAborted())
+	})
+
+	// HACK-03: extreme-length key (>1 KiB) is rejected → 400
+	t.Run("oversized key (100KB) → 400 (HACK-03)", func(t *testing.T) {
+		mw := requireIdempotencyKey()
+		c, w := newRequestWithIdentity(http.MethodPost, "/api/v1/delegations", nil, nil)
+		bigKey := make([]byte, 100*1024)
+		for i := range bigKey {
+			bigKey[i] = 'a'
+		}
+		c.Request.Header.Set("Idempotency-Key", string(bigKey))
+		mw(c)
+		require.Equal(t, http.StatusBadRequest, w.Code)
+		require.True(t, c.IsAborted())
+	})
+
 	t.Run("present header -> passes", func(t *testing.T) {
 		mw := requireIdempotencyKey()
 		c, w := newRequestWithIdentity(http.MethodPost, "/api/v1/delegations", nil, nil)
