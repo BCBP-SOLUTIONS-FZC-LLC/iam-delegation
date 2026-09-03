@@ -7,7 +7,11 @@ bin/
 coverage.out
 coverage.html
 *.md
-docs/
+# Keep docs/swagger in the context — cmd/server blank-imports that Go
+# package for swaggo init(). A blanket `docs/` ignore made `go build
+# ./cmd/server` fail in buildx (parent-dir excludes cannot be re-included).
+docs/lld
+docs/architecture
 deploy/
 test/
 .env

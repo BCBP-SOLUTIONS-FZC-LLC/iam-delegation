@@ -41,6 +41,10 @@ index into those, not a duplicate of them.
   the mock is synchronized. Postgres integration tests now share one Testcontainers
   instance (truncate between tests) so the ~50-container suite fits the runner
   timeout; the Glue refresher call counter is atomic.
+- Docker image build excluded `docs/swagger` via `.dockerignore`, so
+  `go build ./cmd/server` failed in buildx (`docs/swagger` is a checked-in
+  Go package blank-imported for the Swagger UI). The swagger tree is now
+  kept in the build context.
 - The monthly `delegation-cleanup` CronJob never purged `processed_events` — `cmd/reconciler`
   never wired a `ProcessedEvents` store.
 - The two reconciler deferred-counter metrics were registered but never incremented (DLG-D19).
