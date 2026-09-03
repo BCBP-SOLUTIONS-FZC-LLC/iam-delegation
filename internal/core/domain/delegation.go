@@ -43,15 +43,22 @@ const (
 
 // EndReason is the payload field emitted with DelegationEnded (DEL-7).
 // Not persisted — event-payload only. review_expired is DLG-D6/DLG-Q5,
-// added over the pre-extraction O&M enum.
+// added over the pre-extraction O&M enum. delegate_disabled is Bug 2.
 type EndReason string
 
-// The four ended_reason values (DEL-7, DLG-D6/DLG-Q5).
+// The five ended_reason values (DEL-7, DLG-D6/DLG-Q5, Bug 2).
 const (
 	EndReasonExpired         EndReason = "expired"
 	EndReasonCancelled       EndReason = "cancelled"
 	EndReasonDelegateRemoved EndReason = "delegate_removed"
 	EndReasonReviewExpired   EndReason = "review_expired"
+	// EndReasonDelegateDisabled (Bug 2): the delegate's account was disabled
+	// (User Profile UserUpdated{status: disabled}) — distinct from
+	// EndReasonDelegateRemoved, which fires on MembershipRevoked (the
+	// delegate leaving the tenant entirely). "Disabled ≠ removed": a
+	// disabled user is still a tenant member, so this reason exists so
+	// downstream consumers (Notification, Audit) can distinguish the two.
+	EndReasonDelegateDisabled EndReason = "delegate_disabled"
 )
 
 // Delegation is the authoritative OOO grant that drives workflow reroute via

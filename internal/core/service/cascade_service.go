@@ -8,12 +8,14 @@ import (
 	"github.com/google/uuid"
 )
 
-// CascadeService handles the two inbound signals from Core on
+// CascadeService handles the inbound signals landing on
 // delegation-cascade-q (LLD §10.1, §11.5/§11.6): MembershipRevoked (a
 // user removed from a tenant) and TenantMembershipsPurged (a whole tenant
-// offboarded). Both are asynchronous — the stranding-hazard gate itself
-// stays synchronous in Core (LLD §11.5, DLG-D9); this service only ends the
-// now-inert rows.
+// offboarded) from Core, plus User Profile's UserUpdated{status: disabled}
+// (Bug 2 — a second SNS subscription onto the same queue). All three are
+// asynchronous — the stranding-hazard gate for membership removal stays
+// synchronous in Core (LLD §11.5, DLG-D9); this service only ends the
+// now-inert/no-longer-servable rows.
 type CascadeService struct {
 	delegations port.DelegationRepository
 	settings    port.SettingsRepository
@@ -79,6 +81,43 @@ func (s *CascadeService) EndForUser(ctx context.Context, tenantID, userID uuid.U
 		})
 	}
 	return nil
+}
+
+// EndForDisabledDelegate handles User Profile's UserUpdated{status:
+// disabled} (Bug 2). It ends every active/scheduled delegation where
+// delegateID is the delegate and emits DelegationEnded per row —
+// end_reason=delegate_disabled, distinct from EndForUser's
+// delegate_removed (that fires on tenant-membership removal, a different
+// signal; "disabled" is not "removed"). DEL-7/DLG-EVT-4's delegator-side
+// silence rule does not apply here: every row this query matches is, by
+// definition, delegate-side.
+//
+// No User Profile pointer-clear call here (unlike EndForUser): the
+// delegate pointer on the delegator's own user_availability row was
+// already cleared by User Profile itself, atomically within the same
+// transaction that flipped the delegate's status and published this very
+// UserUpdated event (LLD §8.8.16 K1 in iam-user-profile) — by the time
+// this consumer sees the event, User Profile's side is guaranteed done.
+func (s *CascadeService) EndForDisabledDelegate(ctx context.Context, tenantID, delegateID uuid.UUID) error {
+	return s.txRunner.RunInTx(ctx, func(txCtx context.Context) error {
+		rows, err := s.delegations.EndForDisabledDelegate(txCtx, tenantID, delegateID)
+		if err != nil {
+			return err
+		}
+		for _, d := range rows {
+			if err := enqueue(txCtx, domain.EventDelegationEnded, tenantID, d.ID.String(), "iam-system",
+				domain.DelegationEndedPayload{
+					DelegationID: d.ID, TenantID: tenantID,
+					DelegatorID: d.DelegatorID, DelegateID: d.DelegateID,
+					Scope: d.Scope, ScopeID: d.ScopeID,
+					EndedReason: domain.EndReasonDelegateDisabled,
+					ActorID:     domain.SystemActorID,
+				}); err != nil {
+				return err
+			}
+		}
+		return nil
+	})
 }
 
 // ScrubTenant handles TenantMembershipsPurged (LLD §11.6) — soft-deletes every

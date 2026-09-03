@@ -75,6 +75,16 @@ type DelegationRepository interface {
 	// bulk cascade, §12.1).
 	EndForUser(ctx context.Context, tenantID, userID uuid.UUID) ([]domain.Delegation, error)
 
+	// EndForDisabledDelegate cascades on User Profile's UserUpdated{status:
+	// disabled} (Bug 2) — closes (status='ended', deleted_at left NULL) any
+	// active/scheduled delegation where delegateID is the delegate. Unlike
+	// EndForUser, deleted_at is NOT set: "disabled" is not "removed from
+	// tenant" — the user is still a tenant member, so the row stays a
+	// queryable historical record like any other End/Cancel, not a scrub.
+	// Deliberately not optimistic-locked (terminal bulk cascade, §12.1,
+	// mirrors EndForUser).
+	EndForDisabledDelegate(ctx context.Context, tenantID, delegateID uuid.UUID) ([]domain.Delegation, error)
+
 	// SoftDeleteTenant cascades on TenantMembershipsPurged — soft-deletes every
 	// delegation row for the tenant (§11.6). No event emission.
 	SoftDeleteTenant(ctx context.Context, tenantID uuid.UUID) error

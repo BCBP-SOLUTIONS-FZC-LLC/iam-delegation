@@ -19,11 +19,15 @@ const (
 // opts is forwarded verbatim to events.NewSQSConsumerWithClient — the
 // composition root (cmd/server/main.go) passes
 // events.WithConsumerCodec(eventbus.GlueDecodeCodec{}) here so a
-// Glue-encoded MembershipRevoked/TenantMembershipsPurged from Core decodes
-// correctly (LLD §10.1, DLG-D21); this package stays free of any outbound
-// adapter import by accepting the option opaquely rather than importing
-// eventbus itself (Clean Architecture — inbound adapters never depend on
-// outbound adapters directly).
+// Glue-encoded MembershipRevoked/TenantMembershipsPurged from Core, or a
+// Glue-encoded UserUpdated from User Profile (Bug 2's second subscription
+// onto this queue), decodes correctly (LLD §10.1, DLG-D21) — the decode
+// codec is registry-agnostic (the 18-byte Glue wire header is
+// self-describing), so it needs no per-producer configuration to handle a
+// second event source; this package stays free of any outbound adapter
+// import by accepting the option opaquely rather than importing eventbus
+// itself (Clean Architecture — inbound adapters never depend on outbound
+// adapters directly).
 //
 // Kept separate from NewCascadeConsumer (cascade_consumer.go) so
 // CascadeConsumer itself has zero SQS/events-transport dependency and stays

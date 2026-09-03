@@ -409,6 +409,37 @@ func (r *DelegationRepository) EndForUser(ctx context.Context, tenantID, userID 
 	return out, err
 }
 
+// EndForDisabledDelegate cascades on User Profile's UserUpdated{status:
+// disabled} (Bug 2) — closes any active OR scheduled delegation where
+// delegateID is the delegate. deleted_at is deliberately left NULL: unlike
+// EndForUser (MembershipRevoked — the user leaving the tenant entirely), a
+// disabled delegate is still a tenant member, so the row remains a normal
+// historical record (matching regular End/Cancel semantics), not a scrub.
+func (r *DelegationRepository) EndForDisabledDelegate(ctx context.Context, tenantID, delegateID uuid.UUID) ([]domain.Delegation, error) {
+	var out []domain.Delegation
+	err := withPool(ctx, r.pool, func(tx pgx.Tx) error {
+		rows, err := tx.Query(ctx, `
+			UPDATE delegations SET status = 'ended'
+			WHERE tenant_id = $1 AND delegate_id = $2
+			  AND status IN ('active', 'scheduled') AND deleted_at IS NULL
+			RETURNING `+delegationCols,
+			tenantID, delegateID)
+		if err != nil {
+			return err
+		}
+		defer rows.Close()
+		for rows.Next() {
+			d, err := scanDelegation(rows)
+			if err != nil {
+				return err
+			}
+			out = append(out, *d)
+		}
+		return rows.Err()
+	})
+	return out, err
+}
+
 // SoftDeleteTenant cascades on TenantMembershipsPurged — soft-deletes every
 // non-deleted delegation row for the tenant (LLD §11.6). No event emission.
 func (r *DelegationRepository) SoftDeleteTenant(ctx context.Context, tenantID uuid.UUID) error {

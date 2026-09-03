@@ -80,3 +80,15 @@ type TenantMembershipsPurgedPayload struct {
 	TenantID uuid.UUID `json:"tenant_id"`
 	ActorID  uuid.UUID `json:"actor_id"`
 }
+
+// UserUpdatedPayload is the data of User Profile's (iam-user-profile's)
+// consumed UserUpdated event on iam.user.events (Bug 2). Mirrors the
+// subset of iam-user-profile's UserUpdatedPayload this service actually
+// needs — Email and other changed-field-specific values are intentionally
+// omitted, not decoded. Status is a pointer because it is only populated
+// upstream when "status" is present in ChangedFields.
+type UserUpdatedPayload struct {
+	UserID        uuid.UUID `json:"user_id"`
+	ChangedFields []string  `json:"changed_fields"`
+	Status        *string   `json:"status,omitempty"`
+}

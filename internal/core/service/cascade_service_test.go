@@ -67,6 +67,69 @@ func TestCascadeService_EndForUser_DelegatorDelegateAsymmetry(t *testing.T) {
 	}
 }
 
+// TestCascadeService_EndForDisabledDelegate_EmitsEndedForEveryRow is Bug 2's
+// service-level test: every row EndForDisabledDelegate's repository call
+// returns is, by construction, delegate-side (delegateID is the disabled
+// user), so — unlike EndForUser's asymmetric silence — every row emits
+// DelegationEnded{delegate_disabled}. No User Profile call is made: the
+// delegator's pointer was already cleared by User Profile itself before
+// this event was even published.
+func TestCascadeService_EndForDisabledDelegate_EmitsEndedForEveryRow(t *testing.T) {
+	repo, _, up, pub, svc := newCascadeHarness()
+	tenantID := uuid.New()
+	disabledDelegate := uuid.New()
+	delegatorA := uuid.New()
+	delegatorB := uuid.New()
+
+	rowA := domain.Delegation{
+		ID: uuid.New(), TenantID: tenantID,
+		DelegatorID: delegatorA, DelegateID: disabledDelegate,
+		Scope: domain.ScopeAll, Status: domain.DelegationEnded,
+	}
+	rowB := domain.Delegation{
+		ID: uuid.New(), TenantID: tenantID,
+		DelegatorID: delegatorB, DelegateID: disabledDelegate,
+		Scope: domain.ScopeDepartment, Status: domain.DelegationEnded,
+	}
+	repo.endForDisabledDelegateResult = []domain.Delegation{rowA, rowB}
+
+	err := svc.EndForDisabledDelegate(context.Background(), tenantID, disabledDelegate)
+	require.NoError(t, err)
+
+	events := pub.snapshot()
+	require.Len(t, events, 2, "every row is delegate-side and must emit an event")
+	for _, e := range events {
+		assert.Equal(t, domain.EventDelegationEnded, e.Type)
+		payload, ok := e.Data.(domain.DelegationEndedPayload)
+		require.True(t, ok)
+		assert.Equal(t, disabledDelegate, payload.DelegateID)
+		assert.Equal(t, domain.EndReasonDelegateDisabled, payload.EndedReason,
+			"must be delegate_disabled, distinct from EndForUser's delegate_removed")
+	}
+
+	assert.Empty(t, up.calls, "User Profile's delegate pointer was already cleared atomically by its own disable flow — no redundant call")
+}
+
+func TestCascadeService_EndForDisabledDelegate_NoMatchingRows_NoEvents(t *testing.T) {
+	repo, _, up, pub, svc := newCascadeHarness()
+	repo.endForDisabledDelegateResult = nil
+
+	err := svc.EndForDisabledDelegate(context.Background(), uuid.New(), uuid.New())
+	require.NoError(t, err)
+	assert.Empty(t, pub.snapshot())
+	assert.Empty(t, up.calls)
+}
+
+func TestCascadeService_EndForDisabledDelegate_RepoError_Propagates(t *testing.T) {
+	repo, _, _, pub, svc := newCascadeHarness()
+	wantErr := errors.New("db down")
+	repo.endForDisabledDelegateErr = wantErr
+
+	err := svc.EndForDisabledDelegate(context.Background(), uuid.New(), uuid.New())
+	require.ErrorIs(t, err, wantErr)
+	assert.Empty(t, pub.snapshot())
+}
+
 func TestCascadeService_ScrubTenant_OrderAndShortCircuit(t *testing.T) {
 	t.Run("delegation repository error short-circuits before settings", func(t *testing.T) {
 		repo, settings, _, _, svc := newCascadeHarness()

@@ -59,6 +59,19 @@ const (
 	EventTenantMembershipsPurged = "TenantMembershipsPurged"
 )
 
+// EventUserUpdated is User Profile's (iam-user-profile's) consumed
+// UserUpdated signal on iam.user.events — a second SNS subscription onto
+// the same delegation-cascade-q queue, filtered to EventType = "user.updated"
+// (dot-notation: User Profile's own EventType convention, unlike Core's
+// PascalCase above). Bug 2 (cross-service): a delegate being disabled is
+// NOT a MembershipRevoked/tenant-removal signal — "disabled" is a status
+// flip within the tenant, not a departure — so without this second
+// subscription an active delegation whose delegate gets disabled was never
+// ended, silently stranding it (delegate_disabled below). Only dispatched
+// when the decoded payload's status field is "disabled"; changed_fields
+// alone cannot say what status changed TO.
+const EventUserUpdated = "user.updated"
+
 // Topic is the single dedicated SNS topic this service publishes to
 // (DLG-D5) — unlike O&M there is no RoutingPublisher; one topic, three types.
 const Topic = "iam.delegation.events"

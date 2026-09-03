@@ -9,7 +9,7 @@
 | Parent decision | **ADR-0008** (`02-hld-delta-delegation.md`, v2 / Option C) — the fourth O&M extraction, authorised by ADR-0007's explicit deferral of `delegations` |
 | Subsystem | Identity & Access Management |
 | Wave | 4 of 4 (the deferred hot-path table; resolved by removing delegations from I-8 entirely) |
-| Version | 2.5 |
+| Version | 2.6 |
 | Date | 2026-09-03 |
 | Status | Approved for implementation |
 | Audience | IAM platform engineering (owner), Core Org & Membership engineering (drops `delegations`; membership-existence + dept-delegate callee; removal-signal producer), Workflow Service (delegation-event consumer), User Profile (availability callee), AuthZ Enrichment (drops `active_delegations[]`), SRE |
@@ -27,6 +27,7 @@
 | 2.3 | 2026-08-25 | **Post-implementation correction, confirmed by a direct cross-service compatibility audit against `iam-org-membership`'s actual (not just documented) code.** Two corrections to §10.1's Core-signal contract (DLG-Q4): (1) Core renamed `TenantOffboarded` to **`TenantMembershipsPurged`** (identical payload shape) to avoid colliding with Realm Provisioner's own, differently-scoped `TenantOffboarded` event, which Core only ever consumes and never re-emits; (2) both consumed event types are published on the **same** topic, `iam.membership.events` — there is no second upstream topic (`iam.tenant.events` was never actually used for this signal). §2, §10.1, §11.6, and §18.2 are updated to match; DLG-Q4's "requires Core to add the emission" cross-team-coordination note is closed — the audit confirmed Core ships `MembershipRevoked` and `TenantMembershipsPurged` today, both correctly enqueued atomically with the triggering write. Also newly documented: Core Glue-encodes both event types by default in its own committed deployment configuration, independently of this service's own outbound Glue configuration (§10.3.1) — the consumer side needs a decode-capable codec regardless of whether this service publishes with `NoopCodec` or `GlueCodec`; the as-built fix is `eventbus.GlueDecodeCodec` (`ARCHITECTURE.md`'s "Session-specific decisions" DLG-D21). No schema, API, or published-event content changed — this revision only corrects the consumed-event contract to match Core's actual production behavior. |
 | 2.4 | 2026-08-25 | **Post-implementation correction — logging/database/events pass-through audits against `iam-user-profile`'s/`iam-org-membership`'s actual code (DLG-D22/D23/D24), plus one genuine spec bug found while writing this revision.** (1) **`api/asyncapi.yaml`'s `EventEnvelope.specversion` declared `const: "1.0"`, but the actual (and both siblings') wire value is `"1"`** — `events.WithSchemaVersion("1")` was itself missing from this service's publish path until DLG-D24 fixed it (§10.3 corrected to match; DLG-EVT-2's "byte-identical to O&M" invariant now holds for `specversion` too, not just payload shape). (2) §10.4 now documents that `outbox.Runner`'s tunables are `OUTBOX_*`-env-configurable (previously hardcoded) and that a fourth `cmd/server` background goroutine calls `PrunePublished` on a retention ticker — without it `outbox_events` grew unbounded (DLG-D24). (3) §14.5 gains the `outbox_dead_letters_total` alert, previously undocumented and unalerted (DLG-D24). Logging (DLG-D22: switched to `platform-gincommon/pkg/logger.NewLogger`) and database/`pgcommon` pass-through (DLG-D23: `DSNFromEnv`/`MigrationDSNFromEnv`/`PG_STATEMENT_TIMEOUT` support) were implementation-conformance fixes with no LLD-visible design content and are documented only in `ARCHITECTURE.md`'s decision register and `CHANGELOG.md`, per this doc's existing convention (cf. 2.1's "no design change" precedent) — noted here only for revision-history completeness. No schema, API route, or published-event *payload* content changed in this revision. |
 | 2.5 | 2026-09-03 | **Cross-service bug fix (DLG-D25), confirmed against `iam-user-profile`'s actual runtime behavior.** A delegation created with a future `starts_at` immediately called User Profile's `SetAvailability` and emitted `DelegationStarted`, showing the delegator as OOO and routing Workflow work to the delegate before the leave actually began. Fixed by adding a `scheduled` value to `delegation_status` (§7.1/§7.2.1) preceding `active` in the state machine, and a new `idx_delegations_starts_at` partial index. DLG-2 Create (§11.1) now branches on `starts.After(now)`: the existing immediate-`active` path is unchanged for the default/near-now case (within `skewTolerance`, 5s), but a genuinely future `starts_at` skips the User Profile call and `DelegationStarted` entirely and inserts the row as `scheduled`. A new `delegation-activation` CronJob (§11.1a, `*/5 * * * *`, mirrors §11.3's expiry-cron structure) calls User Profile and activates the row (`Activate`, optimistic-lock-guarded) once `starts_at` is reached, emitting `DelegationStarted` then. DLG-3 Cancel (§11.2) and the `MembershipRevoked` cascade (§11.5) were both broadened to treat `scheduled` as non-terminal alongside `active`, so a scheduled delegation is cancellable before activation and is ended (not stranded) if the delegator leaves the tenant first. No public API request/response shape changed; `GET .../delegations` (DLG-1)'s `status='active'` filter is unaffected (a `scheduled` row is, correctly, not yet listed as active). Full implementation rationale in `ARCHITECTURE.md`'s "Session-specific decisions" DLG-D25; §17 test-plan prose (state-machine/coverage bullets) and §11.3/§11.4's cron-topology cross-references were not re-walked line-by-line in this pass — treat this revision as covering the schema/flow/status-machine content only, not a full document reread. |
+| 2.6 | 2026-09-03 | **Cross-service bug fix (Bug 2/DLG-D26), confirmed against `iam-user-profile`'s actual runtime behavior.** Disabling a delegate never ended their active delegations — this service's only inbound cascade was Core's `MembershipRevoked` (tenant departure), and "disabled" is a status flip within the tenant, not a departure; a disabled delegate's grants stayed `active` indefinitely. `EndReason` (§7.1) gains a fifth value, `delegate_disabled`, distinct from `delegate_removed`. New §11.5a documents the fix: `delegation-cascade-q` now carries a second SNS subscription onto User Profile's `iam.user.events` (filtered to `EventType = "user.updated"`, provisioned externally), `CascadeConsumer.Handle` dispatches only when the decoded payload's `status == "disabled"`, and the new `CascadeService.EndForDisabledDelegate`/`DelegationRepository.EndForDisabledDelegate` end every active/scheduled delegation where the disabled user is the delegate — deliberately without setting `deleted_at` (unlike `EndForUser`'s hard soft-delete: disabled ≠ removed) and without a User Profile pointer-clear call back (User Profile already cleared it atomically before publishing the triggering event). §10.5's event catalogue and §10.7 DLG-EVT-3/4 updated to match. No schema/API *request* shape changed — `EndReason` is payload-only, never a column. §17 test-plan prose was not re-walked line-by-line in this pass, mirroring 2.5's precedent. |
 
 ---
 
@@ -268,7 +269,7 @@ CREATE TYPE delegation_status AS ENUM ('scheduled', 'active', 'ended', 'cancelle
 
 `scheduled` (DLG-D25) is the initial status for a delegation whose `starts_at` is genuinely in the future — it precedes `active` in the state machine (`scheduled → active → ended|cancelled`, or `scheduled → cancelled` directly). A row created with no `starts_at`, or one within `skewTolerance` (5s) of `now`, still goes straight to `active` as before; this only defers the caller-requested future case. See revision 2.5 below and ARCHITECTURE.md's "Session-specific decisions" DLG-D25 for the full rationale and reconciler flow (a dedicated `delegation-activation` CronJob promotes `scheduled` rows to `active` once `starts_at` is reached).
 
-`EndReason` is **event-payload-only** (never a column), and — per DLG-Q5 — its domain is now `expired | cancelled | delegate_removed | review_expired`. Adopting `review_expired` (the shipped code's value) as contract makes review-driven auto-ends distinguishable from `ends_at` expiry in Audit and Notification, which is strictly more useful than overloading `expired`.
+`EndReason` is **event-payload-only** (never a column), and — per DLG-Q5 — its domain is now `expired | cancelled | delegate_removed | review_expired | delegate_disabled`. Adopting `review_expired` (the shipped code's value) as contract makes review-driven auto-ends distinguishable from `ends_at` expiry in Audit and Notification, which is strictly more useful than overloading `expired`. `delegate_disabled` (Bug 2, DLG-D26) is distinct from `delegate_removed`: the latter fires on `MembershipRevoked` (the delegate leaving the tenant entirely), the former on User Profile's `UserUpdated{status: disabled}` (a status flip within the tenant — "disabled ≠ removed").
 
 ### 7.2 Tables
 
@@ -681,12 +682,13 @@ This service is **both a producer and a consumer** — the first of the four O&M
 
 ### 10.1 Inbound — SQS consumer
 
-The service has **one** active inbound subscription: Core's user-removal / tenant-offboarding signals, which drive the delegate-side cascade (§11.5, DLG-Q4). Both consumed event types are published by Core on the **same** topic, `iam.membership.events` — there is no second upstream topic for this signal (corrected in v2.3; an earlier revision of this table assumed a separate `iam.tenant.events` source).
+The service has **two** active inbound subscriptions, both landing on the same `delegation-cascade-q` queue: Core's user-removal / tenant-offboarding signals, which drive the delegate-side cascade (§11.5, DLG-Q4), and — as of Bug 2/DLG-D26 — User Profile's `UserUpdated` signal, which drives the delegate-disabled cascade (§11.5a). The two Core-consumed event types are published on the **same** topic, `iam.membership.events` — there is no second upstream topic for that signal (corrected in v2.3; an earlier revision of this table assumed a separate `iam.tenant.events` source). `UserUpdated` is a genuinely separate, third topic (`iam.user.events`, User Profile's own).
 
 | Source topic | Event type(s) | SQS queue | DLQ | `maxReceiveCount` | Filter policy | Dispatched to |
 |---|---|---|---|---|---|---|
 | `iam.membership.events` | `MembershipRevoked` | `delegation-cascade-q` | `delegation-cascade-q-dlq` | 5 | `EventType IN [MembershipRevoked]` | `CascadeService.EndForUser` (§11.5) |
 | `iam.membership.events` | `TenantMembershipsPurged` | `delegation-cascade-q` | `delegation-cascade-q-dlq` | 5 | `EventType IN [TenantMembershipsPurged]` | `CascadeService.ScrubTenant` (§11.6) |
+| `iam.user.events` | `UserUpdated` (dispatched only when the decoded payload's `status == "disabled"`; the filter policy admits every `UserUpdated`, since it can only match on `EventType`) | `delegation-cascade-q` | `delegation-cascade-q-dlq` | 5 | `EventType IN [user.updated]` | `CascadeService.EndForDisabledDelegate` (§11.5a, Bug 2/DLG-D26) |
 
 The queue takes the `lifecycle`-adjacent naming used by the sibling services (`delegation-cascade-q`, not the plain `<topic>-<consumer>-q`, mirroring `iam-group-mapping`'s and User Profile's `tenant-lifecycle-*-q`). Idempotency is via `processed_events` keyed on the envelope `id` (§7.2.3); a redelivery is a no-op. A message whose payload fails schema-decode is routed to the DLQ rather than retried indefinitely.
 
@@ -756,7 +758,7 @@ A single SNS topic, `events.NewSNSPublisher` (no RoutingPublisher — one topic,
 | Event Type | Emitted when | Payload (key fields) | Consumers |
 |---|---|---|---|
 | `DelegationStarted` | DLG-2 create, and the create leg of DLG-5 reassign | `delegation_id, tenant_id, delegator_id, delegate_id, scope, scope_id, starts_at, ends_at, actor_id` | **Workflow Service** (reroute), Notification, Audit |
-| `DelegationEnded` | DLG-3 cancel, `ends_at` expiry (DLG-I1), review auto-end (DLG-I2), the end leg of DLG-5, and the delegate-removed cascade (§11.5) | `delegation_id, tenant_id, delegator_id, delegate_id, ended_reason, actor_id` — `ended_reason ∈ {expired, cancelled, delegate_removed, review_expired}` | **Workflow Service** (restore), Notification, Audit |
+| `DelegationEnded` | DLG-3 cancel, `ends_at` expiry (DLG-I1), review auto-end (DLG-I2), the end leg of DLG-5, the delegate-removed cascade (§11.5), and the delegate-disabled cascade (§11.5a, Bug 2) | `delegation_id, tenant_id, delegator_id, delegate_id, ended_reason, actor_id` — `ended_reason ∈ {expired, cancelled, delegate_removed, review_expired, delegate_disabled}` | **Workflow Service** (restore), Notification, Audit |
 | `DelegationReviewRequested` | `delegation-review` sweep — once per calendar day for each of the 3 days before `review_due_at` (DLG-I2, DLG-Q6) | `delegation_id, tenant_id, delegator_id, delegate_id, days_remaining` — `days_remaining ∈ {3,2,1}` | Notification, Audit |
 
 **Notification fan-out by event type:**
@@ -779,8 +781,8 @@ Publishing is at-least-once (outbox + SNS); every consumer is idempotent via `pr
 |---|---|
 | DLG-EVT-1 | Every event is published through the transactional outbox, atomic with the DB write that caused it — a committed lifecycle change and its event are all-or-nothing. |
 | DLG-EVT-2 | Event `type` values and payload `data` shapes are byte-identical to O&M §7.4 (plus the `review_expired` enum value and the topic/`source` change); consumers dispatch by `type` on `iam.delegation.events`. |
-| DLG-EVT-3 | `DelegationEnded` fires on **every** end path — cancel (`cancelled`), `ends_at` expiry (`expired`), review auto-end (`review_expired`), delegate-removed cascade (`delegate_removed`) — never path-dependent (DEL-7). |
-| DLG-EVT-4 | Delegator-side removal ends the row **silently** (no event), preserving the O&M DEL-7 asymmetry as a deliberate carry-over. |
+| DLG-EVT-3 | `DelegationEnded` fires on **every** end path — cancel (`cancelled`), `ends_at` expiry (`expired`), review auto-end (`review_expired`), delegate-removed cascade (`delegate_removed`), delegate-disabled cascade (`delegate_disabled`, Bug 2/DLG-D26) — never path-dependent (DEL-7). |
+| DLG-EVT-4 | Delegator-side removal ends the row **silently** (no event), preserving the O&M DEL-7 asymmetry as a deliberate carry-over. Does not apply to the delegate-disabled cascade (§11.5a): `EndForDisabledDelegate` only ever matches delegate-side rows by construction, so every row it ends emits `DelegationEnded`. |
 | DLG-EVT-5 | The `delegation-review` sweep emits `DelegationReviewRequested` **once per calendar-day bucket** in the 3-day window before `review_due_at`. `days_remaining` decrements from 3 → 2 → 1 across consecutive daily cron ticks. `review_last_warned_bucket` tracks the last `days_remaining` value notified; extend/reassign reset it to NULL, re-arming the full 3-day cascade for the new window (DLG-Q6). |
 | DLG-EVT-6 | Audit consumes all three types on `delegation-audit-q` (no filter); every event and its DB effect are traceable via the shared `trace_id` (§14.3); cron events carry system sentinels. |
 | DLG-EVT-7 | Payloads are self-contained snapshots; consumers are idempotent (`processed_events`) and order-insensitive, converging on the latest state (§10.6). |
@@ -1027,6 +1029,37 @@ sequenceDiagram
 ```
 
 The stranding hazard is resolved synchronously in Core before removal (Workflow gate + P-26). Under Option C, Core has no `delegations` table, so the §8.8.4 dept-scope precision (WFI-11) is a synchronous Core to Delegation call (DLG-I3) on the admin removal path — not a hot path; on a Delegation outage the gate degrades to tenant-wide impact (still correct, less precise). Row-ending is asynchronous and safe (rows inert once the user has no membership, §7.6.5).
+
+### 11.5a Delegate-disabled cascade (Bug 2, DLG-D26) — "disabled ≠ removed"
+
+§11.5 above handles a user **leaving the tenant** (`MembershipRevoked`). A user being **disabled** — still a tenant member, just unable to authenticate or be assigned work — is a different signal, and before this fix had no cascade at all: an active delegation to a disabled delegate stayed `active` forever, with Workflow continuing to route work to someone who could never act on it.
+
+`delegation-cascade-q` carries a **second** SNS subscription for this — User Profile's `iam.user.events`, filtered to `EventType = "user.updated"` (provisioned externally, like every queue subscription in this repo; §10.1's "one inbound subscription" framing predates this addition). Most `UserUpdated` deliveries are unrelated field changes the filter policy cannot exclude (it only matches on `EventType`), so the consumer decodes each payload and only dispatches when `status == "disabled"`.
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant UP as User Profile
+    participant DLG as Delegation Service
+    participant PG as Delegation Postgres
+
+    Note over UP: PatchIdentity(status=disabled): clears the delegate pointer on every<br/>delegator's user_availability row (ClearInboundDelegates) AND publishes<br/>UserUpdated{status:disabled} atomically in the same transaction (LLD §8.8.16 K1, iam-user-profile)
+    UP-->>DLG: UserUpdated{user_id, changed_fields:[status], status:"disabled"} (iam.user.events)
+    DLG->>DLG: decode payload; status != "disabled" → ack, no dispatch (most deliveries)
+    DLG->>PG: UPDATE delegations SET status='ended' WHERE tenant_id=$1 AND delegate_id=$2<br/>AND status IN ('active','scheduled') AND deleted_at IS NULL<br/>RETURNING *
+    Note over DLG,PG: deleted_at is NOT set (disabled ≠ removed) — unlike EndForUser's hard soft-delete
+    loop per ended delegation (every row is delegate-side by construction)
+        DLG->>PG: RunInTx { outbox DelegationEnded{delegate_disabled} }
+    end
+    Note over DLG,UP: No pointer-clear call back to User Profile — it already cleared the<br/>delegate pointer atomically before this event was even published
+```
+
+Two deliberate asymmetries with §11.5's `EndForUser`:
+
+1. **No `deleted_at`.** A disabled user is still a tenant member — the ended row remains a normal historical record (matching plain `End`/`Cancel` semantics), not a scrub. `EndForUser`'s hard soft-delete is specific to `MembershipRevoked`.
+2. **No User Profile pointer-clear call.** `EndForUser` best-effort clears the delegator's `delegate_id` pointer because Core's `MembershipRevoked` doesn't touch User Profile at all. Here, User Profile *is* the producer of the triggering event, and it already cleared that pointer — atomically, inside the same transaction that published `UserUpdated` — before this consumer ever saw it (LLD §8.8.16 K1 in `iam-user-profile`'s own LLD). Calling `SetAvailability{ClearDelegate:true}` again would be a safe no-op, but a redundant network call with nothing to fix.
+
+DEL-7/DLG-EVT-4's delegator-side silence rule (§11.5) does not apply here: `EndForDisabledDelegate`'s query only ever matches rows where `delegate_id = disabledUserID`, so every row it ends is delegate-side by definition — every one emits `DelegationEnded`.
 
 ### 11.6 Tenant-lifecycle cleanup
 

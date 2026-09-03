@@ -397,6 +397,46 @@ func TestDelegationRepository_EndForUser_IncludesScheduled(t *testing.T) {
 	assert.NotNil(t, ended[0].DeletedAt)
 }
 
+// TestDelegationRepository_EndForDisabledDelegate is Bug 2's repository-level
+// test: active/scheduled rows where delegateID is the delegate are ended
+// WITHOUT deleted_at being set (disabled ≠ removed — the row stays a normal
+// historical record, unlike EndForUser's hard soft-delete). A row where the
+// same user is the DELEGATOR, and a terminal row, must both be untouched.
+func TestDelegationRepository_EndForDisabledDelegate(t *testing.T) {
+	db := setupTestDB(t)
+	ctx := context.Background()
+	repo := NewDelegationRepository(db.App)
+	tenantID := uuid.New()
+	disabledDelegate := uuid.New()
+	ctxA := withTenant(ctx, tenantID)
+
+	activeAsDelegate := seedDelegation(t, ctx, db.Raw, seedDelegationOpts{TenantID: tenantID, DelegateID: disabledDelegate, Status: "active"})
+	scheduledAsDelegate := seedDelegation(t, ctx, db.Raw, seedDelegationOpts{TenantID: tenantID, DelegateID: disabledDelegate, Status: "scheduled"})
+	// Same user as DELEGATOR on an unrelated row — must not be touched;
+	// EndForDisabledDelegate only ever matches on delegate_id.
+	asDelegatorUntouched := seedDelegation(t, ctx, db.Raw, seedDelegationOpts{TenantID: tenantID, DelegatorID: disabledDelegate, Status: "active"})
+	// Already-terminal row for the same delegate — must not be re-ended.
+	alreadyEnded := seedDelegation(t, ctx, db.Raw, seedDelegationOpts{TenantID: tenantID, DelegateID: disabledDelegate, Status: "ended"})
+
+	ended, err := repo.EndForDisabledDelegate(ctxA, tenantID, disabledDelegate)
+	require.NoError(t, err)
+	endedIDs := idsOf(ended)
+	assert.ElementsMatch(t, []uuid.UUID{activeAsDelegate, scheduledAsDelegate}, endedIDs)
+	for _, d := range ended {
+		assert.Equal(t, domain.DelegationEnded, d.Status)
+		assert.Nil(t, d.DeletedAt, "delegate_disabled must NOT soft-delete the row — disabled is not removed from tenant")
+	}
+
+	var status string
+	var deletedAt *time.Time
+	require.NoError(t, db.Raw.QueryRow(ctx, `SELECT status, deleted_at FROM delegations WHERE id = $1`, asDelegatorUntouched).Scan(&status, &deletedAt))
+	assert.Equal(t, "active", status, "a row where the disabled user is the DELEGATOR must be untouched")
+	assert.Nil(t, deletedAt)
+
+	require.NoError(t, db.Raw.QueryRow(ctx, `SELECT status FROM delegations WHERE id = $1`, alreadyEnded).Scan(&status))
+	assert.Equal(t, "ended", status, "an already-terminal row must not be re-matched")
+}
+
 func TestDelegationRepository_SoftDeleteTenant(t *testing.T) {
 	db := setupTestDB(t)
 	ctx := context.Background()

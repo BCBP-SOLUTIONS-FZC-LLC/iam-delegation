@@ -111,6 +111,9 @@ type fakeDelegationRepository struct {
 	endForUserResult []domain.Delegation
 	endForUserErr    error
 
+	endForDisabledDelegateResult []domain.Delegation
+	endForDisabledDelegateErr    error
+
 	softDeleteTenantCalls int
 	softDeleteTenantErr   error
 }
@@ -302,6 +305,11 @@ func (f *fakeDelegationRepository) MarkReviewWarned(ctx context.Context, tenantI
 func (f *fakeDelegationRepository) EndForUser(ctx context.Context, tenantID, userID uuid.UUID) ([]domain.Delegation, error) {
 	f.rec.record("delegationRepo.EndForUser")
 	return f.endForUserResult, f.endForUserErr
+}
+
+func (f *fakeDelegationRepository) EndForDisabledDelegate(ctx context.Context, tenantID, delegateID uuid.UUID) ([]domain.Delegation, error) {
+	f.rec.record("delegationRepo.EndForDisabledDelegate")
+	return f.endForDisabledDelegateResult, f.endForDisabledDelegateErr
 }
 
 func (f *fakeDelegationRepository) SoftDeleteTenant(ctx context.Context, tenantID uuid.UUID) error {

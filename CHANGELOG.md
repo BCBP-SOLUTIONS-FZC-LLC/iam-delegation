@@ -49,6 +49,19 @@ index into those, not a duplicate of them.
   `MembershipRevoked` cascade) and `Cancel`/`End` now also accept `scheduled` rows, so a scheduled
   delegation for a member who leaves the tenant is cancelled rather than stranded (DLG-D25). See
   `iam-user-profile`'s matching CHANGELOG entry for the server-side counterpart fix.
+- Cross-service bug (Bug 2): disabling a delegate never ended their active delegations — this
+  service only ever cascaded on `MembershipRevoked` (full tenant removal), and "disabled" is not
+  "removed". A delegate's disabled account kept receiving routed work indefinitely. `delegation-
+  cascade-q` now carries a second SNS subscription onto User Profile's `iam.user.events`, filtered
+  to `EventType = "user.updated"`; on a decoded payload with `status: "disabled"`,
+  `CascadeService.EndForDisabledDelegate` ends every active/scheduled delegation where the
+  disabled user is the delegate, emitting `DelegationEnded{ended_reason: delegate_disabled}` — a
+  new value distinct from `delegate_removed`, and (unlike the `MembershipRevoked` cascade)
+  `deleted_at` is deliberately left unset, since the user is still a tenant member. No User Profile
+  pointer-clear call is needed here: User Profile already clears the delegate pointer atomically
+  within the same transaction that publishes this event (see `iam-user-profile`'s matching
+  CHANGELOG entry, which also documents the new `UserUpdatedPayload.status` field this fix
+  depends on) (DLG-D26).
 
 ### Known gaps
 

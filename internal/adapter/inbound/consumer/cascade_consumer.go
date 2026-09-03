@@ -15,8 +15,9 @@ import (
 // {cascade, offboarding}") — see ProcessedEvents' doc comment for why one
 // Go consumer type uses two bucket names.
 const (
-	consumerCascade     = "cascade"
-	consumerOffboarding = "offboarding"
+	consumerCascade         = "cascade"
+	consumerOffboarding     = "offboarding"
+	consumerDelegateDisable = "delegate_disable"
 )
 
 // systemPrincipal is the GUC user identity bound for this consumer's
@@ -32,6 +33,10 @@ const systemPrincipal = "iam-system"
 type cascadeService interface {
 	EndForUser(ctx context.Context, tenantID, userID uuid.UUID) error
 	ScrubTenant(ctx context.Context, tenantID uuid.UUID) error
+	// EndForDisabledDelegate handles Bug 2 — User Profile's
+	// UserUpdated{status: disabled}, a second SNS subscription onto this
+	// same queue (see Handle's doc comment).
+	EndForDisabledDelegate(ctx context.Context, tenantID, delegateID uuid.UUID) error
 }
 
 // idempotencyStore is the minimal slice of *ProcessedEvents this consumer
@@ -74,9 +79,15 @@ type Logger interface {
 // also what must gate the RLS check.
 type GUCBinder func(ctx context.Context, tenantID uuid.UUID, userID string) context.Context
 
-// CascadeConsumer handles delegation-cascade-q — this service's one
-// inbound subscription (LLD §10.1). Its Handle method matches
-// platform-events' events.Handler function type
+// CascadeConsumer handles delegation-cascade-q. As of Bug 2, this queue
+// carries TWO SNS subscriptions: Core's iam.membership.events
+// (MembershipRevoked, TenantMembershipsPurged — the original LLD §10.1
+// "one inbound subscription") and, additionally, User Profile's
+// iam.user.events filtered to EventType = "user.updated" — provisioned
+// externally (this repo does not own SNS/SQS infrastructure, only the
+// consumer code and CASCADE_QUEUE_URL wiring, matching every other queue
+// in this service). Its Handle method matches platform-events'
+// events.Handler function type
 // (func(ctx, events.Envelope[json.RawMessage]) error) and is passed
 // directly to events.NewSQSConsumerWithClient (see wiring.go).
 type CascadeConsumer struct {
@@ -103,21 +114,25 @@ func NewCascadeConsumer(cascade cascadeService, idempotency idempotencyStore, bi
 // Idempotency is checked before doing any work and recorded only after the
 // dispatched cascade fully succeeds, so a crash mid-cascade simply leaves
 // the event unmarked and redelivery reruns the (idempotent)
-// EndForUser/ScrubTenant call to completion.
+// EndForUser/ScrubTenant/EndForDisabledDelegate call to completion.
 //
 // A malformed/unparseable envelope id is logged and acked (returns nil,
 // ack-and-drop) — redelivery can never fix a permanently malformed id, so
 // retrying it forever would just wedge the queue (mirrors
 // iam-user-profile's user_event_consumer.go). An unrecognized event type is
 // also acked without dispatching — this queue's SNS filter policy is meant
-// to admit only MembershipRevoked/TenantMembershipsPurged (both on
-// iam.membership.events), so anything else arriving is unexpected but must
-// not crash the consumer. A payload that fails to
-// JSON-decode returns an error instead: LLD §10.1 routes a schema-decode
-// failure to the DLQ rather than retrying indefinitely, which happens
-// automatically via the queue's redrive policy (maxReceiveCount=5) once
-// this handler keeps returning an error — no explicit DLQ-routing code
-// belongs here.
+// to admit only MembershipRevoked/TenantMembershipsPurged (on
+// iam.membership.events) and UserUpdated (on iam.user.events, Bug 2), so
+// anything else arriving is unexpected but must not crash the consumer. A
+// UserUpdated event whose payload.status isn't "disabled" — the filter
+// policy matches on EventType only, not payload content, so most
+// UserUpdated deliveries are for unrelated field changes — is also acked
+// without dispatching; only "disabled" ever reaches CascadeService. A
+// payload that fails to JSON-decode returns an error instead: LLD §10.1
+// routes a schema-decode failure to the DLQ rather than retrying
+// indefinitely, which happens automatically via the queue's redrive policy
+// (maxReceiveCount=5) once this handler keeps returning an error — no
+// explicit DLQ-routing code belongs here.
 func (c *CascadeConsumer) Handle(ctx context.Context, env events.Envelope[json.RawMessage]) error {
 	eventID, err := uuid.Parse(env.ID)
 	if err != nil || eventID == uuid.Nil {
@@ -134,6 +149,19 @@ func (c *CascadeConsumer) Handle(ctx context.Context, env events.Envelope[json.R
 		consumerName = consumerCascade
 	case domain.EventTenantMembershipsPurged:
 		consumerName = consumerOffboarding
+	case domain.EventUserUpdated:
+		disabled, err := isUserUpdatedDisabled(env)
+		if err != nil {
+			return fmt.Errorf("cascadeconsumer: decode UserUpdated payload for event %s: %w", env.ID, err)
+		}
+		if !disabled {
+			// Most UserUpdated deliveries are unrelated field changes
+			// (display_name, timezone, ...) — the filter policy can only
+			// match on EventType, not payload.status. Nothing to dedup or
+			// cascade; ack and move on.
+			return nil
+		}
+		consumerName = consumerDelegateDisable
 	default:
 		c.logger.Warn("no handler registered for event type on delegation-cascade-q — acknowledging to prevent redelivery", map[string]interface{}{
 			"event_type": env.Type,
@@ -161,6 +189,8 @@ func (c *CascadeConsumer) Handle(ctx context.Context, env events.Envelope[json.R
 		handleErr = c.handleMembershipRevoked(ctx, env)
 	case domain.EventTenantMembershipsPurged:
 		handleErr = c.handleTenantMembershipsPurged(ctx, env)
+	case domain.EventUserUpdated:
+		handleErr = c.handleUserDisabled(ctx, env)
 	}
 	if handleErr != nil {
 		return handleErr
@@ -207,6 +237,43 @@ func (c *CascadeConsumer) handleTenantMembershipsPurged(ctx context.Context, env
 	gucCtx := c.bindGUC(ctx, payload.TenantID, systemPrincipal)
 	if err := c.cascade.ScrubTenant(gucCtx, payload.TenantID); err != nil {
 		return fmt.Errorf("cascadeconsumer: ScrubTenant tenant=%s: %w", payload.TenantID, err)
+	}
+	return nil
+}
+
+// isUserUpdatedDisabled decodes a UserUpdated payload and reports whether
+// its status field is "disabled" (Bug 2). false, nil for any other status
+// value or an absent status field (most UserUpdated deliveries — this
+// queue's filter policy admits every UserUpdated on iam.user.events, not
+// just status changes).
+func isUserUpdatedDisabled(env events.Envelope[json.RawMessage]) (bool, error) {
+	var payload domain.UserUpdatedPayload
+	if err := json.Unmarshal(env.Payload, &payload); err != nil {
+		return false, err
+	}
+	return payload.Status != nil && *payload.Status == "disabled", nil
+}
+
+// handleUserDisabled decodes a UserUpdated{status: disabled} payload —
+// already confirmed disabled by isUserUpdatedDisabled before Handle
+// dispatches here — and calls CascadeService.EndForDisabledDelegate
+// (Bug 2). tenantID comes from the envelope, not the payload: unlike
+// MembershipRevoked/TenantMembershipsPurged, UserUpdatedPayload carries no
+// tenant_id field of its own (it is User Profile's own event, scoped by
+// the envelope like every other event on iam.user.events).
+func (c *CascadeConsumer) handleUserDisabled(ctx context.Context, env events.Envelope[json.RawMessage]) error {
+	var payload domain.UserUpdatedPayload
+	if err := json.Unmarshal(env.Payload, &payload); err != nil {
+		return fmt.Errorf("cascadeconsumer: decode UserUpdated payload for event %s: %w", env.ID, err)
+	}
+	tenantID, err := uuid.Parse(env.TenantID)
+	if err != nil {
+		return fmt.Errorf("cascadeconsumer: envelope has invalid tenant_id for event %s: %w", env.ID, err)
+	}
+
+	gucCtx := c.bindGUC(ctx, tenantID, systemPrincipal)
+	if err := c.cascade.EndForDisabledDelegate(gucCtx, tenantID, payload.UserID); err != nil {
+		return fmt.Errorf("cascadeconsumer: EndForDisabledDelegate tenant=%s delegate=%s: %w", tenantID, payload.UserID, err)
 	}
 	return nil
 }
