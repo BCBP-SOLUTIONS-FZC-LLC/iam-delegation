@@ -6,6 +6,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -252,8 +253,8 @@ func TestGlueCodec_StartRefresher_TickFires_WithLogger(t *testing.T) {
 	codec, err := NewGlueCodec(context.Background(), client, "iam-delegation-events", []string{"DelegationStarted"})
 	require.NoError(t, err)
 
-	var warned bool
-	codec.WithLogger(warnLoggerFn(func() { warned = true }))
+	var warned atomic.Bool
+	codec.WithLogger(warnLoggerFn(func() { warned.Store(true) }))
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -261,7 +262,7 @@ func TestGlueCodec_StartRefresher_TickFires_WithLogger(t *testing.T) {
 	time.Sleep(80 * time.Millisecond)
 	cancel()
 	time.Sleep(20 * time.Millisecond)
-	_ = warned // checked indirectly — server returned 500 on refresh
+	_ = warned.Load() // checked indirectly — server returned 500 on refresh
 }
 
 // TestGlueCodec_StartRefresher_TickFires_NilLogger exercises the tick-fires-
