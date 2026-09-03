@@ -35,6 +35,10 @@ index into those, not a duplicate of them.
 - DLG-5 Reassign didn't preserve the old delegation's `ends_at` when omitted.
 - `Idempotency-Key` accepted whitespace-only keys and unbounded values; blank/whitespace keys
   and keys over 1 KiB are now rejected as `ErrValidation`.
+- `make test-ci` ran `go test ./...` three times in parallel (the unit/integration/rls
+  targets are the same colocated suite) and the Glue refresher tests raced on the mock
+  server's request log — both failed the CI `-race` gate. The suite now runs once, and
+  the mock is synchronized.
 - The monthly `delegation-cleanup` CronJob never purged `processed_events` — `cmd/reconciler`
   never wired a `ProcessedEvents` store.
 - The two reconciler deferred-counter metrics were registered but never incremented (DLG-D19).

@@ -6,6 +6,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -18,15 +19,48 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
+// glueCallLog records GetSchemaVersion request bodies from the mock
+// server. StartRefresher hits the handler from a background goroutine, so
+// every read/write goes through mu — otherwise `go test -race` (test-ci)
+// flags a data race on the slice.
+type glueCallLog struct {
+	mu     sync.Mutex
+	bodies [][]byte
+}
+
+func (l *glueCallLog) add(b []byte) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	l.bodies = append(l.bodies, append([]byte(nil), b...))
+}
+
+func (l *glueCallLog) len() int {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return len(l.bodies)
+}
+
+func waitUntil(t *testing.T, timeout time.Duration, pred func() bool) {
+	t.Helper()
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		if pred() {
+			return
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	t.Fatalf("timed out after %s waiting for condition", timeout)
+}
+
 // mockGlueServer returns an httptest.Server whose handler responds to
 // AWSGlue.GetSchemaVersion with a fixed SchemaVersionId UUID. It records every
 // request body so tests can assert on call counts.
-func mockGlueServer(t *testing.T, schemaVersionID string) (*httptest.Server, *[][]byte) {
+func mockGlueServer(t *testing.T, schemaVersionID string) (*httptest.Server, *glueCallLog) {
 	t.Helper()
-	var bodies [][]byte
+	log := &glueCallLog{}
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		body, _ := io.ReadAll(r.Body)
-		bodies = append(bodies, body)
+		log.add(body)
 		w.Header().Set("Content-Type", "application/x-amz-json-1.1")
 		_ = json.NewEncoder(w).Encode(map[string]any{
 			"SchemaVersionId": schemaVersionID,
@@ -34,7 +68,7 @@ func mockGlueServer(t *testing.T, schemaVersionID string) (*httptest.Server, *[]
 		})
 	}))
 	t.Cleanup(srv.Close)
-	return srv, &bodies
+	return srv, log
 }
 
 // newTestGlueClient builds a *glue.Client pointed at the given URL with static
@@ -121,7 +155,7 @@ func TestNewGlueCodec_HappyPath(t *testing.T) {
 	codec, err := NewGlueCodec(context.Background(), client, "iam-delegation-events", []string{schemaName})
 	require.NoError(t, err)
 	require.NotNil(t, codec)
-	require.Len(t, *bodies, 1, "one GetSchemaVersion call expected")
+	require.Equal(t, 1, bodies.len(), "one GetSchemaVersion call expected")
 	require.Equal(t, schemaVersionID, codec.versionCache[schemaName])
 }
 
@@ -181,7 +215,7 @@ func TestGlueCodec_Encode_CacheMiss(t *testing.T) {
 	_, gotID, err := codec.Encode(context.Background(), "DelegationEnded", payload)
 	require.NoError(t, err)
 	require.Equal(t, schemaVersionID, gotID)
-	require.Len(t, *bodies, 1, "cache miss must trigger one GetSchemaVersion call")
+	require.Equal(t, 1, bodies.len(), "cache miss must trigger one GetSchemaVersion call")
 }
 
 // TestGlueCodec_StartRefresher_ExitsOnContextCancel starts the refresher with a
@@ -219,13 +253,11 @@ func TestGlueCodec_StartRefresher_TickFires_Success(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	codec.StartRefresher(ctx, 20*time.Millisecond)
-	time.Sleep(80 * time.Millisecond) // allow ≥1 tick
+	// Wait for the tick instead of a fixed sleep — under `make test-ci`
+	// (-race + loaded runner) 80ms was not enough for the AWS SDK round-trip.
+	waitUntil(t, 2*time.Second, func() bool { return bodies.len() >= 2 })
 	cancel()
-	time.Sleep(20 * time.Millisecond) // let goroutine exit
 
-	// The refresh must have updated the cache and called the server at least twice
-	// (once in NewGlueCodec pre-fetch + at least once on refresh tick).
-	require.GreaterOrEqual(t, len(*bodies), 2, "refresh tick must call GetSchemaVersion")
 	codec.mu.RLock()
 	cached := codec.versionCache["DelegationStarted"]
 	codec.mu.RUnlock()
@@ -236,10 +268,9 @@ func TestGlueCodec_StartRefresher_TickFires_Success(t *testing.T) {
 // fetch-error path when a Logger is attached (Warn branch).
 func TestGlueCodec_StartRefresher_TickFires_WithLogger(t *testing.T) {
 	// First call succeeds (NewGlueCodec), subsequent calls (refresh) fail.
-	call := 0
+	var calls atomic.Int32
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-		call++
-		if call == 1 {
+		if calls.Add(1) == 1 {
 			_ = json.NewEncoder(w).Encode(map[string]any{
 				"SchemaVersionId": uuid.New().String(), "Status": "AVAILABLE",
 			})
@@ -259,19 +290,16 @@ func TestGlueCodec_StartRefresher_TickFires_WithLogger(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	codec.StartRefresher(ctx, 20*time.Millisecond)
-	time.Sleep(80 * time.Millisecond)
+	waitUntil(t, 2*time.Second, func() bool { return warned.Load() })
 	cancel()
-	time.Sleep(20 * time.Millisecond)
-	_ = warned.Load() // checked indirectly — server returned 500 on refresh
 }
 
 // TestGlueCodec_StartRefresher_TickFires_NilLogger exercises the tick-fires-
 // fetch-error path with no logger (slog.Warn fallback branch).
 func TestGlueCodec_StartRefresher_TickFires_NilLogger(t *testing.T) {
-	call := 0
+	var calls atomic.Int32
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-		call++
-		if call == 1 {
+		if calls.Add(1) == 1 {
 			_ = json.NewEncoder(w).Encode(map[string]any{
 				"SchemaVersionId": uuid.New().String(), "Status": "AVAILABLE",
 			})
@@ -289,10 +317,8 @@ func TestGlueCodec_StartRefresher_TickFires_NilLogger(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	codec.StartRefresher(ctx, 20*time.Millisecond)
-	time.Sleep(80 * time.Millisecond)
+	waitUntil(t, 2*time.Second, func() bool { return calls.Load() >= 2 })
 	cancel()
-	time.Sleep(20 * time.Millisecond)
-	// No assertion — reaching here without panic means the nil-logger branch ran.
 }
 
 // warnLoggerFn is a minimal Logger stub that calls fn on every Warn.
