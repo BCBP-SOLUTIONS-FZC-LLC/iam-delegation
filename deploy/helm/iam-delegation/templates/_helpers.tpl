@@ -7,34 +7,21 @@ Expand the name of the chart.
 
 {{/*
 Create a default fully qualified app name.
-We truncate at 63 chars because some Kubernetes name fields are limited to
-this (by the DNS naming spec).
 */}}
 {{- define "iam-delegation.fullname" -}}
 {{- if .Values.fullnameOverride }}
 {{- .Values.fullnameOverride | trunc 63 | trimSuffix "-" }}
 {{- else }}
 {{- $name := default .Chart.Name .Values.nameOverride }}
-{{- if contains $name .Release.Name }}
-{{- .Release.Name | trunc 63 | trimSuffix "-" }}
-{{- else }}
-{{- printf "%s-%s" .Release.Name $name | trunc 63 | trimSuffix "-" }}
+{{- printf "%s" $name | trunc 63 | trimSuffix "-" }}
 {{- end }}
-{{- end }}
-{{- end }}
-
-{{/*
-Create chart name and version as used by the chart label.
-*/}}
-{{- define "iam-delegation.chart" -}}
-{{- printf "%s-%s" .Chart.Name .Chart.Version | replace "+" "_" | trunc 63 | trimSuffix "-" }}
 {{- end }}
 
 {{/*
 Common labels applied to every resource.
 */}}
 {{- define "iam-delegation.labels" -}}
-helm.sh/chart: {{ include "iam-delegation.chart" . }}
+helm.sh/chart: {{ printf "%s-%s" .Chart.Name .Chart.Version | replace "+" "_" | trunc 63 | trimSuffix "-" }}
 {{ include "iam-delegation.selectorLabels" . }}
 {{- if .Chart.AppVersion }}
 app.kubernetes.io/version: {{ .Chart.AppVersion | quote }}
@@ -44,7 +31,7 @@ app.kubernetes.io/managed-by: {{ .Release.Service }}
 
 {{/*
 Selector labels — used by Deployment, Service, HPA, PDB, ServiceMonitor,
-and the three CronJobs (so NetworkPolicy egress rules cover CronJob pods
+and the four CronJobs (so NetworkPolicy egress rules cover CronJob pods
 too, since they select on these same labels).
 */}}
 {{- define "iam-delegation.selectorLabels" -}}
@@ -66,7 +53,7 @@ Create the name of the service account to use.
 {{/*
 Image tag: prefer .Values.image.tag; fall back to chart appVersion. One
 image carries both binaries (server + reconciler) — the Deployment and all
-three CronJobs share this same tag.
+four CronJobs share this same tag.
 */}}
 {{- define "iam-delegation.imageTag" -}}
 {{- .Values.image.tag | default .Chart.AppVersion }}
@@ -76,7 +63,7 @@ three CronJobs share this same tag.
 Name of the Secret holding application secrets: either a pre-existing,
 externally-managed Secret (.Values.existingSecret), or the one this chart
 renders itself from .Values.secretValues (see templates/secret.yaml).
-Shared by the server Deployment and the three reconciler CronJobs.
+Shared by the server Deployment and the four reconciler CronJobs.
 */}}
 {{- define "iam-delegation.secretName" -}}
 {{- default (printf "%s-secrets" (include "iam-delegation.fullname" .)) .Values.existingSecret }}

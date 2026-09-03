@@ -1,15 +1,20 @@
 # Database Schema
 
-**Database:** `delegation` on shared RDS PostgreSQL Multi-AZ (LLD §7). **No PgBouncer** — unlike
-`iam-user-profile`, this repo has no `PG_BOUNCER_MODE`/`PGBouncerMode` anywhere (verified: grep
-across `.go`, `.env.example`, `docker-compose.yml`, `deploy/helm/iam-delegation/values.yaml` finds
-nothing). `DATABASE_URL` connects directly to Postgres.
+**Database:** `delegation` on shared RDS PostgreSQL Multi-AZ (LLD §7). Connection,
+pool sizing, PgBouncer mode, transactions, and health all go through
+`platform-pgcommon` (DLG-D23/D32, matching `iam-realm-provisioner`):
+`pgcommon.ConfigFromEnv` / `pgcommon.NewPool` / `pgcommon.RunInTxWithRetryOpts` /
+`pgcommon.Pool.Health` / `DrainAndClose`. `PG_BOUNCER_MODE` is a standard
+`ConfigFromEnv` var (app pool); `SystemPoolConfig` forces `PGBouncerMode: true`
+unconditionally so the BYPASSRLS pool still works under transaction pooling.
 
-**Pool configuration** (`internal/adapter/outbound/postgres/db.go`'s `NewPool`):
+**Pool configuration** (`cmd/server/main.go` and `cmd/reconciler/main.go`):
 ```go
-cfg, warnings := pgcommon.ConfigFromEnv()   // DATABASE_URL / PG_MAX_CONNS / PG_MIN_CONNS / PG_SLOW_QUERY_THRESHOLD / PG_SSLMODE
-cfg.GUCProvider = pgcommon.GUCSetFromContext
-pool, err := pgcommon.NewPool(ctx, cfg)
+pgCfg, warnings := pgcommon.ConfigFromEnv()   // DATABASE_URL / PG_MAX_CONNS / PG_MIN_CONNS / PG_SLOW_QUERY_THRESHOLD / PG_SSLMODE / PG_BOUNCER_MODE
+pgCfg.DSN = postgres.DSNFromEnv()             // pgcommon-built DSN + PG_STATEMENT_TIMEOUT
+pgCfg.GUCProvider = pgcommon.GUCSetFromContext
+pgCfg.Tracer = postgres.NewOTelTracer(serviceName)
+pool, err := pgcommon.NewPool(ctx, pgCfg)
 ```
 Defaults (`deploy/helm/iam-delegation/values.yaml`): `PG_MAX_CONNS=10`, `PG_MIN_CONNS=2`,
 `PG_SLOW_QUERY_THRESHOLD=200ms`.
@@ -55,20 +60,24 @@ All three call `postgres.WithTenantGUC(ctx, tenantID, userID)` → `pgcommon.GUC
 
 ## BYPASSRLS pool (`sysPool`)
 
-Both `cmd/server/main.go` and `cmd/reconciler/main.go` build a second pool from `SYSTEM_DATABASE_URL` (`postgres.SystemDSNFromEnv()`, `internal/adapter/outbound/postgres/db.go`):
+Both `cmd/server/main.go` and `cmd/reconciler/main.go` build a second pool from `SYSTEM_DATABASE_URL` (`postgres.SystemDSNFromEnv()` + `postgres.SystemPoolConfig()`, `internal/adapter/outbound/postgres/db.go`):
 ```go
-sysDSN, usedFallback := pgadapter.SystemDSNFromEnv()
-if usedFallback {
+sysDSN := pgadapter.SystemDSNFromEnv()
+if sysDSN == dsn {
     logger.Warn("SYSTEM_DATABASE_URL not set — sysPool reuses app DSN; cross-tenant cron/internal sweeps will be RLS-filtered")
 }
-sysPool, err := pgcommon.NewPool(ctx, pgcommon.Config{DSN: sysDSN, ...})
+sysCfg := pgadapter.SystemPoolConfig(sysDSN, logger) // forces PGBouncerMode, no GUCProvider
+sysCfg.Tracer = queryTracer
+sysPool, err := pgcommon.NewPool(ctx, sysCfg)
 ```
-Falls back to `DATABASE_URL` in dev with a startup warning — cross-tenant reads then return zero rows under RLS (fail-quiet, not fail-loud).
+Falls back to `DSNFromEnv()` in dev with a startup warning — cross-tenant reads then return zero rows under RLS (fail-quiet, not fail-loud).
 
-**What actually uses `sysPool` in this repo** (verified — do NOT assume user-profile's exporter list applies here; DLG-D19 in `ARCHITECTURE.md`'s "Session-specific decisions" records that most of this repo's `iam_delegation_*` business metrics are registered but **not yet called from any `internal/core/service` call site** — the two reconciler deferred-counter metrics are the exception, GAP-27 — so there are still no compliance-metric-exporter goroutines here, sysPool-backed or otherwise):
+**What actually uses `sysPool` in this repo:**
 - `cmd/server/main.go`: `delegationRepoSys := pgadapter.NewDelegationRepository(sysPool)` — backs the mesh-only DLG-I3/I4 internal reads (`gucBoundReader`, cross-tenant lookups by design).
-- `cmd/server/main.go`: `processedEvents := consumer.NewProcessedEvents(sysPool)` — the cascade consumer's idempotency ledger, RLS-exempt by table design but routed through the BYPASSRLS pool anyway.
-- `cmd/reconciler/main.go`: `pgadapter.NewDelegationRepository(sysPool)` — backs all three CronJobs' cross-tenant sweep queries (expiry, review, cleanup — LLD §11.3/§11.4/§18.4).
+- `cmd/server/main.go`: `processedEvents := pgadapter.NewProcessedEventsRepository(sysPool)` — the cascade consumer's idempotency ledger, RLS-exempt by table design but routed through the BYPASSRLS pool and `withPool` (joins an ambient TxRunner tx).
+- `cmd/server/main.go`: `pgadapter.NewGaugeRepository(sysPool)` — 5-minute `iam_delegation_active_gauge{tenant}` snapshot exporter.
+- `cmd/reconciler/main.go`: `pgadapter.NewDelegationRepository(sysPool)` — backs all four CronJobs' cross-tenant sweep queries (expiry, activation, review, cleanup — LLD §11.1a/§11.3/§11.4/§18.4).
+- `cmd/reconciler/main.go`: `pgadapter.NewProcessedEventsRepository(sysPool)` — monthly `processed_events` prune (LLD §18.4).
 
 ## PostgreSQL roles (LLD §7.3/§7.4)
 
@@ -78,6 +87,8 @@ Falls back to `DATABASE_URL` in dev with a startup warning — cross-tenant read
 
 ## Migrations
 
-**Exactly one migration exists**: `000001_schema.{up,down}.sql` under `internal/adapter/outbound/postgres/migrations/` — a single consolidated migration creating extensions, both enum types (`delegation_scope`, `delegation_status`), all three tables, `rls_violation_log`, the three RLS functions + policies, the `touch_row()` trigger, both roles, and `delegation_app`'s GRANT on `outbox_events`. The next migration is `000002_description.{up,down}.sql`. This repo does not have iam-user-profile's long incremental migration history (000001–031) — it's a young, still-undeployed service, so schema fixes get folded back into `000001` rather than layered as new migrations; one migration is accurate, not a gap. That folding stops being safe the moment this service is actually deployed anywhere (a fresh migration is then the only safe way to change schema already applied elsewhere).
+**Startup order (DLG-D32, matching `iam-realm-provisioner` / `postgres.Migrate`):** `outbox.ApplySchema` first (creates `outbox_events`), then the domain migration (which GRANTs `delegation_app` on that table). The reverse order — domain then outbox, which `iam-user-profile` uses — fails every fresh-database bring-up here.
+
+This service has never been deployed (no Git tag has ever been pushed — see `../VERSIONING.md`), so there is no rolling-upgrade history across incremental migration files worth preserving — one file (`000001_schema`) is the whole schema, verified round-trip (`up` then `down`) against a real Postgres container. Every schema fix so far (the `scheduled` status/`idx_delegations_starts_at` for DLG-D25, the `delegate_disabled` end reason, etc.) has been folded back into that single file rather than layered as a new migration. Once a real deployment exists, future schema changes should go back to the normal forward-only, additive-where-possible discipline (column drops split across two releases to stay compatible with rolling deploys) — see `../VERSIONING.md`.
 
 **Trigger:** `touch_row()` — identical pattern to user-profile's: maintains `updated_at` and increments `record_version` on every genuine `UPDATE`, guarded by `WHEN (OLD.* IS DISTINCT FROM NEW.*)` from day one (not retrofitted in a later migration the way user-profile's was) so a no-op `UPDATE` never bumps the version. Attached to both `delegations` and `delegation_tenant_settings` (`trg_touch_delegations`, `trg_touch_delegation_tenant_settings`).

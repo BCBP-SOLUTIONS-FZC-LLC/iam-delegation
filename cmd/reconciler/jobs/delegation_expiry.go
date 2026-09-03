@@ -31,6 +31,7 @@ func Expiry(ctx context.Context, jctx *Context) (Result, error) {
 			res.Deferred++
 			if jctx.Metrics != nil {
 				jctx.Metrics.RecordExpiryDeferred()
+				jctx.Metrics.RecordUPAvailabilityFailure("expiry-cron")
 			}
 			continue
 		}
@@ -40,6 +41,9 @@ func Expiry(ctx context.Context, jctx *Context) (Result, error) {
 			res.Failed++
 		} else if !raced {
 			res.Succeeded++
+			if jctx.Metrics != nil {
+				jctx.Metrics.RecordEnded(string(domain.EndReasonExpired))
+			}
 		}
 		// raced (someone else already ended/cancelled it this tick) counts
 		// toward neither succeeded nor failed — the desired end-state

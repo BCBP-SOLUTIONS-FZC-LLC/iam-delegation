@@ -5,11 +5,10 @@
 .github/workflows/ @BCBP-SOLUTIONS-FZC-LLC/iam-team
 .github/dependabot.yml @BCBP-SOLUTIONS-FZC-LLC/iam-team
 
-# Event contract — changes affect all downstream consumers (Workflow,
-# Notification, Audit) on iam.delegation.events, and Core's cascade
-# consumer on delegation-cascade-q. Any modification to the AsyncAPI spec
-# or embedded JSON Schemas must be reviewed by both the IAM team and the
-# platform team.
+# Event contract — changes affect all downstream consumers (Workflow, Notification,
+# Audit) on iam.delegation.events, and Core's cascade consumer on delegation-cascade-q.
+# Any modification to the AsyncAPI spec or embedded JSON Schemas must be reviewed
+# by both the IAM team and the platform team.
 api/asyncapi.yaml @BCBP-SOLUTIONS-FZC-LLC/iam-team @BCBP-SOLUTIONS-FZC-LLC/platform-team
 internal/eventschema/ @BCBP-SOLUTIONS-FZC-LLC/iam-team @BCBP-SOLUTIONS-FZC-LLC/platform-team
 

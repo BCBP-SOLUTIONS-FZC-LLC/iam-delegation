@@ -14,6 +14,7 @@ import (
 type config struct {
 	Environment string
 	Port        string
+	MetricsPort string
 
 	UserProfileBaseURL   string
 	UserProfileTimeout   time.Duration
@@ -29,7 +30,8 @@ type config struct {
 	AWSEndpointURL   string
 	GlueRegistryName string
 
-	CascadeQueueURL string
+	CascadeQueueURL       string
+	CascadeSQSConcurrency int
 
 	// Outbox runner tunables (outbox.Config) — env-configurable to match
 	// iam-org-membership's/iam-user-profile's identical OUTBOX_* surface;
@@ -72,6 +74,7 @@ func loadConfig() (config, error) {
 	cfg := config{
 		Environment:          getEnv("ENVIRONMENT", "development"),
 		Port:                 getEnv("PORT", "8080"),
+		MetricsPort:          getEnv("METRICS_PORT", "9090"),
 		UserProfileBaseURL:   os.Getenv("USER_PROFILE_BASE_URL"),
 		OrgMembershipBaseURL: os.Getenv("ORG_MEMBERSHIP_BASE_URL"),
 		ValkeyAddr:           getEnv("VALKEY_ADDR", "localhost:6379"),
@@ -141,6 +144,9 @@ func loadConfig() (config, error) {
 	if cfg.OutboxPruneLimit, err = getEnvInt("OUTBOX_PRUNE_LIMIT", 1000); err != nil {
 		return cfg, err
 	}
+	if cfg.CascadeSQSConcurrency, err = getEnvInt("CASCADE_SQS_CONCURRENCY", 4); err != nil {
+		return cfg, err
+	}
 
 	// Fail-fast on empty base URLs for the two data-bearing outbound clients
 	// (LLD §15 "base URLs required, fail-fast on empty") — deferred to the
@@ -153,6 +159,18 @@ func loadConfig() (config, error) {
 	if cfg.CascadeQueueURL == "" {
 		return cfg, fmt.Errorf("CASCADE_QUEUE_URL is required")
 	}
+
+	// Fail fast in production rather than let pgadapter.SystemDSNFromEnv's
+	// dev-safe fallback (SYSTEM_DATABASE_URL unset -> reuse the RLS-scoped
+	// app DSN) degrade silently: the reconciler's cross-tenant sweeps
+	// (ListExpiringBefore/FindDueForDailyWarn/FindDueForAutoEnd/
+	// HardPurgeSoftDeletedBefore) and the active-gauge exporter would then
+	// run under RLS with no tenant GUC bound, so every query returns zero
+	// rows instead of erroring — no alert fires, since that's a different
+	// failure mode than the existing "deferred" counters/alerts cover.
+	if cfg.Environment == "production" && os.Getenv("SYSTEM_DATABASE_URL") == "" {
+		return cfg, fmt.Errorf("SYSTEM_DATABASE_URL is required when ENVIRONMENT=production (must be the BYPASSRLS delegation_migrator role, see .claude/database.md)")
+	}
 	return cfg, nil
 }
 
@@ -161,6 +179,43 @@ func getEnv(key, fallback string) string {
 		return v
 	}
 	return fallback
+}
+
+// resolveAppEnv matches iam-realm-provisioner's APP_ENV contract (the
+// value platform-gincommon's InitTracingFromEnv / logger.NewLogger read)
+// while still honoring this service's existing ENVIRONMENT var.
+func resolveAppEnv() string {
+	if v := os.Getenv("APP_ENV"); v != "" {
+		return v
+	}
+	switch getEnv("ENVIRONMENT", "development") {
+	case "development", "dev", "local":
+		return "dev"
+	default:
+		return getEnv("ENVIRONMENT", "production")
+	}
+}
+
+// ensureGincommonEnv fills the env vars InitTracingFromEnv / NewLogger
+// read so a deployment that only sets ENVIRONMENT still gets the same
+// OTLP service name, sample ratio, and version labels as iam-realm-provisioner.
+func ensureGincommonEnv(version string) {
+	if os.Getenv("APP_ENV") == "" {
+		//nolint:errcheck // os.Setenv on the current process's own env cannot fail
+		_ = os.Setenv("APP_ENV", resolveAppEnv())
+	}
+	if os.Getenv("APP_NAME") == "" {
+		//nolint:errcheck // os.Setenv on the current process's own env cannot fail
+		_ = os.Setenv("APP_NAME", "iam-delegation")
+	}
+	if os.Getenv("OTEL_SERVICE_NAME") == "" {
+		//nolint:errcheck // os.Setenv on the current process's own env cannot fail
+		_ = os.Setenv("OTEL_SERVICE_NAME", "iam-delegation")
+	}
+	if os.Getenv("BUILD_VERSION") == "" && version != "" {
+		//nolint:errcheck // os.Setenv on the current process's own env cannot fail
+		_ = os.Setenv("BUILD_VERSION", version)
+	}
 }
 
 func getEnvDuration(key string, fallback time.Duration) (time.Duration, error) {

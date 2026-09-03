@@ -7,6 +7,7 @@ import (
 	"testing"
 
 	"github.com/gin-gonic/gin"
+	"github.com/jackc/pgx/v5/pgconn"
 
 	"github.com/BCBP-SOLUTIONS-FZC-LLC/iam-delegation/internal/core/domain"
 )
@@ -56,6 +57,7 @@ func TestHandleError_EverySentinel(t *testing.T) {
 
 		{"org_membership_unavailable", domain.ErrOrgMembershipUnavailable, http.StatusServiceUnavailable},
 		{"user_profile_unavailable", domain.ErrUserProfileUnavailable, http.StatusServiceUnavailable},
+		{"db_unavailable", domain.ErrDBUnavailable, http.StatusServiceUnavailable},
 	}
 
 	for _, tc := range cases {
@@ -88,5 +90,37 @@ func TestHandleError_WrappedSentinel(t *testing.T) {
 	HandleError(c, wrapped)
 	if w.Code != http.StatusNotFound {
 		t.Fatalf("got status %d, want %d", w.Code, http.StatusNotFound)
+	}
+}
+
+func TestHandleError_DBConnectivitySQLState_Returns503(t *testing.T) {
+	c, w := newTestGinContext()
+	HandleError(c, &pgconn.PgError{Code: "08006"})
+	if w.Code != http.StatusServiceUnavailable {
+		t.Fatalf("got status %d, want 503", w.Code)
+	}
+}
+
+func TestHandleError_ConstraintViolationSQLState_Returns500(t *testing.T) {
+	c, w := newTestGinContext()
+	HandleError(c, &pgconn.PgError{Code: "23505"})
+	if w.Code != http.StatusInternalServerError {
+		t.Fatalf("got status %d, want 500", w.Code)
+	}
+}
+
+func TestWriteErrorWithDetails_NilDetails_FallsBackToWriteError(t *testing.T) {
+	c, w := newTestGinContext()
+	writeErrorWithDetails(c, http.StatusBadRequest, "validation_error", nil)
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("expected status %d, got %d", http.StatusBadRequest, w.Code)
+	}
+}
+
+func TestWriteErrorWithDetails_WithDetails(t *testing.T) {
+	c, w := newTestGinContext()
+	writeErrorWithDetails(c, http.StatusConflict, "optimistic_lock_conflict", map[string]any{"record_version": int64(3)})
+	if w.Code != http.StatusConflict {
+		t.Fatalf("expected status %d, got %d", http.StatusConflict, w.Code)
 	}
 }

@@ -1,7 +1,7 @@
 # Reusable workflow — test gate.
-# Race detector (unit · integration · rls) + coverage + arch lint. Called
-# by ci.yml and release.yml. Gates the build-image job. Mirrors
-# iam-tender-acl's validate-test.yml.
+# Race detector (unit · integration · rls) + coverage + arch lint + Swagger
+# staleness + end-to-end tests. Called by ci.yml and release.yml. Gates the
+# build-image job.
 name: Validate / Test
 
 "on":
@@ -22,10 +22,7 @@ permissions:
 
 env:
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: 'true'
-  # 70% — see .github/scripts/coverage-gate.sh for why this matches
-  # iam-tender-acl's baseline rather than a service-specific bar. Ratchet
-  # this up over time; never lower it to make a failing PR pass.
-  COVERAGE_THRESHOLD: '70'
+  COVERAGE_THRESHOLD: '95'
 
 jobs:
   test:
@@ -36,20 +33,22 @@ jobs:
       pct: ${{ steps.gate.outputs.pct }}
     steps:
       - name: Checkout
-        uses: actions/checkout@v7.0.0
+        uses: actions/checkout@v7.0.1
         with:
           ref: ${{ inputs.ref || github.ref }}
           persist-credentials: false
           token: ${{ secrets.CI_REPO_READ_TOKEN || github.token }}
 
       - name: Set up Go
-        uses: actions/setup-go@v6.5.0
+        uses: actions/setup-go@v7.0.0
         with:
           go-version-file: go.mod
           cache-dependency-path: |
             go.sum
             go.mod
 
+      # Store credentials so go mod download can fetch private BCBP modules.
+      # Mirrors the pattern used in platform-events ci.yml (secrets.GO_PRIVATE_TOKEN).
       - name: Configure private module access
         run: |
           git config --global credential.helper store
@@ -76,7 +75,10 @@ jobs:
           TESTCONTAINERS_RYUK_DISABLED: 'true'
         run: make test-ci
 
-      - name: Coverage threshold gate
+      # make test-ci already merges the unit/integration/rls coverage profiles
+      # into coverage.out. Assert the combined statement coverage meets the
+      # threshold. Do not lower it to make a failing PR pass.
+      - name: Coverage threshold gate (≥ 95%)
         id: gate
         run: bash .github/scripts/coverage-gate.sh
 
@@ -95,7 +97,7 @@ jobs:
       # on core (+ eventschema/api/observability), never on each other —
       # wired together only from cmd/server and cmd/reconciler.
       - name: Cache go-arch-lint binary
-        uses: actions/cache@v6.0.0
+        uses: actions/cache@v6.1.0
         with:
           path: ~/go/bin
           key: go-arch-lint-${{ runner.os }}-v1.15.0
@@ -104,8 +106,7 @@ jobs:
         run: bash .github/scripts/arch-lint.sh
 
       # Regenerates Swagger docs from handler annotations and fails if the
-      # committed artifacts (docs/swagger/) are stale — mirrors
-      # iam-user-profile's / iam-tender-acl's identical CI gate.
+      # committed artifacts (docs/swagger/) are stale.
       - name: Swagger staleness check
         run: bash .github/scripts/check-swagger-stale.sh
 

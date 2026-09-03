@@ -27,26 +27,25 @@ cross-reference rather than duplicate here.
 
 ## Metrics — `internal/adapter/outbound/metrics/metrics.go`
 
-**PARTIALLY CLOSED (DLG-D19/GAP-27, `ARCHITECTURE.md`'s "Session-specific decisions"):** the two deferred-counter
-instruments (`iam_delegation_expiry_deferred_total`/`iam_delegation_review_deferred_total` — the
-ones the Prometheus alert actually watches) are wired: `cmd/reconciler/jobs.Context.Metrics` is
-called from `delegation_expiry.go`/`delegation_review.go` on every UP-failure defer, and
-`cmd/server/main.go` passes its real registered `*metrics.Metrics` in. The other eight instruments
-below still have **no call site in `internal/core/service`** — those counters will still report
-zero until a metrics-recorder parameter is threaded through `DelegationService`/`SettingsService`/
-`CascadeService`. `cmd/reconciler`'s standalone CronJob binary registers its own `*metrics.Metrics`
-too (for `jobs.Context` symmetry) but has no `/metrics` scrape endpoint, so its increments aren't
-exported anywhere — the alert-visible counters only actually reach Prometheus via `cmd/server`'s
-DLG-I1/I2 on-demand HTTP entry points (DLG-D17), which share the same `jobs.Context`-calling code
-and do have a live scrape target.
+**CLOSED for HTTP/cascade/cron paths (DLG-D30/D31, matching `iam-realm-provisioner` handler increments):**
+`DelegationService.WithMetrics` / `CascadeService.WithMetrics` increment `created`/`ended`/
+`idempotency_hits`/`up_availability_failures` after the matching outcome; the membership-check
+client records duration + failures; the cascade consumer records processed/DLQ; the reconciler
+jobs record deferred/warned/expired/ended. `iam_delegation_active_gauge{tenant}` is refreshed
+every 5 minutes from a BYPASSRLS `COUNT(*) GROUP BY tenant_id` on `status='active' AND
+deleted_at IS NULL` (`cmd/server/exporters.go`, matching `iam-realm-provisioner`'s DB-state
+gauge exporters) — emit-once at start so the first scrape is populated.
+`cmd/reconciler`'s CronJob binary still has no `/metrics` scrape endpoint — alert-visible
+deferred counters reach Prometheus via `cmd/server`'s DLG-I1/I2 HTTP entry points.
 
 | Metric | Type | Labels | Recorder method |
 |---|---|---|---|
 | `iam_delegation_created_total` | Counter | — | `RecordCreated(scope)` |
 | `iam_delegation_ended_total` | Counter | — | `RecordEnded(reason)` |
-| `iam_delegation_active_gauge` | Gauge | tenant | `SetActiveGauge(tenant, count)` |
+| `iam_delegation_active_gauge` | Gauge | tenant | `ReplaceActiveGauges` (5-min sysPool snapshot) |
 | `iam_delegation_expiry_deferred_total` | Counter | — | `RecordExpiryDeferred()` |
 | `iam_delegation_review_deferred_total` | Counter | — | `RecordReviewDeferred()` |
+| `iam_delegation_activation_deferred_total` | Counter | — | `RecordActivationDeferred()` |
 | `iam_delegation_review_warned_total` | Counter | days_remaining | `RecordReviewWarned(daysRemaining)` |
 | `iam_delegation_review_expired_total` | Counter | — | `RecordReviewExpired()` |
 | `iam_delegation_membership_check_duration_seconds` | Histogram | — | `ObserveMembershipCheckDuration(seconds)` |
@@ -59,14 +58,23 @@ and do have a live scrape target.
 ## Tracing and logging
 
 OTel via `platform-gincommon` (same shared lib as sibling services); structured logging via Zap,
-wired through `gincommon`. No custom span instrumentation beyond what `gincommon`'s middleware adds.
+wired through `gincommon`. Both binaries call `gincommon.InitTracingFromEnv` then
+`ObservabilityMiddlewares` at startup **before** creating tracers or registering collectors
+(DLG-D31, matching `iam-realm-provisioner`), then share one `postgres.NewOTelTracer` across
+the app and sys pools so `db.query` spans share the HTTP OTLP pipeline. Outbound User Profile /
+Org Membership calls go through `internal/adapter/outbound/httpx` (`otelhttp`) so they emit
+client spans and inject `traceparent`. The reconciler wraps each job in a
+`reconciler.<job>` span. No custom TracerProvider/exporter. `/metrics` is served on
+`METRICS_PORT` (default 9090), not on the API listener. `metrics.Register()` is the no-arg
+gincommon API.
 
 ## Health checks — `internal/adapter/inbound/http/health.go`
 
 - `GET /healthz` — `gincommon.HealthHandler()` verbatim (liveness only, no local logic).
-- `GET /readyz` — checks three dependencies, only Postgres is hard-blocking:
-  - **Postgres** (`pgcommon.Pool.Health`) — unhealthy → overall `503`. Also reports pool stats
+- `GET /readyz` — Postgres (app pool) and sys Postgres (BYPASSRLS pool) are hard-blocking:
+  - **Postgres** (`pgcommon.Pool.Health` on the app pool) — unhealthy → overall `503`. Also reports pool stats
     (total/idle/acquired/max conns, utilization) in the response body.
+  - **Sys Postgres** (`pgcommon.Pool.Health` on sysPool) — unhealthy → overall `503` (matching `iam-realm-provisioner`).
   - **Valkey** (`redisPinger.Ping`, `cmd/server/adapters.go`) — degraded-only, never flips overall
     readiness.
   - **Outbox runner** (`outboxPinger.Ping`) — reports "not ready" until the runner's `Ready()`
@@ -93,9 +101,9 @@ IAM permission failures, and the `schema-gov` CLI (written this session, DLG-D20
 | `PORT` | No | `8080` | HTTP listen port — **not** `HTTP_PORT` (no dead config remains as of this pass, see below) |
 | `DATABASE_URL` | Yes (via pgcommon) | — | App role (`delegation_app`, RLS-enforced, no BYPASSRLS) — or set `PG_HOST`/`PG_PORT`/`PG_USER`/`PG_PASSWORD`/`PG_DBNAME`/`PG_SSLMODE` individually; both forms go through `pgcommon.ConfigFromEnv` via `postgres.DSNFromEnv` |
 | `MIGRATION_DATABASE_URL` | No | falls back to `postgres.DSNFromEnv()` | BYPASSRLS role for the server's self-migration at startup; must bypass PgBouncer |
-| `SYSTEM_DATABASE_URL` | No | falls back to `postgres.DSNFromEnv()` with a startup warning | BYPASSRLS pool for cross-tenant reconciler/cron sweeps (`postgres.SystemDSNFromEnv`) — cross-tenant queries return 0 rows under RLS if unset |
-| `PG_STATEMENT_TIMEOUT` | No | — | Go duration string (e.g. `5s`), appended to the app DSN's `options` query param as a millisecond `statement_timeout` (`postgres.ApplyStatementTimeout`); ignored when `DATABASE_URL` is set verbatim |
-| `PG_MAX_CONNS` / `PG_MIN_CONNS` / `PG_SLOW_QUERY_THRESHOLD` / `PG_BOUNCER_MODE` / `PG_SSLMODE` | No | pgcommon defaults | Standard `pgcommon.ConfigFromEnv` vars |
+| `SYSTEM_DATABASE_URL` | Helm: required. Go: required when `ENVIRONMENT=production` (both binaries fail fast at startup otherwise, DLG-D34); optional elsewhere | falls back to `postgres.DSNFromEnv()` with a startup warning outside production | BYPASSRLS pool for cross-tenant reconciler/cron sweeps, cascade `processed_events`, and the active-gauge exporter (`postgres.SystemDSNFromEnv`). Unset outside production → RLS-filtered zero rows, no alert |
+| `PG_STATEMENT_TIMEOUT` | No | Helm `5s` | Applied to migration + sysPool DSNs (`postgres.ApplyStatementTimeout`); ignored on the app pool when `DATABASE_URL` is set verbatim |
+| `PG_MAX_CONNS` / `PG_MIN_CONNS` / `PG_SLOW_QUERY_THRESHOLD` / `PG_BOUNCER_MODE` / `PG_SSLMODE` | No | Helm: `10` / `0` / `200ms` / `true` | Standard `pgcommon.ConfigFromEnv` vars. `PG_MIN_CONNS=0` with `PG_BOUNCER_MODE=true` is pgcommon's transaction-pooling recommendation |
 | `VALKEY_ADDR` | No | `localhost:6379` | |
 | `IDEMPOTENCY_TTL_SECONDS` | No | `86400` (24h) | Create-idempotency-key TTL (DLG-Q3) — **not** `CACHE_IDEMPOTENCY_TTL_SECONDS` |
 | `LIST_CACHE_TTL_SECONDS` | No | `60` | DLG-1 list cache TTL — **not** `CACHE_LIST_TTL_SECONDS` |
@@ -105,6 +113,7 @@ IAM permission failures, and the `schema-gov` CLI (written this session, DLG-D20
 | `ORG_MEMBERSHIP_MEMBERSHIP_CHECK_TIMEOUT_MS` | No | `3000` | |
 | `SNS_TOPIC_ARN` | **Yes** | — | `loadConfig` returns an error if empty — the process never starts |
 | `CASCADE_QUEUE_URL` | **Yes** | — | Same — fail-fast, not a soft default |
+| `CASCADE_SQS_CONCURRENCY` | No | `4` | `events.WithConcurrency` on the cascade SQS consumer (iam-realm-provisioner) |
 | `AWS_REGION` | No | `us-east-1` | |
 | `AWS_ENDPOINT_URL` | No | — | LocalStack endpoint override, dev only |
 | `GLUE_REGISTRY_NAME` | No | `""` → `NoopCodec` | Set to `iam-delegation-events` to activate `GlueCodec` (added this session, DLG-D20) |
@@ -129,8 +138,9 @@ point-in-time finding, not a standing guarantee.
 GitHub Actions (`.github/workflows/`), all names/steps verified against current YAML:
 
 1. **`validate-test.yml`** (`Validate / Test`) — on push/PR: unit+integration+rls tests with `-race`
-   and merged coverage → coverage-threshold gate (`.github/scripts/coverage-gate.sh`, **70%
-   single global floor**, not a per-package gate — matches `iam-tender-acl`'s baseline) → upload
+   and merged coverage → coverage-threshold gate (`.github/scripts/coverage-gate.sh`, **95%
+   single global floor**, not a per-package gate — bumped from the original 70% during the
+   DLG-D34 production-readiness sweep, global coverage sits at 95.2% as of that pass) → upload
    coverage artifact → architecture lint (`go-arch-lint`) → Swagger staleness check → end-to-end
    tests.
 2. **`validate-quality.yml`** (`Validate / Quality`) — on push/PR: a repo-specific check rejecting

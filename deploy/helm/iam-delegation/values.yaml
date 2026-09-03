@@ -4,7 +4,7 @@
 # serves the HTTP API (DLG-1..7, DLG-I1..I4) AND runs the
 # delegation-cascade-q SQS consumer (§11.5) in-process — same "one process,
 # two responsibilities" pattern as iam-tender-acl / iam-user-profile. The
-# three CronJobs (delegation-expiry/-review/-cleanup, §16.3) run from the
+# four CronJobs (delegation-expiry/-activation/-review/-cleanup, §16.3) run from the
 # SAME image (it carries both binaries — see the repo-root Dockerfile),
 # with each CronJob template overriding `command` to invoke
 # /iam-delegation-reconciler --job=<name> — mirrors iam-user-profile's
@@ -63,6 +63,8 @@ resources:
 env:
   LOG_LEVEL: "info"
   ENVIRONMENT: "production"
+  APP_ENV: "production"
+  APP_NAME: "iam-delegation"
 
   # ElastiCache Valkey — "del:" keyspace is a compile-time constant, not
   # env-driven (LLD §9/§15). No auth token is embedded in this URL form;
@@ -100,6 +102,7 @@ env:
   # depends on the environment's AWS account) — set per environment.
   SNS_TOPIC_ARN: ""
   CASCADE_QUEUE_URL: ""
+  CASCADE_SQS_CONCURRENCY: "4"
   AWS_REGION: "us-east-1"
   # Set to the Glue Schema Registry name (iam-delegation-events) to activate
   # eventbus.GlueCodec at publish time; empty → NoopCodec (dev/test only).
@@ -109,12 +112,20 @@ env:
   # OpenTelemetry — OTLP/gRPC via platform-gincommon's
   # ObservabilityMiddlewares (port 4317, not the legacy OTLP/HTTP 4318).
   OTEL_EXPORTER_OTLP_ENDPOINT: "otel-collector.observability.svc.cluster.local:4317"
+  OTEL_SERVICE_NAME: "iam-delegation"
+
+  # Dedicated /metrics listener (cmd/server), separate from the API port.
+  METRICS_PORT: "9090"
 
   # Postgres pool sizing (pgcommon.ConfigFromEnv()) — logical database name
   # ("delegation", LLD §7) is embedded in DATABASE_URL itself, not a
-  # separate env var.
+  # separate env var. PG_BOUNCER_MODE / PG_STATEMENT_TIMEOUT / PG_MIN_CONNS
+  # match iam-realm-provisioner: transaction pooling in production, MinConns
+  # 0 so pgcommon does not keep idle backends against PgBouncer.
   PG_MAX_CONNS: "10"
-  PG_MIN_CONNS: "2"
+  PG_MIN_CONNS: "0"
+  PG_BOUNCER_MODE: "true"
+  PG_STATEMENT_TIMEOUT: "5s"
   PG_SLOW_QUERY_THRESHOLD: "200ms"
 
   # Docs surface (optional) — Swagger UI is always mounted outside
@@ -125,12 +136,13 @@ env:
 
 # Env vars whose value comes from a Kubernetes Secret. Keys must be present
 # in either .Values.existingSecret or .Values.secretValues. Shared by both
-# the server Deployment and the three reconciler CronJobs (they all need
-# DATABASE_URL/VALKEY_PASSWORD; the reconciler additionally reads
-# MIGRATION_DATABASE_URL only if it self-migrates, which it does not — the
-# server owns migrations at startup, LLD §16.4).
+# the server Deployment and the four reconciler CronJobs (they all need
+# DATABASE_URL/SYSTEM_DATABASE_URL/VALKEY_PASSWORD). The server owns
+# migrations at startup (LLD §16.4); CronJobs still receive
+# MIGRATION_DATABASE_URL because envFromSecret is shared.
 envFromSecret:
   - DATABASE_URL
+  - SYSTEM_DATABASE_URL
   - MIGRATION_DATABASE_URL
   - VALKEY_PASSWORD
   - DOCS_AUTH_TOKEN
@@ -141,10 +153,11 @@ envFromSecret:
 # the chart creates no Secret resource and secretValues is ignored.
 #
 # DATABASE_URL here MUST be the runtime app role (delegation_app), which has
-# no BYPASSRLS. MIGRATION_DATABASE_URL MUST be the BYPASSRLS
-# delegation_migrator role — the server pod applies migrations itself at
-# startup (LLD §7.4/§16.4, additive-only for rolling-deploy safety); there
-# is no separate migrate Job in this chart.
+# no BYPASSRLS. SYSTEM_DATABASE_URL and MIGRATION_DATABASE_URL MUST both be
+# the BYPASSRLS delegation_migrator role — the server pod applies migrations
+# itself at startup (LLD §7.4/§16.4) and sysPool runs cross-tenant sweeps
+# (cron, cascade processed_events, active-gauge exporter). There is no
+# separate migrate Job in this chart.
 existingSecret: ""
 
 # rotationEpoch — used only when existingSecret is set. Bump this value to
@@ -156,6 +169,7 @@ rotationEpoch: "0"
 # Pass via --set or a Helm secrets plugin (never commit real values).
 secretValues:
   DATABASE_URL: ""
+  SYSTEM_DATABASE_URL: ""
   MIGRATION_DATABASE_URL: ""
   VALKEY_PASSWORD: ""
   DOCS_AUTH_TOKEN: ""
@@ -233,10 +247,23 @@ readinessProbe:
 # both share the same "http" port at the network layer, exactly like
 # iam-tender-acl's TAC-1..3 (public) / TAC-4 (internal) split. :9090/metrics
 # is restricted to the monitoring namespace only.
+# Envoy Gateway: data-plane Envoy proxy pods run in the same namespace as the
+# Gateway resource (not envoy-gateway-system, which is the control plane).
+# Set ingressControllerNamespaceSelector to the Gateway's namespace label and
+# ingressControllerPodSelector to the Envoy pod labels so the NetworkPolicy
+# allows only gateway traffic, not arbitrary pods in that namespace.
 networkPolicy:
   enabled: true
+  # Namespace label selector for the ingress controller / Envoy Gateway data-plane.
+  # nginx-ingress:   kubernetes.io/metadata.name: ingress-nginx
+  # Envoy Gateway:   kubernetes.io/metadata.name: <namespace where Gateway lives>
   ingressControllerNamespaceSelector:
     kubernetes.io/metadata.name: envoy-gateway-system
+  # Optional pod label selector — combined with namespaceSelector (logical AND).
+  # Envoy Gateway data-plane pods carry:
+  #   gateway.envoyproxy.io/owning-gateway-name: <gateway-name>
+  #   gateway.envoyproxy.io/owning-gateway-namespace: <gateway-namespace>
+  # Leave empty ({}) to allow all pods in the ingress controller namespace.
   ingressControllerPodSelector: {}
   metricsIngress:
     enabled: true
@@ -250,11 +277,15 @@ networkPolicy:
 # ServiceMonitor — requires kube-prometheus-stack (monitoring.coreos.com/v1
 # CRD). PrometheusRule (alerting rules) is also gated on this flag — no
 # scrape means no metrics, which means every alert stays permanently
-# inactive.
+# inactive. Set to true (and add the correct serviceMonitorSelector labels)
+# before relying on any alert in deploy/monitoring/ or
+# deploy/helm/iam-delegation/templates/prometheusrule.yaml.
 serviceMonitor:
   enabled: true
   interval: "30s"
   scrapeTimeout: "10s"
+  # Labels added to the ServiceMonitor (must match your Prometheus operator's
+  # serviceMonitorSelector — typically: release: kube-prometheus-stack).
   additionalLabels: {}
   relabelings: []
   namespaceSelector: {}
@@ -272,6 +303,26 @@ ingress:
         - path: /api/v1
           pathType: PathPrefix
 
+  # ── Gateway API (type: HTTPRoute) ────────────────────────────────────────
+  # Reference the Gateway resource that Envoy Gateway manages.
+  # The Gateway must be deployed separately (e.g. via the envoy-gateway Helm chart).
+  #
+  # Minimal example:
+  #   apiVersion: gateway.networking.k8s.io/v1
+  #   kind: Gateway
+  #   metadata:
+  #     name: iam-gateway
+  #     namespace: envoy-gateway-system
+  #   spec:
+  #     gatewayClassName: eg
+  #     listeners:
+  #       - name: https
+  #         protocol: HTTPS
+  #         port: 443
+  #         tls:
+  #           mode: Terminate
+  #           certificateRefs:
+  #             - name: iam-tls-secret
   gateway:
     name: ""              # required — name of the Gateway resource
     namespace: ""         # optional — defaults to the release namespace
@@ -285,6 +336,7 @@ ingress:
       allowMethods:
         - GET
         - POST
+        - PUT
         - PATCH
         - DELETE
         - OPTIONS
@@ -378,7 +430,7 @@ cronJobs:
       limits:
         cpu: 500m
         memory: 256Mi
-  # Rows-per-tick cap shared by all three jobs (LLD §15 crons.batchLimit) —
+  # Rows-per-tick cap shared by all four jobs (LLD §15 crons.batchLimit) —
   # raise this or shorten a job's schedule if it starts saturating
   # (LLD §16.3).
   batchLimit: 50

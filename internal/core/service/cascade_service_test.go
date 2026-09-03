@@ -6,6 +6,7 @@ import (
 	"testing"
 
 	"github.com/BCBP-SOLUTIONS-FZC-LLC/iam-delegation/internal/core/domain"
+	"github.com/BCBP-SOLUTIONS-FZC-LLC/iam-delegation/internal/core/port"
 	"github.com/google/uuid"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -67,6 +68,36 @@ func TestCascadeService_EndForUser_DelegatorDelegateAsymmetry(t *testing.T) {
 	}
 }
 
+func TestCascadeService_WithMetrics_ReturnsSameInstance(t *testing.T) {
+	_, _, _, _, svc := newCascadeHarness()
+	fm := &fakeMetrics{}
+	got := svc.WithMetrics(fm)
+	assert.Same(t, svc, got)
+}
+
+func TestCascadeService_EndForUser_RecordsMetrics(t *testing.T) {
+	repo, _, up, _, svc := newCascadeHarness()
+	fm := &fakeMetrics{}
+	svc.WithMetrics(fm)
+	tenantID := uuid.New()
+	removedUserID := uuid.New()
+	delegateSideRow := domain.Delegation{
+		ID: uuid.New(), TenantID: tenantID,
+		DelegatorID: uuid.New(), DelegateID: removedUserID,
+		Scope: domain.ScopeAll, Status: domain.DelegationEnded,
+	}
+	repo.endForUserResult = []domain.Delegation{delegateSideRow}
+	up.fn = func(ctx context.Context, r port.SetAvailabilityRequest) error {
+		return errors.New("user-profile down")
+	}
+
+	err := svc.EndForUser(context.Background(), tenantID, removedUserID)
+	require.NoError(t, err)
+
+	assert.Equal(t, []string{"cascade"}, fm.upAvailabilityFailures)
+	assert.Equal(t, []string{string(domain.EndReasonDelegateRemoved)}, fm.ended)
+}
+
 // TestCascadeService_EndForDisabledDelegate_EmitsEndedForEveryRow is Bug 2's
 // service-level test: every row EndForDisabledDelegate's repository call
 // returns is, by construction, delegate-side (delegateID is the disabled
@@ -97,17 +128,93 @@ func TestCascadeService_EndForDisabledDelegate_EmitsEndedForEveryRow(t *testing.
 	require.NoError(t, err)
 
 	events := pub.snapshot()
-	require.Len(t, events, 2, "every row is delegate-side and must emit an event")
+	require.Len(t, events, 4, "every row is delegate-side and must emit BOTH DelegationEnded and DelegationEscalationRequested (Bug 2a)")
+	endedCount, escalationCount := 0, 0
 	for _, e := range events {
-		assert.Equal(t, domain.EventDelegationEnded, e.Type)
-		payload, ok := e.Data.(domain.DelegationEndedPayload)
-		require.True(t, ok)
-		assert.Equal(t, disabledDelegate, payload.DelegateID)
-		assert.Equal(t, domain.EndReasonDelegateDisabled, payload.EndedReason,
-			"must be delegate_disabled, distinct from EndForUser's delegate_removed")
+		switch e.Type {
+		case domain.EventDelegationEnded:
+			endedCount++
+			payload, ok := e.Data.(domain.DelegationEndedPayload)
+			require.True(t, ok)
+			assert.Equal(t, disabledDelegate, payload.DelegateID)
+			assert.Equal(t, domain.EndReasonDelegateDisabled, payload.EndedReason,
+				"must be delegate_disabled, distinct from EndForUser's delegate_removed")
+		case domain.EventDelegationEscalationRequested:
+			escalationCount++
+			payload, ok := e.Data.(domain.DelegationEscalationRequestedPayload)
+			require.True(t, ok)
+			assert.Equal(t, disabledDelegate, payload.DelegateID)
+			assert.Equal(t, domain.EndReasonDelegateDisabled, payload.Reason)
+			assert.Equal(t, domain.SystemActorID, payload.ActorID)
+		default:
+			t.Fatalf("unexpected event type %q", e.Type)
+		}
 	}
+	assert.Equal(t, 2, endedCount)
+	assert.Equal(t, 2, escalationCount)
 
 	assert.Empty(t, up.calls, "User Profile's delegate pointer was already cleared atomically by its own disable flow — no redundant call")
+}
+
+// TestCascadeService_EndForDisabledDelegate_EscalationMatchesEndedRow is Bug
+// 2a's field-correspondence test: DelegationEscalationRequested must carry
+// the SAME delegation_id/delegator_id/scope as the DelegationEnded it rides
+// alongside, so a consumer never needs to guess which grant is being
+// escalated.
+func TestCascadeService_EndForDisabledDelegate_EscalationMatchesEndedRow(t *testing.T) {
+	repo, _, _, pub, svc := newCascadeHarness()
+	tenantID := uuid.New()
+	disabledDelegate := uuid.New()
+	delegator := uuid.New()
+	scopeID := uuid.New()
+
+	row := domain.Delegation{
+		ID: uuid.New(), TenantID: tenantID,
+		DelegatorID: delegator, DelegateID: disabledDelegate,
+		Scope: domain.ScopeDepartment, ScopeID: &scopeID,
+		Status: domain.DelegationEnded,
+	}
+	repo.endForDisabledDelegateResult = []domain.Delegation{row}
+
+	err := svc.EndForDisabledDelegate(context.Background(), tenantID, disabledDelegate)
+	require.NoError(t, err)
+
+	events := pub.snapshot()
+	require.Len(t, events, 2)
+
+	var endedPayload domain.DelegationEndedPayload
+	var escalationPayload domain.DelegationEscalationRequestedPayload
+	for _, e := range events {
+		switch p := e.Data.(type) {
+		case domain.DelegationEndedPayload:
+			endedPayload = p
+		case domain.DelegationEscalationRequestedPayload:
+			escalationPayload = p
+		}
+	}
+
+	assert.Equal(t, endedPayload.DelegationID, escalationPayload.DelegationID)
+	assert.Equal(t, endedPayload.TenantID, escalationPayload.TenantID)
+	assert.Equal(t, endedPayload.DelegatorID, escalationPayload.DelegatorID)
+	assert.Equal(t, endedPayload.DelegateID, escalationPayload.DelegateID)
+	assert.Equal(t, endedPayload.Scope, escalationPayload.Scope)
+	assert.Equal(t, endedPayload.ScopeID, escalationPayload.ScopeID)
+}
+
+func TestCascadeService_EndForDisabledDelegate_RecordsEndedMetricPerRow(t *testing.T) {
+	repo, _, _, _, svc := newCascadeHarness()
+	fm := &fakeMetrics{}
+	svc.WithMetrics(fm)
+	tenantID := uuid.New()
+	disabledDelegate := uuid.New()
+	repo.endForDisabledDelegateResult = []domain.Delegation{
+		{ID: uuid.New(), TenantID: tenantID, DelegatorID: uuid.New(), DelegateID: disabledDelegate, Scope: domain.ScopeAll},
+		{ID: uuid.New(), TenantID: tenantID, DelegatorID: uuid.New(), DelegateID: disabledDelegate, Scope: domain.ScopeAll},
+	}
+
+	err := svc.EndForDisabledDelegate(context.Background(), tenantID, disabledDelegate)
+	require.NoError(t, err)
+	assert.Equal(t, []string{string(domain.EndReasonDelegateDisabled), string(domain.EndReasonDelegateDisabled)}, fm.ended)
 }
 
 func TestCascadeService_EndForDisabledDelegate_NoMatchingRows_NoEvents(t *testing.T) {

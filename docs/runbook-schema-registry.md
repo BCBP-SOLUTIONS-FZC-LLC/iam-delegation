@@ -2,13 +2,13 @@
 
 ## The contract
 
-The service reads its three event schemas from AWS Glue at startup
+The service reads its four event schemas from AWS Glue at startup
 (`eventbus.NewGlueCodec` pre-fetches every version ID). Startup fails fast if
 any schema is missing — the pod will not accept traffic. This is intentional;
 publishing an event whose header points at a non-existent Glue schema
 version silently poisons every consumer downstream.
 
-The three expected schema names in the registry (`iam-delegation-events`) are
+The four expected schema names in the registry (`iam-delegation-events`) are
 **identical to the domain event-type constants** — no PascalCase translation
 table is needed, unlike `iam-user-profile`'s `domain.GlueSchemaName`:
 
@@ -17,6 +17,7 @@ table is needed, unlike `iam-user-profile`'s `domain.GlueSchemaName`:
 | `EventDelegationStarted` | `DelegationStarted` |
 | `EventDelegationEnded` | `DelegationEnded` |
 | `EventDelegationReviewRequested` | `DelegationReviewRequested` |
+| `EventDelegationEscalationRequested` | `DelegationEscalationRequested` |
 
 Note: the **JSON filenames** in `internal/eventschema/` (`delegation_started.json`,
 etc.) are snake_case to satisfy `schema-gov validate`'s Pass 7 coverage rule.
@@ -31,14 +32,14 @@ environment. Fails loudly if any schema is missing.
 
 ```bash
 export GLUE_REGISTRY_NAME=iam-delegation-events   # or the env-specific name
-export AWS_REGION=ap-south-1
+export AWS_REGION=us-east-1
 make schema-verify
 ```
 
 Expected output:
 
 ```
-OK: all three schemas present in registry 'iam-delegation-events'
+OK: all four schemas present in registry 'iam-delegation-events'
 ```
 
 Failure modes and fixes:
@@ -61,8 +62,9 @@ Failure modes and fixes:
 
 ```
 prefetch glue schema "DelegationStarted" in registry "iam-delegation-events":
-<underlying AWS error> — confirm the three expected schemas exist
-(DelegationStarted, DelegationEnded, DelegationReviewRequested)
+<underlying AWS error> — confirm the four expected schemas exist
+(DelegationStarted, DelegationEnded, DelegationReviewRequested,
+DelegationEscalationRequested)
 ```
 
 The pod exits before opening the HTTP port. Kubernetes will restart-loop it
@@ -75,7 +77,7 @@ and permanently corrupts the audit trail for the duration.
 
 ## Local development
 
-`scripts/init-localstack.sh` registers the three schemas under the same
+`scripts/init-localstack.sh` registers the four schemas under the same
 names into LocalStack's Glue mock, but only when running with
 `docker-compose.pro.yml` (Glue is a LocalStack Pro feature). Without it the
 script logs and continues, and the app must run with `GLUE_REGISTRY_NAME=""`
@@ -89,14 +91,30 @@ stack.
    here, no translation switch to extend).
 2. Add the JSON schema file to `internal/eventschema/` using the snake_case
    filename convention (e.g. `delegation_transferred.json`).
-3. Update `defaultSchemaEntries` in `eventbus/validator.go`.
-4. Extend `SCHEMA_NAME_MAP` in `.github/workflows/schema-registry.yml` (all
-   three job blocks) and the `register_schema` calls in
+3. Add the schema to `eventschema.ByEventType` in `internal/eventschema/schemas.go`
+   (`ValidatingCodec` compiles this map at enqueue) **and** the
+   `schemaNames` slice passed to `eventbus.NewGlueCodec` in
+   `cmd/server/main.go` (the Glue pre-fetch list `NewGlueCodec` fails fast
+   on at startup) — two separate lists, easy to update one and miss the
+   other; DLG-D27 shipped `delegate_disabled` in the Go `EndReason` enum
+   without updating the *schema's* enum (step 4 below) and initially missed
+   this exact `NewGlueCodec` list too, both silent-failure gaps invisible to
+   unit tests (they use a fake `EventPublisher` that skips schema
+   validation, and never construct a real `GlueCodec`).
+4. If the new event type reuses an existing enum field on an already-shipped
+   payload (e.g. adding a value to `ended_reason`), update that field's enum
+   in **both** `internal/eventschema/{name}.json` **and**
+   `api/asyncapi.yaml`'s matching schema — not just the Go `const` block.
+   `make schema-validate` (step 7) catches this locally; without it, a
+   payload using the new enum value fails real `SchemaValidator` validation
+   at publish time even though every Go-level unit test passes.
+5. Extend `SCHEMA_NAME_MAP` in `.github/workflows/schema-registry.yml` (all
+   three job blocks) and the `register_schema` call in
    `scripts/init-localstack.sh`.
-5. Add `x-lifecycle`/`x-owner` annotations to the new message in
+6. Add `x-lifecycle`/`x-owner` annotations to the new message in
    `api/asyncapi.yaml`.
-6. Run `make schema-validate` locally.
-7. Merge, then run `make schema-register` in every environment before the
+7. Run `make schema-validate` locally.
+8. Merge, then run `make schema-register` in every environment before the
    first pod that would publish the new event starts.
 
 ## IAM policy — required SIDs
@@ -124,7 +142,7 @@ Set in `deploy/helm/iam-delegation/values.yaml` (per environment) or `.env`
 |---|---|---|
 | `GLUE_REGISTRY_NAME` | Glue registry name | Set to `iam-delegation-events` in production/staging. Leave empty in dev (NoopCodec). |
 | `GLUE_REGISTRY_ARN` | Full registry ARN | For IAM policy scoping; used by `schema-gov register` and `deploy/iam/policy.tf.example`. Not read by the Go runtime. |
-| `AWS_REGION` | Primary region | `ap-south-1` in production (see `deploy/helm/iam-delegation/values.yaml`; local dev/CI use `us-east-1` against LocalStack). |
+| `AWS_REGION` | Primary region | `us-east-1` everywhere — production, local dev, and CI (see `deploy/helm/iam-delegation/values.yaml`; local dev/CI additionally point `AWS_ENDPOINT_URL` at LocalStack). |
 
 ## CI governance pipeline
 

@@ -36,6 +36,7 @@ type DelegationService struct {
 	idempotency     port.IdempotencyStore
 	cache           port.Cache
 	txRunner        port.TxRunner
+	metrics         Metrics
 }
 
 // NewDelegationService builds a DelegationService.
@@ -52,6 +53,12 @@ func NewDelegationService(
 		delegations: d, settings: settings, membershipCheck: membershipCheck,
 		userProfile: up, idempotency: idem, cache: cache, txRunner: txRunner,
 	}
+}
+
+// WithMetrics attaches an optional recorder. Nil is valid (no-op).
+func (s *DelegationService) WithMetrics(m Metrics) *DelegationService {
+	s.metrics = m
+	return s
 }
 
 // List is DLG-1 — the caller's own active delegations (LLD §9.1), cache
@@ -93,6 +100,9 @@ func (s *DelegationService) Create(ctx context.Context, tenantID, delegatorID uu
 	if idempotencyKey != "" && s.idempotency != nil {
 		if rec, found, err := s.idempotency.Get(ctx, tenantID, idempotencyKey); err == nil && found {
 			if existing, ferr := s.delegations.FindByID(ctx, tenantID, rec.DelegationID); ferr == nil {
+				if s.metrics != nil {
+					s.metrics.RecordIdempotencyHit()
+				}
 				return existing, nil
 			}
 		}
@@ -153,6 +163,30 @@ func (s *DelegationService) Create(ctx context.Context, tenantID, delegatorID uu
 	// activate immediately with no behavior change.
 	isScheduled := starts.After(now)
 
+	// reviewDueAt applies only to open-ended delegations (EndsAt == nil,
+	// DEL-8) and is computed here — before the UP call below, not inside
+	// RunInTx as previously — because it now doubles as the bound sent to
+	// User Profile's OOO window (see the OOOUntil fallback immediately
+	// below): User Profile's own model requires status=ooo to carry a
+	// bounded ooo_until (ValidateOOOWindow, ≤180 days), but this service's
+	// open-ended delegations have no ends_at at all. Without this, every
+	// open-ended Create call was rejected by User Profile with 422 — a
+	// confirmed cross-service contract bug, not a hypothetical: open-ended
+	// delegations are DLG-4 Extend's and DLG-I2's entire reason for
+	// existing, not an edge case. review_due_at is this service's own
+	// tenant-configured "how long can this go unreviewed" bound
+	// (delegation_tenant_settings.review_window_days, 1..180 — always
+	// within User Profile's 180-day cap), so it is the natural proxy for
+	// "open-ended" in a service that has no concept of open-ended at all.
+	// Re-synced on every Extend (below) for the same reason — otherwise
+	// User Profile's own expiry sweep resets the user to available once
+	// this original bound passes, even though the delegation was extended.
+	var reviewDueAt *time.Time
+	if req.EndsAt == nil {
+		due := starts.Add(time.Duration(settings.ReviewWindowDays) * 24 * time.Hour)
+		reviewDueAt = &due
+	}
+
 	// DEL-6 availability-first: call UP BEFORE any write, unless deferred.
 	// Clamp oooFrom to now() when starts_at is in the past relative to UP (a
 	// past starts_at is allowed here — the delegation is immediately active).
@@ -161,12 +195,19 @@ func (s *DelegationService) Create(ctx context.Context, tenantID, delegatorID uu
 		if oooFrom.Before(now) {
 			oooFrom = now
 		}
+		oooUntil := req.EndsAt
+		if oooUntil == nil {
+			oooUntil = reviewDueAt
+		}
 		oooStatus := "ooo"
 		if err := s.userProfile.SetAvailability(ctx, port.SetAvailabilityRequest{
 			TenantID: tenantID, UserID: delegatorID,
-			Status: &oooStatus, OOOFrom: &oooFrom, OOOUntil: req.EndsAt,
+			Status: &oooStatus, OOOFrom: &oooFrom, OOOUntil: oooUntil,
 			DelegateID: &req.DelegateID, Note: req.Reason,
 		}); err != nil {
+			if s.metrics != nil {
+				s.metrics.RecordUPAvailabilityFailure("create")
+			}
 			if errors.Is(err, port.ErrDependencyUnavailable) {
 				return nil, domain.NewError(domain.ErrUserProfileUnavailable, "user profile unavailable")
 			}
@@ -185,11 +226,8 @@ func (s *DelegationService) Create(ctx context.Context, tenantID, delegatorID uu
 	scope := domain.DelegationScope(req.Scope)
 	var created *domain.Delegation
 	err = s.txRunner.RunInTx(ctx, func(txCtx context.Context) error {
-		var reviewDueAt *time.Time
-		if req.EndsAt == nil {
-			due := starts.Add(time.Duration(settings.ReviewWindowDays) * 24 * time.Hour)
-			reviewDueAt = &due
-		}
+		// reviewDueAt was computed above, before the UP call — reused here
+		// rather than recomputed.
 		reviewWindowDays := settings.ReviewWindowDays
 		out, err := s.delegations.Insert(txCtx, &domain.Delegation{
 			TenantID:              tenantID,
@@ -247,6 +285,9 @@ func (s *DelegationService) Create(ctx context.Context, tenantID, delegatorID uu
 	}
 	if s.cache != nil {
 		s.cache.InvalidateDelegatorList(ctx, tenantID, delegatorID)
+	}
+	if s.metrics != nil {
+		s.metrics.RecordCreated(string(created.Scope))
 	}
 	return created, nil
 }
@@ -308,11 +349,13 @@ func (s *DelegationService) Cancel(ctx context.Context, tenantID, id uuid.UUID, 
 	if err != nil {
 		return nil, err
 	}
-	//nolint:errcheck // fail-open by design (LLD §11.2): if UP is down, log
+	// fail-open by design (LLD §11.2): if UP is down, log
 	// and proceed — the expiry cron re-clears the pointer later (DEL-6).
-	_ = s.userProfile.SetAvailability(ctx, port.SetAvailabilityRequest{
+	if err := s.userProfile.SetAvailability(ctx, port.SetAvailabilityRequest{
 		TenantID: tenantID, UserID: d.DelegatorID, ClearDelegate: true,
-	})
+	}); err != nil && s.metrics != nil {
+		s.metrics.RecordUPAvailabilityFailure("cancel")
+	}
 	// use actual caller if available in context, fall back to delegator
 	actorID := d.DelegatorID
 	if rc, ok := requestctx.FromContext(ctx); ok {
@@ -342,6 +385,9 @@ func (s *DelegationService) Cancel(ctx context.Context, tenantID, id uuid.UUID, 
 	}
 	if s.cache != nil {
 		s.cache.InvalidateDelegatorList(ctx, tenantID, d.DelegatorID)
+	}
+	if s.metrics != nil {
+		s.metrics.RecordEnded(string(domain.EndReasonCancelled))
 	}
 	return ended, nil
 }
@@ -381,6 +427,28 @@ func (s *DelegationService) Extend(ctx context.Context, tenantID, id uuid.UUID, 
 	}
 	if s.cache != nil {
 		s.cache.InvalidateDelegatorList(ctx, tenantID, out.DelegatorID)
+	}
+	// Re-sync User Profile's ooo_until to the new review_due_at. Required
+	// because Create (above) now sends review_due_at as the OOO window's
+	// bound for open-ended delegations — User Profile has no concept of
+	// "open-ended," only a bounded window it expires on its own schedule.
+	// Without this, extending the delegation here would leave User
+	// Profile's ooo_until at the OLD (soon-to-lapse) value; once that
+	// original bound passed, User Profile's own expiry sweep would reset
+	// the delegator to 'available' even though the delegation is still
+	// active — reintroducing the same class of cross-service desync this
+	// fix exists to close. Fail-open (best-effort), matching Cancel's
+	// existing DEL-6 pattern: unlike the expiry-cron's stale-pointer case,
+	// there is no later self-healing retry for this specific field if the
+	// call fails here — accepted as a rare-outage residual risk rather
+	// than blocking the user's own extend action on a transient UP hiccup.
+	oooStatus := "ooo"
+	if err := s.userProfile.SetAvailability(ctx, port.SetAvailabilityRequest{
+		TenantID: tenantID, UserID: out.DelegatorID,
+		Status: &oooStatus, OOOFrom: &out.StartsAt, OOOUntil: out.ReviewDueAt,
+		DelegateID: &out.DelegateID, Note: out.Reason,
+	}); err != nil && s.metrics != nil {
+		s.metrics.RecordUPAvailabilityFailure("extend")
 	}
 	return out, nil
 }

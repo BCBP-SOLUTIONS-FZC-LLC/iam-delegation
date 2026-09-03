@@ -2,7 +2,7 @@ iam-delegation {{ .Chart.Version }} deployed.
 
 This service is the fourth and last O&M extraction (ADR-0008, Option C) —
 owns delegations + delegation_tenant_settings, the DLG-1..7/DLG-I1..I4 API,
-the delegation-expiry/-review/-cleanup CronJobs, and the
+the delegation-activation/-expiry/-review/-cleanup CronJobs, and the
 iam.delegation.events topic.
 
 ━━ REQUIRED ACTIONS ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -39,6 +39,9 @@ iam.delegation.events topic.
 {{ end -}}
 ━━ CRONJOBS ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
+{{ if .Values.cronJobs.activation.enabled -}}
+  delegation-activation  {{ .Values.cronJobs.activation.schedule }}   (DLG-D25, defer activation until starts_at)
+{{ end -}}
 {{ if .Values.cronJobs.expiry.enabled -}}
   delegation-expiry   {{ .Values.cronJobs.expiry.schedule }}   (DLG-I1, LLD §11.3)
 {{ end -}}

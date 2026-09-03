@@ -1,12 +1,5 @@
 // Posts or updates a single PR comment summarising CI job results.
 // Invoked by ci.yml via actions/github-script script-path (keeps JS out of YAML).
-//
-// Row-to-job mapping differs from iam-user-profile's version this was
-// ported from: this repo's ci.yml deliberately keeps Trivy/smoke as steps
-// inside build-image's {server, reconciler} matrix rather than separate
-// top-level jobs (see ci.yml's "DELIBERATE SCOPE TRIM" comment), so there
-// is one "Image build + scan + smoke" row covering both binaries instead
-// of separate Trivy/smoke rows.
 const needs = JSON.parse(process.env.NEEDS_JSON || '{}');
 
 function icon(r) {
@@ -20,9 +13,11 @@ const coveragePct = needs['validate-test']?.outputs?.pct;
 
 const rows = [
   ['Tests & race detector', 'validate-test'],
-  ['Coverage ≥ 70%', 'validate-test'],
-  ['Image build + Trivy scan + smoke (server, reconciler)', 'build-image'],
-  ['Code quality', 'validate-quality'],
+  ['Image build + Dockerfile lint', 'build-image'],
+  ['Coverage ≥ 95%',         'validate-test'],
+  ['Trivy CVE scan',         'trivy'],
+  ['Smoke tests (server, reconciler)', 'smoke'],
+  ['Code quality',           'validate-quality'],
 ];
 
 const table = rows
@@ -30,7 +25,7 @@ const table = rows
     const label = row[0];
     const key   = row[1];
     const r     = needs[key]?.result || 'skipped';
-    const value = (label === 'Coverage ≥ 70%' && coveragePct)
+    const value = (label === 'Coverage ≥ 95%' && coveragePct)
       ? parseFloat(coveragePct).toFixed(1) + '%'
       : '`' + r + '`';
     return '| ' + icon(r) + ' | ' + label + ' | ' + value + ' |';
@@ -53,7 +48,7 @@ const body = [
   '|---|---|---|',
   table,
   '',
-  '📦 Both images (`iam-delegation-server`, `iam-delegation-reconciler`) cached for `linux/amd64` · merges to `main` are signed with Cosign',
+  '📦 Image (`iam-delegation`, carrying both the server and reconciler binaries) cached for `linux/amd64` · merges to `main` are signed with Cosign',
   '🔍 [Security tab](https://github.com/' +
     context.repo.owner +
     '/' +

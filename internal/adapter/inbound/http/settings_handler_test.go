@@ -70,6 +70,14 @@ func TestSettingsHandler_Set(t *testing.T) {
 		require.Equal(t, http.StatusUnauthorized, w.Code)
 	})
 
+	t.Run("invalid tenant id -> 401", func(t *testing.T) {
+		h := NewSettingsHandler(&fakeSettingsService{})
+		rc := &requestctx.Context{UserID: userID.String(), TenantID: "not-a-uuid", Roles: []string{"tenant_admin"}}
+		c, w := newRequestWithIdentity(http.MethodPut, "/api/v1/delegations/settings", bytes.NewReader([]byte(`{}`)), rc)
+		h.Set(c)
+		require.Equal(t, http.StatusUnauthorized, w.Code)
+	})
+
 	t.Run("malformed JSON body -> 400", func(t *testing.T) {
 		h := NewSettingsHandler(&fakeSettingsService{})
 		c, w := newRequestWithIdentity(http.MethodPut, "/api/v1/delegations/settings", bytes.NewReader([]byte(`{bad`)), adminRC(userID, tenantID))

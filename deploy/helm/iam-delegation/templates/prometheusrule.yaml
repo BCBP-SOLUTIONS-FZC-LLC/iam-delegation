@@ -76,6 +76,105 @@ spec:
               the cron self-retries every tick, no data is lost, but this is
               a real freshness gap. Check iam-user-profile's health.
 
+    # ── DLG-D25 availability-first activation deferrals (cross-service
+    #    future-OOO bug fix) — same alerting shape as
+    #    IamDelegationExpiryDeferred above, added alongside the
+    #    delegation-activation CronJob. Without this alert, a stuck
+    #    iam-user-profile silently leaves `scheduled` delegations un-activated
+    #    forever with no page — Bug 3/DLG-D25's whole point is that
+    #    activation must actually happen at starts_at, not just "not too
+    #    early" (Bug 1) ──────────────────────────────────────────────────────
+    - name: iam_delegation_activation
+      rules:
+        - alert: IamDelegationActivationDeferred
+          # Same counter-vs-increase() reasoning as IamDelegationExpiryDeferred
+          # above: iam_delegation_activation_deferred_total only ever goes up.
+          expr: |
+            sum(increase(iam_delegation_activation_deferred_total{job={{ include "iam-delegation.fullname" . | quote }}}[30m])) > 0
+          for: 30m
+          labels:
+            severity: warning
+            team: platform
+          annotations:
+            summary: iam-delegation delegation-activation cron is deferring (iam-user-profile unavailable)
+            description: >-
+              The delegation-activation cron (DLG-D25, availability-first
+              ordering, LLD §11.1a) has been deferring activation passes for
+              30+ minutes because iam-user-profile's SetAvailability call is
+              failing. Delegations past starts_at are stuck in `scheduled` —
+              the delegator is NOT shown as OOO and the delegate is NOT
+              routed work, even though the leave has actually begun. The
+              cron self-retries every tick once iam-user-profile recovers,
+              no data is lost, but this is a real freshness gap. Check
+              iam-user-profile's health.
+
+    # ── DLG-D7/DLG-Q6 review-window deferrals — same alerting shape and
+    #    counter-vs-increase() reasoning as IamDelegationExpiryDeferred
+    #    above. LLD §14.5/§18.4 (GAP-27/DLG-D19 gap closure) explicitly
+    #    requires this alert to exist since iam_delegation_review_deferred_total
+    #    is unenforceable as a production signal if never alerted on.
+    - name: iam_delegation_review
+      rules:
+        - alert: IamDelegationReviewDeferred
+          expr: |
+            sum(increase(iam_delegation_review_deferred_total{job={{ include "iam-delegation.fullname" . | quote }}}[30m])) > 0
+          for: 30m
+          labels:
+            severity: warning
+            team: platform
+          annotations:
+            summary: iam-delegation DLG-I2 review cron is deferring (iam-user-profile unavailable)
+            description: >-
+              The delegation-review cron (DLG-I2, 3-day daily-cascade warn
+              then auto-end, LLD §11.4) has been deferring passes for 30+
+              minutes because iam-user-profile's SetAvailability/pointer-clear
+              call is failing. Review warnings and review_expired auto-ends
+              are NOT yet applied — the cron self-retries every tick, no
+              data is lost, but this is a real freshness gap. Check
+              iam-user-profile's health.
+
+    # ── Generic HTTP error-rate — platform-gincommon's http_requests_total
+    #    with status_class="5xx" (v1.3.0's `error_class` label distinguishes
+    #    success/client_error/server_error; status_class buckets 3xx into
+    #    2xx). Not itself an LLD §14.5 alert, but standard coverage for
+    #    degradation none of the business-metric alerts above would catch.
+    - name: iam_delegation_errors
+      rules:
+        - alert: IamDelegationHighErrorRate
+          expr: |
+            sum(rate(http_requests_total{job={{ include "iam-delegation.fullname" . | quote }}, status_class="5xx"}[5m]))
+              /
+            clamp_min(sum(rate(http_requests_total{job={{ include "iam-delegation.fullname" . | quote }}}[5m])), 0.001)
+            > 0.05
+          for: 5m
+          labels:
+            severity: warning
+            team: platform
+          annotations:
+            summary: iam-delegation 5xx error rate above 5%
+            description: >-
+              {{ "{{ $value | humanizePercentage }}" }} of requests are
+              returning 5xx errors over the last 5 minutes. Investigate
+              recent deployments, dependency health (Postgres, Valkey,
+              iam-user-profile, iam-org-membership), and application logs.
+
+        - alert: IamDelegationCriticalErrorRate
+          expr: |
+            sum(rate(http_requests_total{job={{ include "iam-delegation.fullname" . | quote }}, status_class="5xx"}[5m]))
+              /
+            clamp_min(sum(rate(http_requests_total{job={{ include "iam-delegation.fullname" . | quote }}}[5m])), 0.001)
+            > 0.20
+          for: 2m
+          labels:
+            severity: critical
+            team: platform
+          annotations:
+            summary: iam-delegation 5xx error rate above 20%
+            description: >-
+              {{ "{{ $value | humanizePercentage }}" }} of requests are
+              returning 5xx errors. This exceeds the critical threshold —
+              escalate immediately, the service is severely degraded.
+
     # ── delegation-cascade-q DLQ — LLD §14.5 "cascade_dlq > 0 (warning)" ───
     - name: iam_delegation_cascade
       rules:

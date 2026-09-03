@@ -3,9 +3,9 @@
 # Platform Terraform owns the authoritative version of this resource.
 #
 # The SAME role must be assumable by both cmd/server (publishes to
-# iam-delegation-events, consumes delegation-cascade-q) and the three
+# iam-delegation-events, consumes delegation-cascade-q) and the four
 # cmd/reconciler CronJobs (LLD §16.1) — one ServiceAccount, one role, shared
-# by the Deployment and all three CronJobs (see deploy/helm/iam-delegation's
+# by the Deployment and all four CronJobs (see deploy/helm/iam-delegation's
 # serviceAccount.annotations and the CronJob templates, which reference the
 # same serviceAccountName helper).
 

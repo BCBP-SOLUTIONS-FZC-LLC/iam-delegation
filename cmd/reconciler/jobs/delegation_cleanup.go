@@ -9,16 +9,17 @@ import (
 // a hard purge.
 const defaultRetentionDays = 90
 
-// processedEventsRetention is the LLD §18.4 retention window for the
-// processed_events idempotency ledger (GAP-09).
-const processedEventsRetention = 30 * 24 * time.Hour
+// processedEventsTTLDays is the LLD §18.4 retention window for the
+// processed_events idempotency ledger (GAP-09), passed to Prune as days.
+const processedEventsTTLDays = 30
 
 // Cleanup is the monthly delegation-cleanup job (0 4 1 * *) — hard-purges
 // delegations soft-deleted more than RetentionDays ago (LLD §18.4), and
 // purges the processed_events idempotency ledger older than 30 days
-// (GAP-09). No event emission (purely a storage-retention concern), no GUC
-// binding needed (HardPurgeSoftDeletedBefore is a cross-tenant DELETE
-// against the BYPASSRLS pool, like the other cron finder queries).
+// (GAP-09) via bounded Prune (iam-realm-provisioner). No event emission
+// (purely a storage-retention concern), no GUC binding needed
+// (HardPurgeSoftDeletedBefore is a cross-tenant DELETE against the
+// BYPASSRLS pool, like the other cron finder queries).
 func Cleanup(ctx context.Context, jctx *Context) (Result, error) {
 	var res Result
 	retention := jctx.RetentionDays
@@ -32,10 +33,11 @@ func Cleanup(ctx context.Context, jctx *Context) (Result, error) {
 	}
 	res.Purged = purged
 
-	// GAP-09: purge the processed_events idempotency ledger (LLD §18.4).
+	// GAP-09: prune the processed_events idempotency ledger (LLD §18.4)
+	// with a LIMIT so a large backlog cannot lock the table unbounded.
 	if jctx.ProcessedEvents != nil {
-		if err := jctx.ProcessedEvents.CleanupExpired(ctx, processedEventsRetention); err != nil {
-			jctx.Logger.Warn("delegation-cleanup: processed_events purge failed",
+		if _, err := jctx.ProcessedEvents.Prune(ctx, processedEventsTTLDays, batchLimit(jctx)); err != nil {
+			jctx.Logger.Warn("delegation-cleanup: processed_events prune failed",
 				map[string]interface{}{"error": err.Error()})
 			// non-fatal: log and continue — delegation purge already succeeded
 		}

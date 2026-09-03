@@ -4,10 +4,10 @@ import "context"
 
 import "github.com/BCBP-SOLUTIONS-FZC-LLC/iam-delegation/internal/core/domain"
 
-// EventPublisher is the tx-scoped event sink services enqueue onto. The
-// eventbus adapter's implementation validates the payload, wraps it in an
-// events.Envelope, and calls outbox.Enqueue inside the caller's active
-// pgx.Tx — atomic with the state change (DLG-EVT-1).
+// EventPublisher is the event sink services enqueue onto inside a
+// TxRunner.RunInTx. The eventbus Publisher validates the payload, wraps it
+// in an events.Envelope, and calls outbox.Enqueue on the pgx.Tx bound in
+// ctx (DLG-EVT-1). Callers never pass a pgx.Tx.
 type EventPublisher interface {
 	EnqueueCtx(ctx context.Context, evt *domain.DomainEvent) error
 }

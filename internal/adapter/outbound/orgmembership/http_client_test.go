@@ -9,11 +9,36 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/prometheus/client_golang/prometheus"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
+	"github.com/BCBP-SOLUTIONS-FZC-LLC/iam-delegation/internal/adapter/outbound/metrics"
 	"github.com/BCBP-SOLUTIONS-FZC-LLC/iam-delegation/internal/core/port"
 )
+
+// TestHTTPChecker_Exists_RecordsMetrics exercises Exists's metrics.Live !=
+// nil branch (observed duration on every call, failure count on error).
+// metrics.Live is a package-level global set once by the composition root
+// in production; this test sets and restores it to avoid leaking state
+// into other packages' tests.
+func TestHTTPChecker_Exists_RecordsMetrics(t *testing.T) {
+	prev := metrics.Live
+	m, err := metrics.RegisterOn(prometheus.NewRegistry())
+	require.NoError(t, err)
+	metrics.Live = m
+	t.Cleanup(func() { metrics.Live = prev })
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusInternalServerError)
+	}))
+	defer server.Close()
+	checker, err := NewHTTPChecker(server.URL, nil, 0)
+	require.NoError(t, err)
+
+	_, _, err = checker.Exists(t.Context(), uuid.New(), uuid.New())
+	require.Error(t, err, "the metrics recording path runs regardless of outcome")
+}
 
 func TestNewHTTPChecker_EmptyBaseURL_Errors(t *testing.T) {
 	_, err := NewHTTPChecker("", nil, 0)
@@ -61,6 +86,32 @@ func TestHTTPChecker_Exists_NotActive(t *testing.T) {
 	active, _, err := checker.Exists(t.Context(), uuid.New(), uuid.New())
 	require.NoError(t, err)
 	assert.False(t, active)
+}
+
+func TestHTTPChecker_Exists_4xx_PlainErrorNotWrapped(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusNotFound)
+	}))
+	defer server.Close()
+
+	checker, err := NewHTTPChecker(server.URL, nil, 0)
+	require.NoError(t, err)
+	_, _, err = checker.Exists(t.Context(), uuid.New(), uuid.New())
+	require.Error(t, err)
+	assert.NotErrorIs(t, err, port.ErrDependencyUnavailable, "a 4xx must not be treated as a dependency-unavailable condition")
+}
+
+func TestHTTPChecker_Exists_MalformedResponseBody_Errors(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte("{not json"))
+	}))
+	defer server.Close()
+
+	checker, err := NewHTTPChecker(server.URL, nil, 0)
+	require.NoError(t, err)
+	_, _, err = checker.Exists(t.Context(), uuid.New(), uuid.New())
+	require.Error(t, err)
 }
 
 // TestHTTPChecker_Exists_5xx_WrapsErrDependencyUnavailable covers this

@@ -98,6 +98,22 @@ func TestDelegationHandler_Create(t *testing.T) {
 		require.Equal(t, http.StatusUnauthorized, w.Code)
 	})
 
+	t.Run("invalid tenant id -> 401", func(t *testing.T) {
+		h := NewDelegationHandler(&fakeDelegationService{}, &fakeDelegationReader{})
+		rc := &requestctx.Context{UserID: userID.String(), TenantID: "not-a-uuid"}
+		c, w := newRequestWithIdentity(http.MethodPost, "/api/v1/delegations", bytes.NewReader([]byte(`{}`)), rc)
+		h.Create(c)
+		require.Equal(t, http.StatusUnauthorized, w.Code)
+	})
+
+	t.Run("invalid user id -> 401", func(t *testing.T) {
+		h := NewDelegationHandler(&fakeDelegationService{}, &fakeDelegationReader{})
+		rc := &requestctx.Context{UserID: "not-a-uuid", TenantID: tenantID.String()}
+		c, w := newRequestWithIdentity(http.MethodPost, "/api/v1/delegations", bytes.NewReader([]byte(`{}`)), rc)
+		h.Create(c)
+		require.Equal(t, http.StatusUnauthorized, w.Code)
+	})
+
 	t.Run("malformed JSON body -> 400", func(t *testing.T) {
 		h := NewDelegationHandler(&fakeDelegationService{}, &fakeDelegationReader{})
 		c, w := newRequestWithIdentity(http.MethodPost, "/api/v1/delegations", bytes.NewReader([]byte(`{not json`)), selfRC(userID, tenantID))
@@ -173,6 +189,15 @@ func TestDelegationHandler_Cancel(t *testing.T) {
 	t.Run("missing identity -> 401", func(t *testing.T) {
 		h := NewDelegationHandler(&fakeDelegationService{}, &fakeDelegationReader{})
 		c, w := newRequestWithIdentity(http.MethodDelete, "/api/v1/delegations/"+delegationID.String(), nil, nil)
+		setPathParam(c, "id", delegationID.String())
+		h.Cancel(c)
+		require.Equal(t, http.StatusUnauthorized, w.Code)
+	})
+
+	t.Run("invalid tenant id -> 401", func(t *testing.T) {
+		h := NewDelegationHandler(&fakeDelegationService{}, &fakeDelegationReader{})
+		rc := &requestctx.Context{UserID: delegatorID.String(), TenantID: "not-a-uuid"}
+		c, w := newRequestWithIdentity(http.MethodDelete, "/api/v1/delegations/"+delegationID.String(), nil, rc)
 		setPathParam(c, "id", delegationID.String())
 		h.Cancel(c)
 		require.Equal(t, http.StatusUnauthorized, w.Code)
@@ -283,6 +308,23 @@ func TestDelegationHandler_Extend(t *testing.T) {
 		require.Equal(t, http.StatusBadRequest, w.Code)
 	})
 
+	t.Run("missing identity -> 401", func(t *testing.T) {
+		h := NewDelegationHandler(&fakeDelegationService{}, &fakeDelegationReader{})
+		c, w := newRequestWithIdentity(http.MethodPost, "/api/v1/delegations/"+delegationID.String()+"/extend", bytes.NewReader([]byte(`{}`)), nil)
+		setPathParam(c, "id", delegationID.String())
+		h.Extend(c)
+		require.Equal(t, http.StatusUnauthorized, w.Code)
+	})
+
+	t.Run("invalid tenant id -> 401", func(t *testing.T) {
+		h := NewDelegationHandler(&fakeDelegationService{}, &fakeDelegationReader{})
+		rc := &requestctx.Context{UserID: delegatorID.String(), TenantID: "not-a-uuid"}
+		c, w := newRequestWithIdentity(http.MethodPost, "/api/v1/delegations/"+delegationID.String()+"/extend", bytes.NewReader([]byte(`{}`)), rc)
+		setPathParam(c, "id", delegationID.String())
+		h.Extend(c)
+		require.Equal(t, http.StatusUnauthorized, w.Code)
+	})
+
 	t.Run("neither self nor admin -> 403", func(t *testing.T) {
 		h := NewDelegationHandler(&fakeDelegationService{}, readerFor(delegatorID))
 		c, w := newRequestWithIdentity(http.MethodPost, "/api/v1/delegations/"+delegationID.String()+"/extend", bytes.NewReader([]byte(`{}`)), selfRC(otherID, tenantID))
@@ -362,6 +404,23 @@ func TestDelegationHandler_Reassign(t *testing.T) {
 		setPathParam(c, "id", "nope")
 		h.Reassign(c)
 		require.Equal(t, http.StatusBadRequest, w.Code)
+	})
+
+	t.Run("missing identity -> 401", func(t *testing.T) {
+		h := NewDelegationHandler(&fakeDelegationService{}, &fakeDelegationReader{})
+		c, w := newRequestWithIdentity(http.MethodPost, "/api/v1/delegations/"+delegationID.String()+"/reassign", bytes.NewReader([]byte(`{}`)), nil)
+		setPathParam(c, "id", delegationID.String())
+		h.Reassign(c)
+		require.Equal(t, http.StatusUnauthorized, w.Code)
+	})
+
+	t.Run("invalid tenant id -> 401", func(t *testing.T) {
+		h := NewDelegationHandler(&fakeDelegationService{}, &fakeDelegationReader{})
+		rc := &requestctx.Context{UserID: delegatorID.String(), TenantID: "not-a-uuid"}
+		c, w := newRequestWithIdentity(http.MethodPost, "/api/v1/delegations/"+delegationID.String()+"/reassign", bytes.NewReader([]byte(`{}`)), rc)
+		setPathParam(c, "id", delegationID.String())
+		h.Reassign(c)
+		require.Equal(t, http.StatusUnauthorized, w.Code)
 	})
 
 	t.Run("neither self nor admin -> 403", func(t *testing.T) {

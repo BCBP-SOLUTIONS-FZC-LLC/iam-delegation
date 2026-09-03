@@ -7,7 +7,7 @@ graph TD
 
     subgraph path2["Path 2 — Mesh-only internal reads (DLG-I3/I4)"]
         p2a["gucBoundReader (cmd/server/adapters.go)\nwraps *postgres.DelegationRepository"]
-        p2b["binds app.tenant_id + userID=\"iam-system\"\nper call, immediately before each\nsingle-statement query — no middleware,\nno open tx (LLD §7.3/RLS-6)"]
+        p2b["binds app.tenant_id + userID='iam-system'\nper call, immediately before each\nsingle-statement query — no middleware,\nno open tx (LLD §7.3/RLS-6)"]
         p2a --> p2b
     end
 

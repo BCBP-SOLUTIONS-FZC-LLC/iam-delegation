@@ -4,6 +4,7 @@ import (
 	"context"
 	"net/http"
 	"strings"
+	"time"
 
 	"github.com/gin-gonic/gin"
 
@@ -84,27 +85,36 @@ func NewRouter(
 	settingsHandler *SettingsHandler,
 	internalHandler *InternalHandler,
 	postgres PostgresHealth,
+	sysPostgres PostgresHealth,
 	cache Pinger,
 	outbox Pinger,
-	logger Logger,
-	tracing *gincommon.TracingOptions,
+	ginCfg gincommon.Config,
 	docs DocsConfig,
 	bindTenantGUC BindTenantGUC,
 ) *Router {
-	gin.SetMode(gin.ReleaseMode)
 	engine := gin.New()
+	engine.HandleMethodNotAllowed = true
 
-	cfg := gincommon.Config{Logger: logger, ServiceName: "delegation", Tracing: tracing}
+	if ginCfg.ServiceName == "" {
+		ginCfg.ServiceName = "iam-delegation"
+	}
 
-	// Observability (recovery/request-id/tracing/metrics/correlation/
-	// logging) applies to every route, including /internal/*. Auth
+	// Middleware order matches platform-gincommon's README and
+	// iam-realm-provisioner: 1 MB body cap → TimeoutMiddleware →
+	// ObservabilityMiddlewares (recovery/request-id/tracing/metrics/
+	// correlation/logging) on every route, including /internal/*. Auth
 	// (ProtectedMiddlewares) applies only to the public group below —
 	// /internal/* is a mesh-only trust boundary with no RBAC/JWT check
-	// (LLD §8.2/§13.2), mirroring iam-tender-acl's TAC-4 registration.
-	engine.Use(gincommon.ObservabilityMiddlewares(cfg)...)
+	// (LLD §8.2/§13.2). gin.SetMode is decided in cmd/server from APP_ENV.
+	engine.Use(func(c *gin.Context) {
+		c.Request.Body = http.MaxBytesReader(c.Writer, c.Request.Body, 1<<20)
+		c.Next()
+	})
+	engine.Use(gincommon.TimeoutMiddleware(30 * time.Second))
+	engine.Use(gincommon.ObservabilityMiddlewares(ginCfg)...)
 
 	public := engine.Group("/api/v1/delegations")
-	public.Use(gincommon.ProtectedMiddlewares(cfg)...)
+	public.Use(gincommon.ProtectedMiddlewares(ginCfg)...)
 	public.Use(ContextMiddleware())
 	if bindTenantGUC != nil {
 		public.Use(tenantGUCMiddleware(bindTenantGUC))
@@ -126,7 +136,7 @@ func NewRouter(
 	internalGroup.GET("/delegations/dept-delegate", internalHandler.DeptDelegate)
 	internalGroup.GET("/users/:id/active-delegations", internalHandler.ActiveDelegations)
 
-	hc := &healthHandlers{postgres: postgres, cache: cache, outbox: outbox}
+	hc := &healthHandlers{postgres: postgres, sysPostgres: sysPostgres, cache: cache, outbox: outbox}
 	// healthz is gincommon.HealthHandler() itself, not a local
 	// reimplementation of its {"status":"ok"} body.
 	engine.GET("/healthz", gincommon.HealthHandler())

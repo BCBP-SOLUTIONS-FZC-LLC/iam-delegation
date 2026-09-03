@@ -19,12 +19,14 @@ func (fakeLogger) Info(string, map[string]interface{}) {}
 func (fakeLogger) Warn(string, map[string]interface{}) {}
 
 type fakeUserProfile struct {
-	failFor map[uuid.UUID]bool // delegatorID -> fail SetAvailability
-	calls   []uuid.UUID
+	failFor  map[uuid.UUID]bool // delegatorID -> fail SetAvailability
+	calls    []uuid.UUID
+	requests []port.SetAvailabilityRequest // full request per call, same order as calls
 }
 
 func (f *fakeUserProfile) SetAvailability(_ context.Context, req port.SetAvailabilityRequest) error {
 	f.calls = append(f.calls, req.UserID)
+	f.requests = append(f.requests, req)
 	if f.failFor != nil && f.failFor[req.UserID] {
 		return errors.New("user profile down")
 	}
@@ -123,9 +125,14 @@ type fakeMetrics struct {
 	reviewDeferred     int
 }
 
-func (f *fakeMetrics) RecordExpiryDeferred()     { f.expiryDeferred++ }
-func (f *fakeMetrics) RecordActivationDeferred() { f.activationDeferred++ }
-func (f *fakeMetrics) RecordReviewDeferred()     { f.reviewDeferred++ }
+func (f *fakeMetrics) RecordExpiryDeferred()              { f.expiryDeferred++ }
+func (f *fakeMetrics) RecordActivationDeferred()          { f.activationDeferred++ }
+func (f *fakeMetrics) RecordReviewDeferred()              { f.reviewDeferred++ }
+func (f *fakeMetrics) RecordReviewWarned(string)          {}
+func (f *fakeMetrics) RecordReviewExpired()               {}
+func (f *fakeMetrics) RecordEnded(string)                 {}
+func (f *fakeMetrics) RecordCreated(string)               {}
+func (f *fakeMetrics) RecordUPAvailabilityFailure(string) {}
 
 func newDelegation(delegatorID uuid.UUID) domain.Delegation {
 	return domain.Delegation{
@@ -357,6 +364,66 @@ func TestActivation_NoScheduledRows_NoOp(t *testing.T) {
 	}
 	if res.Attempted != 0 || res.Succeeded != 0 {
 		t.Fatalf("expected a no-op result, got %+v", res)
+	}
+}
+
+// TestActivation_OpenEnded_SendsReviewDueAtAsOOOUntil is a regression test
+// for DLG-D29 found during a third production-readiness pass: a scheduled,
+// open-ended delegation (EndsAt == nil — a first-class case, not an edge
+// case) sent OOOUntil: nil to User Profile on activation, the exact same
+// bug DelegationService.Create was fixed for, missed here because
+// Activation is a separate call site. User Profile's real ValidateOOOWindow
+// unconditionally rejects status="ooo" with no ooo_until, so this would
+// have deferred every single tick forever — the same wrong payload
+// rejected the same way each time — never actually activating an
+// open-ended scheduled delegation. newDelegation's default (EndsAt/
+// ReviewDueAt both nil) is what let this slip past every other Activation
+// test: the fake UserProfile never validated the payload shape.
+func TestActivation_OpenEnded_SendsReviewDueAtAsOOOUntil(t *testing.T) {
+	d := newScheduledDelegation(uuid.New())
+	reviewDueAt := time.Now().UTC().Add(90 * 24 * time.Hour)
+	d.EndsAt = nil
+	d.ReviewDueAt = &reviewDueAt
+	repo := &fakeDelegationRepo{scheduled: []domain.Delegation{d}}
+	up := &fakeUserProfile{}
+	tx := &fakeTxRunner{}
+	jctx := &Context{Delegations: repo, UserProfile: up, TxRunner: tx, BindTenantGUC: noopBind, Logger: fakeLogger{}}
+
+	res, err := Activation(context.Background(), jctx)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if res.Succeeded != 1 {
+		t.Fatalf("expected activation to succeed, got %+v", res)
+	}
+	if len(up.requests) != 1 {
+		t.Fatalf("expected 1 SetAvailability call, got %d", len(up.requests))
+	}
+	got := up.requests[0]
+	if got.OOOUntil == nil {
+		t.Fatalf("OOOUntil must never be nil when Status is ooo — User Profile's real ValidateOOOWindow rejects that combination unconditionally")
+	}
+	if !got.OOOUntil.Equal(reviewDueAt) {
+		t.Fatalf("expected OOOUntil to fall back to ReviewDueAt %v, got %v", reviewDueAt, *got.OOOUntil)
+	}
+}
+
+// TestActivation_FixedEnd_StillSendsEndsAtAsOOOUntil confirms the
+// open-ended fallback above didn't regress the ordinary fixed-end case.
+func TestActivation_FixedEnd_StillSendsEndsAtAsOOOUntil(t *testing.T) {
+	d := newScheduledDelegation(uuid.New())
+	endsAt := time.Now().UTC().Add(48 * time.Hour)
+	d.EndsAt = &endsAt
+	repo := &fakeDelegationRepo{scheduled: []domain.Delegation{d}}
+	up := &fakeUserProfile{}
+	tx := &fakeTxRunner{}
+	jctx := &Context{Delegations: repo, UserProfile: up, TxRunner: tx, BindTenantGUC: noopBind, Logger: fakeLogger{}}
+
+	if _, err := Activation(context.Background(), jctx); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(up.requests) != 1 || up.requests[0].OOOUntil == nil || !up.requests[0].OOOUntil.Equal(endsAt) {
+		t.Fatalf("expected OOOUntil to equal the delegation's own ends_at %v, got %+v", endsAt, up.requests)
 	}
 }
 

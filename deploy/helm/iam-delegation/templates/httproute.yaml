@@ -33,7 +33,7 @@ spec:
             value: {{ .path | quote }}
       backendRefs:
         - name: {{ include "iam-delegation.fullname" $ }}
-          port: {{ $.Values.service.port }}
+          port: {{ $.Values.service.httpPort }}
     {{- end }}
     {{- end }}
   {{- end }}

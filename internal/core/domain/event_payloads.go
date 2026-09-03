@@ -60,6 +60,27 @@ type DelegationReviewRequestedPayload struct {
 	ActorID       uuid.UUID       `json:"actor_id"`
 }
 
+// DelegationEscalationRequestedPayload is DelegationEscalationRequested's
+// data (Bug 2a). Fired alongside DelegationEnded, in the same transaction,
+// whenever a delegation ends because the delegate was disabled
+// (Reason=delegate_disabled today — the only trigger this service
+// currently recognizes; the field is typed as EndReason rather than a
+// hardcoded constant so a future trigger doesn't need a new event type).
+// Self-contained (DLG-EVT-7): a consumer never needs to correlate this
+// with the DelegationEnded event to know why escalation is needed.
+// ActorID is always SystemActorID — this only ever fires from the
+// background delegate-disabled cascade, never a human action.
+type DelegationEscalationRequestedPayload struct {
+	DelegationID uuid.UUID       `json:"delegation_id"`
+	TenantID     uuid.UUID       `json:"tenant_id"`
+	DelegatorID  uuid.UUID       `json:"delegator_id"`
+	DelegateID   uuid.UUID       `json:"delegate_id"`
+	Scope        DelegationScope `json:"scope"`
+	ScopeID      *uuid.UUID      `json:"scope_id,omitempty"`
+	Reason       EndReason       `json:"reason"` // delegate_disabled today
+	ActorID      uuid.UUID       `json:"actor_id"`
+}
+
 // ── Consumed payloads (Core → this service, delegation-cascade-q) ─────────
 
 // MembershipRevokedPayload is the data of Core's consumed MembershipRevoked

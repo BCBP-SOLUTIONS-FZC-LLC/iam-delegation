@@ -1,9 +1,7 @@
-// Package eventbus provides the publish-side pieces of this service's event
-// pipeline that sit outside the transactional outbox itself (owned by
-// internal/adapter/outbound/postgres): JSON Schema validation of outbound
-// payloads before they are enqueued, and the AWS Glue Schema Registry wire
-// codec applied only at SNS-publish time. See codec.go's package-level
-// comment for the enqueue-time vs. publish-time split (LLD §10.3.1).
+// Package eventbus implements the outbound port.EventPublisher (writes to
+// the transactional outbox, DLG-EVT-1) and the wire-format codecs used at
+// SNS-publish time (Glue Schema Registry) and at SQS-consume time (decoding
+// a Glue-encoded payload from another producer).
 package eventbus
 
 import (
@@ -11,7 +9,6 @@ import (
 	"encoding/json"
 	"fmt"
 
-	"github.com/BCBP-SOLUTIONS-FZC-LLC/iam-delegation/internal/core/domain"
 	"github.com/BCBP-SOLUTIONS-FZC-LLC/iam-delegation/internal/eventschema"
 	jsonschema "github.com/santhosh-tekuri/jsonschema/v6"
 )
@@ -25,22 +22,10 @@ import (
 // (GlueCodec in this package) configured through events.WithCodec (see
 // cmd/server/main.go).
 //
-// Cross-package contract: the postgres-adapter's txBoundPublisher
-// (internal/adapter/outbound/postgres, implementing port.EventPublisher) is
-// the caller. Construct one *SchemaValidator with NewSchemaValidator() at
-// startup (it compiles all three schemas once and is safe for concurrent
-// use — jsonschema.Schema.Validate takes no lock and holds no mutable
-// state), hold it as a singleton, and inside EnqueueCtx / RunInTx call:
-//
-//	raw, _ := json.Marshal(evt.Data)
-//	if err := validator.Validate(ctx, evt.Type, raw); err != nil {
-//	    return err // abort the tx — never write an invalid payload to the outbox
-//	}
-//
-// before building the events.Envelope and calling outbox.Enqueue. See also
-// ValidatePayload in publisher_helpers.go for a package-level function form
-// of the same call, for callers that prefer not to hold the receiver type
-// directly in their own signatures.
+// Production enqueue uses ValidatingCodec (missing schema = pass-through,
+// matching iam-realm-provisioner). SchemaValidator remains the fail-closed
+// unit-test helper: Validate errors if eventType is unregistered. See
+// ValidatePayload in publisher_helpers.go for a package-level function form.
 type SchemaValidator struct {
 	schemas map[string]*jsonschema.Schema
 }
@@ -51,25 +36,16 @@ type schemaEntry struct {
 	src  []byte
 }
 
-// defaultSchemaEntries are the three published-event schemas embedded at
-// build time (internal/eventschema), keyed by the exact domain event-type
-// constants (internal/core/domain/event.go) — the same PascalCase strings
-// used as the Glue schema names (LLD §10.3.1) and the envelope `type` /
-// SNS `EventType` attribute value.
-var defaultSchemaEntries = []schemaEntry{
-	{domain.EventDelegationStarted, eventschema.DelegationStarted},
-	{domain.EventDelegationEnded, eventschema.DelegationEnded},
-	{domain.EventDelegationReviewRequested, eventschema.DelegationReviewRequested},
-}
-
-// NewSchemaValidator compiles the three published-event schemas from the
-// embedded JSON files and returns a validator ready to check payloads
-// before they are enqueued. Consumed event types (MembershipRevoked,
-// TenantMembershipsPurged) are intentionally NOT registered here — this
-// service does not validate inbound cascade payloads against these schemas;
-// that is the SQS consumer's own concern.
+// NewSchemaValidator compiles the published-event schemas from
+// eventschema.ByEventType. Consumed event types are intentionally NOT
+// registered — this service does not validate inbound cascade payloads
+// against these schemas.
 func NewSchemaValidator() (*SchemaValidator, error) {
-	return newSchemaValidatorFromEntries(defaultSchemaEntries)
+	entries := make([]schemaEntry, 0, len(eventschema.ByEventType))
+	for name, src := range eventschema.ByEventType {
+		entries = append(entries, schemaEntry{name: name, src: src})
+	}
+	return newSchemaValidatorFromEntries(entries)
 }
 
 // newSchemaValidatorFromEntries is the testable core of NewSchemaValidator.

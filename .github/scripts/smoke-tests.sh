@@ -1,9 +1,10 @@
 #!/usr/bin/env bash
 # Image size + startup gate smoke tests for the CI-built Docker image.
-# Invoked by ci.yml once per binary (server / reconciler — both ship in the
-# SAME image, per the repo-root Dockerfile) with IMAGE_TAG and BINARY set,
-# and ENTRYPOINT set only for the reconciler leg (server uses the image's
-# default entrypoint) — keeps shell operators out of inline YAML run blocks.
+# Invoked by ci.yml's smoke job once per binary (server / reconciler — both
+# ship in the SAME image, per the repo-root Dockerfile) with IMAGE_TAG and
+# BINARY set, and ENTRYPOINT set only for the reconciler leg (server uses
+# the image's default entrypoint) — keeps shell operators out of inline
+# YAML run blocks.
 set -euo pipefail
 
 : "${IMAGE_TAG:?IMAGE_TAG is required}"
@@ -14,10 +15,11 @@ if [ -n "${ENTRYPOINT:-}" ]; then
 fi
 
 echo "::group::Image size check (${BINARY}, linux/amd64)"
-# arm64 is typically within ±5 MB of amd64 for a distroless Go binary; the
-# limit is deliberately generous so it catches regressions (e.g.
-# accidentally COPYing third_party build artefacts or embedding test
-# assets), not normal arch variance.
+# arm64 is typically within ±5 MB of amd64 for a distroless Go binary; the limit
+# is deliberately generous so it catches regressions (e.g. accidentally COPYing
+# vendor/ or embedding test assets), not normal arch variance.
+# For a full multi-arch manifest size breakdown after push, use:
+#   docker buildx imagetools inspect ghcr.io/.../iam-delegation:<tag>
 MAX_MB=200
 size=$(docker image inspect "${IMAGE_TAG}" --format='{{.Size}}')
 mb=$((size / 1024 / 1024))
@@ -40,7 +42,7 @@ P2=$!
 echo "::endgroup::"
 
 wait $P1 || {
-  echo "::error title=Image size (${BINARY})::Image is ${mb} MB, exceeds ${MAX_MB} MB limit — check COPY instructions for accidental inclusions"
+  echo "::error file=Dockerfile,title=Image size (${BINARY})::Image is ${mb} MB, exceeds ${MAX_MB} MB limit — check COPY/ADD instructions for accidental inclusions"
   exit 1
 }
 wait $P2 || {
@@ -52,4 +54,5 @@ wait $P2 || {
   echo "### Smoke test results — ${BINARY}"
   echo "- ✅ Startup gate: binary exits ${exit_code} on missing required env vars"
   echo "- 📦 Image size (linux/amd64): **${mb} MB** (limit: ${MAX_MB} MB)"
+  echo "- 🔍 [Security (Trivy SARIF results)](https://github.com/${GITHUB_REPOSITORY}/security/code-scanning)"
 } >> "$GITHUB_STEP_SUMMARY"

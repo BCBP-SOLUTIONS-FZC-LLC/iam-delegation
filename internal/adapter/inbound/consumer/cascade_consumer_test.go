@@ -7,7 +7,10 @@ import (
 	"testing"
 
 	"github.com/google/uuid"
+	"github.com/prometheus/client_golang/prometheus"
+	"github.com/stretchr/testify/require"
 
+	"github.com/BCBP-SOLUTIONS-FZC-LLC/iam-delegation/internal/adapter/outbound/metrics"
 	"github.com/BCBP-SOLUTIONS-FZC-LLC/iam-delegation/internal/core/domain"
 	events "github.com/BCBP-SOLUTIONS-FZC-LLC/platform-events/pkg/events"
 )
@@ -80,6 +83,19 @@ type gucBindCall struct {
 	userID   string
 }
 
+// passthroughTx implements port.TxRunner by invoking fn on ctx — unit tests
+// don't need a real transaction; markProcessedInTx still goes through the
+// production RunInTx seam.
+type passthroughTx struct{}
+
+func (passthroughTx) RunInTx(ctx context.Context, fn func(context.Context) error) error {
+	return fn(ctx)
+}
+
+func newTestConsumer(cascade cascadeService, idem idempotencyStore, bindGUC GUCBinder) *CascadeConsumer {
+	return NewCascadeConsumer(cascade, idem, bindGUC, passthroughTx{}, noopLogger{})
+}
+
 // fakeGUCBinder records every bind call and returns ctx unmodified — good
 // enough for these tests, which only assert on dispatch, not on RLS
 // enforcement itself (that's covered by CascadeService/repository tests).
@@ -109,7 +125,7 @@ func TestHandle_MembershipRevoked_DispatchesToEndForUser(t *testing.T) {
 	cascade := &fakeCascadeService{}
 	idem := newFakeIdempotencyStore()
 	var gucCalls []gucBindCall
-	c := NewCascadeConsumer(cascade, idem, fakeGUCBinder(&gucCalls), noopLogger{})
+	c := newTestConsumer(cascade, idem, fakeGUCBinder(&gucCalls))
 
 	tenantID, userID := uuid.New(), uuid.New()
 	eventID := uuid.New().String()
@@ -145,7 +161,7 @@ func TestHandle_TenantMembershipsPurged_DispatchesToScrubTenant(t *testing.T) {
 	cascade := &fakeCascadeService{}
 	idem := newFakeIdempotencyStore()
 	var gucCalls []gucBindCall
-	c := NewCascadeConsumer(cascade, idem, fakeGUCBinder(&gucCalls), noopLogger{})
+	c := newTestConsumer(cascade, idem, fakeGUCBinder(&gucCalls))
 
 	tenantID := uuid.New()
 	eventID := uuid.New().String()
@@ -172,7 +188,7 @@ func TestHandle_TenantMembershipsPurged_DispatchesToScrubTenant(t *testing.T) {
 func TestHandle_AlreadyProcessed_SkipsDispatch(t *testing.T) {
 	cascade := &fakeCascadeService{}
 	idem := newFakeIdempotencyStore()
-	c := NewCascadeConsumer(cascade, idem, fakeGUCBinder(&[]gucBindCall{}), noopLogger{})
+	c := newTestConsumer(cascade, idem, fakeGUCBinder(&[]gucBindCall{}))
 
 	tenantID, userID := uuid.New(), uuid.New()
 	eventID := uuid.New().String()
@@ -196,7 +212,7 @@ func TestHandle_AlreadyProcessed_SkipsDispatch(t *testing.T) {
 func TestHandle_HandlerError_DoesNotMarkProcessed(t *testing.T) {
 	cascade := &fakeCascadeService{endForUserErr: errors.New("db unavailable")}
 	idem := newFakeIdempotencyStore()
-	c := NewCascadeConsumer(cascade, idem, fakeGUCBinder(&[]gucBindCall{}), noopLogger{})
+	c := newTestConsumer(cascade, idem, fakeGUCBinder(&[]gucBindCall{}))
 
 	tenantID, userID := uuid.New(), uuid.New()
 	eventID := uuid.New().String()
@@ -215,10 +231,49 @@ func TestHandle_HandlerError_DoesNotMarkProcessed(t *testing.T) {
 	}
 }
 
+func TestHandle_RecordsMetrics(t *testing.T) {
+	prev := metrics.Live
+	m, err := metrics.RegisterOn(prometheus.NewRegistry())
+	require.NoError(t, err)
+	metrics.Live = m
+	t.Cleanup(func() { metrics.Live = prev })
+
+	t.Run("success records CascadeProcessed", func(t *testing.T) {
+		cascade := &fakeCascadeService{}
+		idem := newFakeIdempotencyStore()
+		c := newTestConsumer(cascade, idem, fakeGUCBinder(&[]gucBindCall{}))
+		env := mustEnvelope(t, uuid.New().String(), domain.EventMembershipRevoked, domain.MembershipRevokedPayload{
+			TenantID: uuid.New(), UserID: uuid.New(), ActorID: uuid.New(),
+		})
+		require.NoError(t, c.Handle(context.Background(), env))
+	})
+
+	t.Run("handler error records CascadeDLQ", func(t *testing.T) {
+		cascade := &fakeCascadeService{endForUserErr: errors.New("db unavailable")}
+		idem := newFakeIdempotencyStore()
+		c := newTestConsumer(cascade, idem, fakeGUCBinder(&[]gucBindCall{}))
+		env := mustEnvelope(t, uuid.New().String(), domain.EventMembershipRevoked, domain.MembershipRevokedPayload{
+			TenantID: uuid.New(), UserID: uuid.New(), ActorID: uuid.New(),
+		})
+		require.Error(t, c.Handle(context.Background(), env))
+	})
+
+	t.Run("mark-processed failure records CascadeDLQ", func(t *testing.T) {
+		cascade := &fakeCascadeService{}
+		idem := newFakeIdempotencyStore()
+		idem.markProcessedErr = errors.New("db down")
+		c := newTestConsumer(cascade, idem, fakeGUCBinder(&[]gucBindCall{}))
+		env := mustEnvelope(t, uuid.New().String(), domain.EventMembershipRevoked, domain.MembershipRevokedPayload{
+			TenantID: uuid.New(), UserID: uuid.New(), ActorID: uuid.New(),
+		})
+		require.Error(t, c.Handle(context.Background(), env))
+	})
+}
+
 func TestHandle_MalformedEnvelopeID_AcksWithoutCrashing(t *testing.T) {
 	cascade := &fakeCascadeService{}
 	idem := newFakeIdempotencyStore()
-	c := NewCascadeConsumer(cascade, idem, fakeGUCBinder(&[]gucBindCall{}), noopLogger{})
+	c := newTestConsumer(cascade, idem, fakeGUCBinder(&[]gucBindCall{}))
 
 	env := mustEnvelope(t, "not-a-uuid", domain.EventMembershipRevoked, domain.MembershipRevokedPayload{
 		TenantID: uuid.New(), UserID: uuid.New(), ActorID: uuid.New(),
@@ -238,7 +293,7 @@ func TestHandle_MalformedEnvelopeID_AcksWithoutCrashing(t *testing.T) {
 func TestHandle_UnknownEventType_AcksWithoutDispatching(t *testing.T) {
 	cascade := &fakeCascadeService{}
 	idem := newFakeIdempotencyStore()
-	c := NewCascadeConsumer(cascade, idem, fakeGUCBinder(&[]gucBindCall{}), noopLogger{})
+	c := newTestConsumer(cascade, idem, fakeGUCBinder(&[]gucBindCall{}))
 
 	env := mustEnvelope(t, uuid.New().String(), "SomeOtherEvent", json.RawMessage(`{}`))
 
@@ -248,8 +303,8 @@ func TestHandle_UnknownEventType_AcksWithoutDispatching(t *testing.T) {
 	if len(cascade.endForUserCalls) != 0 || len(cascade.scrubTenantCalls) != 0 {
 		t.Fatalf("no cascade method should have been called for an unknown event type")
 	}
-	if len(idem.markCalls) != 0 {
-		t.Fatalf("MarkProcessed should not have been called for an unknown event type")
+	if len(idem.markCalls) != 1 {
+		t.Fatalf("MarkProcessed must be called for an unknown event type (IDEMP-2) — got %v", idem.markCalls)
 	}
 }
 
@@ -280,7 +335,7 @@ func TestHandle_UserUpdatedDisabled_DispatchesToEndForDisabledDelegate(t *testin
 	cascade := &fakeCascadeService{}
 	idem := newFakeIdempotencyStore()
 	var gucCalls []gucBindCall
-	c := NewCascadeConsumer(cascade, idem, fakeGUCBinder(&gucCalls), noopLogger{})
+	c := newTestConsumer(cascade, idem, fakeGUCBinder(&gucCalls))
 
 	tenantID, delegateID := uuid.New(), uuid.New()
 	eventID := uuid.New().String()
@@ -330,7 +385,7 @@ func TestHandle_UserUpdatedNotDisabled_AcksWithoutDispatching(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			cascade := &fakeCascadeService{}
 			idem := newFakeIdempotencyStore()
-			c := NewCascadeConsumer(cascade, idem, fakeGUCBinder(&[]gucBindCall{}), noopLogger{})
+			c := newTestConsumer(cascade, idem, fakeGUCBinder(&[]gucBindCall{}))
 
 			env := mustUserUpdatedEnvelope(t, uuid.New().String(), uuid.New(), tc.payload)
 			if err := c.Handle(context.Background(), env); err != nil {
@@ -357,7 +412,7 @@ func TestHandle_UserUpdatedNotDisabled_AcksWithoutDispatching(t *testing.T) {
 func TestHandle_UserUpdatedMalformedPayload_ReturnsErrorForDLQ(t *testing.T) {
 	cascade := &fakeCascadeService{}
 	idem := newFakeIdempotencyStore()
-	c := NewCascadeConsumer(cascade, idem, fakeGUCBinder(&[]gucBindCall{}), noopLogger{})
+	c := newTestConsumer(cascade, idem, fakeGUCBinder(&[]gucBindCall{}))
 
 	env := events.Envelope[json.RawMessage]{
 		ID:       uuid.New().String(),
@@ -371,5 +426,105 @@ func TestHandle_UserUpdatedMalformedPayload_ReturnsErrorForDLQ(t *testing.T) {
 	}
 	if len(cascade.endForDisabledDelegateCalls) != 0 {
 		t.Fatalf("EndForDisabledDelegate must not be called on a decode failure")
+	}
+}
+
+func TestHandle_TenantMembershipsPurged_ScrubTenantError_ReturnsErrorForDLQ(t *testing.T) {
+	cascade := &fakeCascadeService{scrubTenantErr: errors.New("db unavailable")}
+	idem := newFakeIdempotencyStore()
+	c := newTestConsumer(cascade, idem, fakeGUCBinder(&[]gucBindCall{}))
+	eventID := uuid.New().String()
+	env := mustEnvelope(t, eventID, domain.EventTenantMembershipsPurged, domain.TenantMembershipsPurgedPayload{
+		TenantID: uuid.New(), ActorID: uuid.New(),
+	})
+
+	if err := c.Handle(context.Background(), env); err == nil {
+		t.Fatalf("expected ScrubTenant's error to be returned")
+	}
+	if idem.processed[consumerOffboarding+":"+eventID] {
+		t.Fatalf("event must not be recorded as processed when the handler errors")
+	}
+}
+
+func TestHandle_UserUpdatedDisabled_EndForDisabledDelegateError_ReturnsErrorForDLQ(t *testing.T) {
+	cascade := &fakeCascadeService{endForDisabledDelegateErr: errors.New("db unavailable")}
+	idem := newFakeIdempotencyStore()
+	c := newTestConsumer(cascade, idem, fakeGUCBinder(&[]gucBindCall{}))
+	tenantID := uuid.New()
+	eventID := uuid.New().String()
+	env := mustUserUpdatedEnvelope(t, eventID, tenantID, domain.UserUpdatedPayload{
+		UserID: uuid.New(), Status: strPtr("disabled"),
+	})
+
+	if err := c.Handle(context.Background(), env); err == nil {
+		t.Fatalf("expected EndForDisabledDelegate's error to be returned")
+	}
+	if idem.processed[consumerDelegateDisable+":"+eventID] {
+		t.Fatalf("event must not be recorded as processed when the handler errors")
+	}
+}
+
+func TestHandle_MembershipRevokedMalformedPayload_ReturnsErrorForDLQ(t *testing.T) {
+	cascade := &fakeCascadeService{}
+	idem := newFakeIdempotencyStore()
+	c := newTestConsumer(cascade, idem, fakeGUCBinder(&[]gucBindCall{}))
+
+	env := events.Envelope[json.RawMessage]{
+		ID:      uuid.New().String(),
+		Type:    domain.EventMembershipRevoked,
+		Payload: json.RawMessage(`{"tenant_id": 12345}`), // tenant_id must be a string
+	}
+
+	if err := c.Handle(context.Background(), env); err == nil {
+		t.Fatalf("expected a decode error to be returned (routed to DLQ), got nil")
+	}
+	if len(cascade.endForUserCalls) != 0 {
+		t.Fatalf("EndForUser must not be called on a decode failure")
+	}
+}
+
+func TestHandle_TenantMembershipsPurgedMalformedPayload_ReturnsErrorForDLQ(t *testing.T) {
+	cascade := &fakeCascadeService{}
+	idem := newFakeIdempotencyStore()
+	c := newTestConsumer(cascade, idem, fakeGUCBinder(&[]gucBindCall{}))
+
+	env := events.Envelope[json.RawMessage]{
+		ID:      uuid.New().String(),
+		Type:    domain.EventTenantMembershipsPurged,
+		Payload: json.RawMessage(`{"tenant_id": 12345}`), // tenant_id must be a string
+	}
+
+	if err := c.Handle(context.Background(), env); err == nil {
+		t.Fatalf("expected a decode error to be returned (routed to DLQ), got nil")
+	}
+	if len(cascade.scrubTenantCalls) != 0 {
+		t.Fatalf("ScrubTenant must not be called on a decode failure")
+	}
+}
+
+// TestHandle_UserUpdatedInvalidTenantID_ReturnsErrorForDLQ covers
+// handleUserDisabled's own uuid.Parse(env.TenantID) branch — a status:
+// "disabled" delivery whose envelope carries a malformed tenant_id.
+func TestHandle_UserUpdatedInvalidTenantID_ReturnsErrorForDLQ(t *testing.T) {
+	cascade := &fakeCascadeService{}
+	idem := newFakeIdempotencyStore()
+	c := newTestConsumer(cascade, idem, fakeGUCBinder(&[]gucBindCall{}))
+
+	payload, err := json.Marshal(domain.UserUpdatedPayload{UserID: uuid.New(), Status: strPtr("disabled")})
+	if err != nil {
+		t.Fatalf("marshal payload: %v", err)
+	}
+	env := events.Envelope[json.RawMessage]{
+		ID:       uuid.New().String(),
+		Type:     domain.EventUserUpdated,
+		TenantID: "not-a-uuid",
+		Payload:  payload,
+	}
+
+	if err := c.Handle(context.Background(), env); err == nil {
+		t.Fatalf("expected an error for the invalid tenant_id (routed to DLQ), got nil")
+	}
+	if len(cascade.endForDisabledDelegateCalls) != 0 {
+		t.Fatalf("EndForDisabledDelegate must not be called when tenant_id fails to parse")
 	}
 }

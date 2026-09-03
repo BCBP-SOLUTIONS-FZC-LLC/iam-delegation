@@ -2,8 +2,7 @@
 # fmt · tidy · vet · lint (golangci-lint via go tool) · vuln-check ·
 # Dockerfile checks (both server + reconciler images). Called by ci.yml and
 # release.yml. Must pass before push/release; does NOT gate coverage, trivy,
-# or smoke (those only need validate-test.yml). Mirrors iam-tender-acl's
-# validate-quality.yml.
+# or smoke (those only need validate-test.yml).
 name: Validate / Quality
 
 "on":
@@ -28,14 +27,14 @@ jobs:
     timeout-minutes: 10
     steps:
       - name: Checkout
-        uses: actions/checkout@v7.0.0
+        uses: actions/checkout@v7.0.1
         with:
           ref: ${{ inputs.ref || github.ref }}
           persist-credentials: false
           token: ${{ secrets.CI_REPO_READ_TOKEN || github.token }}
 
       - name: Set up Go
-        uses: actions/setup-go@v6.5.0
+        uses: actions/setup-go@v7.0.0
         with:
           go-version-file: go.mod
           cache-dependency-path: |
@@ -72,7 +71,7 @@ jobs:
 
       - name: Format check
         run: |
-          unformatted=$(gofmt -l cmd/ internal/ pkg/ test/ 2>/dev/null || true)
+          unformatted=$(gofmt -l cmd/ internal/ pkg/ 2>/dev/null || true)
           if [ -n "${unformatted}" ]; then
             echo "${unformatted}" | while IFS= read -r f; do
               echo "::error file=${f},title=Format check::Not formatted — run 'make fmt'"
@@ -101,14 +100,14 @@ jobs:
             exit 1
           fi
 
-      # Enforce digest-pinned FROM lines in the Dockerfile. Floating tags
-      # (e.g. golang:1.26.6-bookworm without @sha256:...) can be silently
-      # overwritten by upstream maintainers, breaking supply-chain
-      # guarantees.
+      # Enforce digest-pinned FROM lines in the Dockerfile. Floating tags (e.g.
+      # golang:1.26.6-bookworm without @sha256:...) can be silently overwritten by
+      # upstream maintainers, breaking supply-chain guarantees. Run
+      # `make pin-base-images` (requires docker) to update the pinned digests.
       - name: Dockerfile base image digest check
         run: |
           if grep -E '^FROM [^ @]+:[^ @]+( AS .+)?$' Dockerfile; then
-            echo "::error file=Dockerfile,title=Unpinned base image::Dockerfile FROM lines must use digest-pinned references (e.g. golang:1.26.6-bookworm@sha256:...)."
+            echo "::error file=Dockerfile,title=Unpinned base image::Dockerfile FROM lines must use digest-pinned references (e.g. golang:1.26.6-bookworm@sha256:...). Run 'make pin-base-images' to update."
             exit 1
           fi
           echo "Dockerfile base images are digest-pinned."

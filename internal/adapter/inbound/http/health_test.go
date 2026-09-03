@@ -109,7 +109,7 @@ func TestReadyz(t *testing.T) {
 		require.Equal(t, "ok", checks["outbox"])
 	})
 
-	t.Run("postgres unhealthy + cache degraded -> still 503 overall", func(t *testing.T) {
+	t.Run("postgres unhealthy + cache degraded still 503", func(t *testing.T) {
 		hc := &healthHandlers{
 			postgres: fakePostgresHealth{status: pgcommon.HealthStatus{Healthy: false}},
 			cache:    fakePinger{err: errors.New("down")},
@@ -117,5 +117,25 @@ func TestReadyz(t *testing.T) {
 		c, w := newRequestWithIdentity(http.MethodGet, "/readyz", nil, nil)
 		hc.readyz(c)
 		require.Equal(t, http.StatusServiceUnavailable, w.Code)
+		var body map[string]any
+		require.NoError(t, json.Unmarshal(w.Body.Bytes(), &body))
+		require.Equal(t, "error", body["status"])
+		checks := body["checks"].(map[string]any)
+		require.Equal(t, "error", checks["postgres"])
+		require.Equal(t, "degraded", checks["valkey"])
+	})
+
+	t.Run("sys postgres unhealthy -> 503 overall error", func(t *testing.T) {
+		hc := &healthHandlers{
+			postgres:    fakePostgresHealth{status: pgcommon.HealthStatus{Healthy: true}},
+			sysPostgres: fakePostgresHealth{status: pgcommon.HealthStatus{Healthy: false}},
+		}
+		c, w := newRequestWithIdentity(http.MethodGet, "/readyz", nil, nil)
+		hc.readyz(c)
+		require.Equal(t, http.StatusServiceUnavailable, w.Code)
+		var body map[string]any
+		require.NoError(t, json.Unmarshal(w.Body.Bytes(), &body))
+		checks := body["checks"].(map[string]any)
+		require.Equal(t, "error", checks["sys_postgres"])
 	})
 }

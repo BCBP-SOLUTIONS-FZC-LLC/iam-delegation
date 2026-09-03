@@ -219,6 +219,7 @@ jobs:
             [delegation_started]=DelegationStarted
             [delegation_ended]=DelegationEnded
             [delegation_review_requested]=DelegationReviewRequested
+            [delegation_escalation_requested]=DelegationEscalationRequested
           )
 
           TEMP_DIR=$(mktemp -d)
@@ -485,6 +486,7 @@ jobs:
             [delegation_started]=DelegationStarted
             [delegation_ended]=DelegationEnded
             [delegation_review_requested]=DelegationReviewRequested
+            [delegation_escalation_requested]=DelegationEscalationRequested
           )
 
           TEMP_DIR=$(mktemp -d)
@@ -709,6 +711,7 @@ jobs:
             [delegation_started]=DelegationStarted
             [delegation_ended]=DelegationEnded
             [delegation_review_requested]=DelegationReviewRequested
+            [delegation_escalation_requested]=DelegationEscalationRequested
           )
 
           TEMP_DIR=$(mktemp -d)

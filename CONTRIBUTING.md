@@ -35,7 +35,7 @@ make test-unit
 cmd/
   server/               ← Composition root — HTTP API + delegation-cascade-q SQS consumer, one process
   reconciler/
-    jobs/                ← delegation_expiry.go / delegation_review.go / delegation_cleanup.go — the three CronJob entry points
+    jobs/                ← delegation_expiry.go / delegation_review.go / delegation_cleanup.go / delegation_activation.go — the four CronJob entry points
 internal/
   core/domain/           ← Entities, value objects, event payloads, domain errors (no external deps)
   core/port/             ← Interfaces: DelegationRepository, SettingsRepository, UserProfileClient, MembershipCheckClient, IdempotencyStore, EventPublisher, Cache, TxRunner
@@ -50,7 +50,7 @@ internal/
     eventbus/            ← SchemaValidator (jsonschema/v6) + GlueCodec/NoopCodec
     valkey/               ← del: cache + idempotency store
     metrics/              ← Prometheus instruments
-internal/eventschema/    ← Hand-maintained JSON Schemas for the three published events
+internal/eventschema/    ← Hand-maintained JSON Schemas for the four published events
 pkg/requestctx/          ← Gateway-identity / tenant-actor extraction helpers
 api/                     ← asyncapi.yaml (hand-maintained) + embed.go
 docs/                    ← lld/, architecture/ (mermaid diagrams), runbook-schema-registry.md, swagger/
@@ -95,7 +95,7 @@ This repo's event contract is entirely hand-maintained — unlike `iam-user-prof
 
 1. Add the payload struct and event-type constant to `internal/core/domain/event.go` — the constant value IS the Glue schema name (PascalCase, no translation table).
 2. Add the JSON schema file to `internal/eventschema/` using the snake_case filename convention (e.g. `delegation_transferred.json`), with `"additionalProperties": true`.
-3. Update `defaultSchemaEntries` in `internal/adapter/outbound/eventbus/validator.go`.
+3. Add the schema to `eventschema.ByEventType` in `internal/eventschema/schemas.go` (ValidatingCodec compiles this map at startup; SchemaValidator uses the same map).
 4. Extend `SCHEMA_NAME_MAP` in `.github/workflows/schema-registry.yml` (all three job blocks: `staging`, `production`, `pr-check`) and add a `register_schema` call in `scripts/init-localstack.sh`.
 5. Add the message to `api/asyncapi.yaml` with `x-lifecycle: {status: active}` and `x-owner` annotations.
 6. Run `make schema-validate` locally, then `make schema-register` in every environment before the first pod that would publish the new event starts.
@@ -131,23 +131,14 @@ make race
 
 ### Coverage gate
 
-CI enforces a single global statement-coverage gate of **≥ 70%** on the merged `coverage.out` (`.github/scripts/coverage-gate.sh`) — matching `iam-tender-acl`'s baseline, since the LLD specifies test *composition*, not a numeric threshold. This is a floor, not an aspiration; ratchet it up over time, never lower it to pass a failing PR.
+CI enforces a single global statement-coverage gate of **≥ 95%** on the merged `coverage.out` (`.github/scripts/coverage-gate.sh`) — bumped from the original 70% floor (which matched `iam-tender-acl`'s baseline) during the DLG-D34 production-readiness sweep, once actual coverage was pushed to 95.2%. This is a floor, not an aspiration; ratchet it up over time, never lower it to pass a failing PR.
 
 ```bash
 make cover-func   # per-function summary in terminal
 make cover        # HTML report
 ```
 
-Coverage as of the initial build, well above the 70% floor in the packages that matter most (re-run `make cover-func` for current numbers rather than trusting this table as it ages):
-
-| Package | Coverage | Notes |
-|---|---|---|
-| `internal/core/service` | 84.7% | Full DEL-1…14 branch coverage, availability-first ordering, idempotency replay, reassign end-then-create, DEL-7 asymmetry |
-| `internal/adapter/outbound/postgres` | 73.9% | Full §17.5 RLS matrix (Cases 1–5, both tables), review-sweep boundary predicates, trigger, `processed_events` dedup |
-| `internal/adapter/inbound/http` | 90.4% | Every `domain.Err*` → HTTP status, role gates, DLG-5 raw-JSON presence detection |
-| `internal/adapter/inbound/consumer` | 59.0% | Dispatch, idempotency skip/mark-after-success, malformed/unknown envelope handling |
-| `cmd/reconciler/jobs` | 81.7%+ | Happy path, UP-failure defer, race-vs-failure distinction, daily-cascade warn+auto-end, GAP-27 deferred-metric assertions |
-| `internal/adapter/outbound/{userprofile,orgmembership,valkey,metrics,eventbus}` | 85–100% | HTTP client shapes, cache/idempotency TTL behavior, metric registration, schema validation, `GlueDecodeCodec` wire-format round-trip |
+Global coverage was 83.9% before DLG-D34 and 95.2% immediately after it — the largest single gain came from direct AWS Glue Schema Registry API mocking via a real `httptest.Server` (`GlueCodec`'s construction, version-cache refresh, and encode paths had zero coverage before, since `*glue.Client` is a concrete SDK type with no test seam); the rest closed handler auth-branch, cascade-consumer error/metrics, schema-validator error, and repository edge-case gaps. Per-package numbers shift as the code does — run `make cover-func` for current figures rather than trusting a table here to stay accurate.
 
 Coverage is measured over `./internal/...` and `./pkg/...` (`COVER_PKG_LIST` in the Makefile).
 
@@ -211,7 +202,7 @@ fix(cascade): dedupe MembershipRevoked via processed_events on redelivery
 
 ## Deployment
 
-This service ships **two** binaries (`cmd/server`, `cmd/reconciler`) built into **one** image from the repo-root `Dockerfile`. Releases are handled via the CI/CD pipeline:
+This service ships **two** binaries (`cmd/server`, `cmd/reconciler`) built into **one** image from the repo-root `Dockerfile` — not yet deployed to any live environment, and no Git tag has ever been pushed (see `VERSIONING.md` for the full release process, SemVer policy, and runtime-contract scope). Releases are handled via the CI/CD pipeline:
 
 **On push to `main`:** `validate-test` and `validate-quality` run in parallel with `build-image`. `build-image` lints the Dockerfile (hadolint), builds a single-platform (`linux/amd64`) image, runs a Trivy CRITICAL/HIGH/UNKNOWN CVE scan (fails the build; a second permissive scan uploads SARIF to the GitHub Security tab), and runs smoke tests against both the `server` and `reconciler` entrypoints from the same built image. On success it's pushed to GHCR (`ghcr.io/bcbp-solutions-fzc-llc/iam-delegation`, tagged by branch + short SHA) with build provenance and SBOM attached, then signed with Cosign keyless signing and the signature is verified in the same job.
 

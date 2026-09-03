@@ -149,7 +149,7 @@ help:
 	@echo "  make cover-func       - coverage summary by function"
 	@echo "  make run              - run the server locally (go run cmd/server), sourcing .env if present"
 	@echo "  make run-server       - alias for 'make run'"
-	@echo "  make run-reconciler   - run the reconciler locally (go run cmd/reconciler); pass JOB=delegation-expiry|delegation-review|delegation-cleanup"
+	@echo "  make run-reconciler   - run the reconciler locally (go run cmd/reconciler); pass JOB=delegation-activation|delegation-expiry|delegation-review|delegation-cleanup"
 	@echo "  make build            - compile both binaries (iam-delegation-server, iam-delegation-reconciler) to bin/"
 	@echo "  make build-server     - compile only cmd/server"
 	@echo "  make build-reconciler - compile only cmd/reconciler"
@@ -238,9 +238,10 @@ run-server:
 	@-lsof -ti :$${HTTP_PORT:-8080} | xargs kill -9 2>/dev/null; true
 	@if [ -f .env ]; then set -a && . ./.env && set +a && $(GO) run $(SERVER_CMD_PKG); else $(GO) run $(SERVER_CMD_PKG); fi
 
-# JOB selects which of the three CronJob entry points to run locally
-# (delegation-expiry | delegation-review | delegation-cleanup — see
-# deploy/helm/iam-delegation/templates/cronjob-*.yaml for the convention).
+# JOB selects which of the four CronJob entry points to run locally
+# (delegation-activation | delegation-expiry | delegation-review |
+# delegation-cleanup — see deploy/helm/iam-delegation/templates/cronjob-*.yaml
+# for the convention).
 run-reconciler:
 	@if [ -f .env ]; then set -a && . ./.env && set +a && $(GO) run $(RECONCILER_CMD_PKG) --job=$${JOB:-delegation-expiry}; else $(GO) run $(RECONCILER_CMD_PKG) --job=$${JOB:-delegation-expiry}; fi
 

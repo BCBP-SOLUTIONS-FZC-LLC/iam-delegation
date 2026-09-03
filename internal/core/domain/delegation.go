@@ -28,7 +28,7 @@ type DelegationStatus string
 // fix) — a delegation created with a future starts_at is created in this
 // state, not active, and never calls User Profile or emits
 // DelegationStarted until the delegation-activation reconciler job (LLD
-// §11.3a) flips it to active at starts_at. A scheduled delegation can still
+// §11.1a) flips it to active at starts_at. A scheduled delegation can still
 // be cancelled (End's WHERE clause and probeVersionConflict's terminal
 // check both accept scheduled alongside active) and is cascaded on
 // MembershipRevoked exactly like an active one (EndForUser), since a

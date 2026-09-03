@@ -39,7 +39,8 @@ Provide a clear description of the changes.
 - [ ] Swagger docs regenerated if handler annotations changed (`make swag` — all three files in `docs/swagger/` committed)
 - [ ] AsyncAPI spec updated if a new event type or payload field was added (`api/asyncapi.yaml`)
 - [ ] Event schema JSON files updated to match (`internal/eventschema/*.json`)
-- [ ] `"additionalProperties": true` is set on every modified or new schema in `internal/eventschema/` (mirrors the shipped schemas' open-schema convention)
+- [ ] `"additionalProperties": true` is set on every modified or new schema in `internal/eventschema/`
+      (CI Pass 5 enforces this; the item is a pre-review reminder)
 
 ### Consumer Forward-Compatibility
 *Complete only when `internal/eventschema/` changed.*
@@ -51,6 +52,9 @@ but consumers must be configured for lenient deserialization or they will crash 
       to ignore unknown fields. Required per-language settings:
       - **Go (encoding/json):** do NOT call `json.Decoder.DisallowUnknownFields()` — silently ignored by default.
       - **Go (sonic):** use `sonic.ConfigDefault` or `sonic.ConfigFastest`, NOT `sonic.ConfigStrict`.
+      - **Java (Jackson):** `mapper.configure(DeserializationFeature.FAIL_ON_UNKNOWN_PROPERTIES, false)` or `@JsonIgnoreProperties(ignoreUnknown=true)`.
+      - **Python (Pydantic v2):** `model_config = ConfigDict(extra='ignore')` on every payload model.
+      - **Kotlin (kotlinx.serialization):** `Json { ignoreUnknownKeys = true }`.
 - [ ] **Deploy order followed for non-breaking additions** — Consumers deployed first, then producer.
       New fields in the payload reach consumers before the producer starts sending them. Consumers
       that haven't been updated yet will receive the new field as an ignored unknown — no crash.
@@ -76,6 +80,9 @@ business meaning can change without any JSON Schema difference.
 - [ ] **Description-only change confirmed** — Any `description` field edits in
       `asyncapi.yaml` are wording clarifications only (no change to valid range,
       units, nullability, or consumer-observable behaviour).
+      CI Pass B will list changed descriptions in the log — review them here.
+      Add `[skip-semantic-check]` to the commit message to suppress the notice
+      once confirmed as documentation-only.
 
 ### RLS / Tenant Isolation
 *Complete only when a new query, table, or GUC-binding path was added.*

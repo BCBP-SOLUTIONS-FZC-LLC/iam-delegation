@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"math"
+	"strconv"
 	"time"
 
 	"github.com/BCBP-SOLUTIONS-FZC-LLC/iam-delegation/internal/core/domain"
@@ -70,6 +71,9 @@ func ReviewSweep(ctx context.Context, jctx *Context) (Result, error) {
 			case 1:
 				res.Warned1d++
 			}
+			if jctx.Metrics != nil {
+				jctx.Metrics.RecordReviewWarned(strconv.Itoa(daysRemaining))
+			}
 		}
 	}
 
@@ -87,6 +91,7 @@ func ReviewSweep(ctx context.Context, jctx *Context) (Result, error) {
 			res.Deferred++
 			if jctx.Metrics != nil {
 				jctx.Metrics.RecordReviewDeferred()
+				jctx.Metrics.RecordUPAvailabilityFailure("review-cron")
 			}
 			continue
 		}
@@ -99,6 +104,10 @@ func ReviewSweep(ctx context.Context, jctx *Context) (Result, error) {
 		}
 		if !raced {
 			res.Expired++
+			if jctx.Metrics != nil {
+				jctx.Metrics.RecordReviewExpired()
+				jctx.Metrics.RecordEnded(string(domain.EndReasonReviewExpired))
+			}
 		}
 	}
 

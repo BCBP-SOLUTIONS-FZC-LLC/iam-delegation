@@ -16,22 +16,27 @@ import (
 	"fmt"
 	"os"
 	"os/signal"
+	"sync"
 	"syscall"
 	"time"
+
+	"go.opentelemetry.io/otel"
 
 	"github.com/BCBP-SOLUTIONS-FZC-LLC/platform-gincommon/pkg/gincommon"
 	gclogger "github.com/BCBP-SOLUTIONS-FZC-LLC/platform-gincommon/pkg/logger"
 	pgcommon "github.com/BCBP-SOLUTIONS-FZC-LLC/platform-pgcommon/pkg/pgcommon"
 
 	"github.com/BCBP-SOLUTIONS-FZC-LLC/iam-delegation/cmd/reconciler/jobs"
-	"github.com/BCBP-SOLUTIONS-FZC-LLC/iam-delegation/internal/adapter/inbound/consumer"
+	"github.com/BCBP-SOLUTIONS-FZC-LLC/iam-delegation/internal/adapter/outbound/eventbus"
 	"github.com/BCBP-SOLUTIONS-FZC-LLC/iam-delegation/internal/adapter/outbound/metrics"
 	pgadapter "github.com/BCBP-SOLUTIONS-FZC-LLC/iam-delegation/internal/adapter/outbound/postgres"
 	"github.com/BCBP-SOLUTIONS-FZC-LLC/iam-delegation/internal/adapter/outbound/userprofile"
+	"github.com/BCBP-SOLUTIONS-FZC-LLC/iam-delegation/internal/core/domain"
 )
 
 func main() {
-	logger, err := gclogger.NewLogger(getEnv("ENVIRONMENT", "development"))
+	ensureGincommonEnv()
+	logger, err := gclogger.NewLogger(resolveAppEnv())
 	if err != nil {
 		panic("init logger: " + err.Error())
 	}
@@ -50,6 +55,26 @@ func run(logger Logger) error {
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
+
+	// Same TracerProvider as cmd/server so spans from this job export
+	// through gincommon's OTLP pipeline when the collector is set —
+	// matching iam-realm-provisioner's reconciler: InitTracingFromEnv,
+	// then ObservabilityMiddlewares so Register() picks up {service,
+	// version} const labels, then a job-root span.
+	shutdownTracing := gincommon.InitTracingFromEnv()
+	defer shutdownTracing()
+	serviceName := getEnv("APP_NAME", "iam-delegation-reconciler")
+	_ = gincommon.ObservabilityMiddlewares(gincommon.Config{
+		Logger:       logger,
+		ServiceName:  serviceName,
+		BuildVersion: getEnv("BUILD_VERSION", "dev"),
+	})
+	reconcilerMetrics := metrics.Register()
+	//nolint:errcheck // best-effort flush on exit; the job's own exit code is what matters
+	defer func() { _ = gincommon.Shutdown(logger) }()
+
+	ctx, jobSpan := otel.Tracer(serviceName).Start(ctx, "reconciler."+*jobName)
+	defer jobSpan.End()
 
 	// Database — pgcommon.ConfigFromEnv reads DATABASE_URL/PG_* directly —
 	// same source cmd/server/main.go uses — so pool sizing and DSN assembly
@@ -70,22 +95,52 @@ func run(logger Logger) error {
 	pgCfg.DSN = dsn
 	pgCfg.GUCProvider = pgcommon.GUCSetFromContext
 	pgCfg.Logger = pgadapter.NewLoggerAdapter(logger)
+	queryTracer := pgadapter.NewOTelTracer(serviceName)
+	pgCfg.Tracer = queryTracer
 	appPool, err := pgcommon.NewPool(ctx, pgCfg)
 	if err != nil {
 		return fmt.Errorf("connect app pool: %w", err)
 	}
-	//nolint:errcheck // best-effort shutdown cleanup — an error here has no recovery action at process exit.
-	defer func() { _ = appPool.DrainAndClose(context.Background()) }()
 
+	// DrainAndClose is pgcommon's graceful path (wait for in-flight
+	// WithConn/RunInTx, then close). sync.Once keeps DrainAndClose and a
+	// later defer from running concurrently (pgcommon forbids that).
+	// Matching iam-realm-provisioner's reconciler.
+	var sysPool *pgcommon.Pool
+	var drainOnce sync.Once
+	drainPools := func() {
+		drainOnce.Do(func() {
+			drainCtx, cancelDrain := context.WithTimeout(context.Background(), 15*time.Second)
+			defer cancelDrain()
+			if err := appPool.DrainAndClose(drainCtx); err != nil {
+				logger.Error("app pool drain error", map[string]interface{}{"error": err.Error()})
+			}
+			if sysPool != nil {
+				if err := sysPool.DrainAndClose(drainCtx); err != nil {
+					logger.Error("sysPool drain error", map[string]interface{}{"error": err.Error()})
+				}
+			}
+		})
+	}
+	defer drainPools()
+
+	// Fail fast in production rather than let the dev-safe fallback below
+	// degrade silently: every cross-tenant sweep this binary runs
+	// (ListExpiringBefore/FindDueForDailyWarn/FindDueForAutoEnd/
+	// HardPurgeSoftDeletedBefore) would then execute under RLS with no
+	// tenant GUC bound and return zero rows instead of erroring — no alert
+	// fires, since that's a different failure mode than the existing
+	// "deferred" counters/alerts cover.
+	if getEnv("ENVIRONMENT", "development") == "production" && os.Getenv("SYSTEM_DATABASE_URL") == "" {
+		return fmt.Errorf("SYSTEM_DATABASE_URL is required when ENVIRONMENT=production (must be the BYPASSRLS delegation_migrator role, see .claude/database.md)")
+	}
 	sysDSN := pgadapter.SystemDSNFromEnv()
-	sysPool, err := pgcommon.NewPool(ctx, pgcommon.Config{
-		DSN: sysDSN, Logger: pgadapter.NewLoggerAdapter(logger), PGBouncerMode: true,
-	})
+	sysCfg := pgadapter.SystemPoolConfig(sysDSN, logger)
+	sysCfg.Tracer = queryTracer
+	sysPool, err = pgcommon.NewPool(ctx, sysCfg)
 	if err != nil {
 		return fmt.Errorf("connect system pool: %w", err)
 	}
-	//nolint:errcheck // best-effort shutdown cleanup — an error here has no recovery action at process exit.
-	defer func() { _ = sysPool.DrainAndClose(context.Background()) }()
 	if sysDSN == dsn {
 		logger.Warn("SYSTEM_DATABASE_URL not set — sysPool reuses app DSN; cross-tenant sweeps will be RLS-filtered", nil)
 	}
@@ -99,13 +154,16 @@ func run(logger Logger) error {
 		return fmt.Errorf("build User Profile client: %w", err)
 	}
 
-	// No schema validator here: this binary never publishes events itself
-	// through a Glue-encoded path — it enqueues plain JSON to the same
-	// outbox cmd/server's runner drains, and DLG-EVT-1 atomicity is what
-	// matters for a cron write, not wire-format validation redundancy
-	// (cmd/server already validates every payload shape it defines, and
-	// this binary uses the identical domain.*Payload structs).
-	txRunner := pgadapter.NewTxRunner(appPool, nil)
+	// ValidatingCodec + Publisher so cron-enqueued DelegationStarted /
+	// DelegationEnded / DelegationReviewRequested are schema-checked at
+	// enqueue, matching cmd/server and iam-realm-provisioner. Nil publisher
+	// would leave EventPublisherFromContext empty and silently skip emission.
+	enqueueCodec, err := eventbus.NewValidatingCodec(eventbus.NoopCodec{})
+	if err != nil {
+		return fmt.Errorf("build enqueue codec: %w", err)
+	}
+	outboxPublisher := eventbus.New(domain.Source, enqueueCodec).WithLogger(logger)
+	txRunner := pgadapter.NewTxRunner(appPool, outboxPublisher)
 
 	batchLimit, err := getEnvIntVar("CRON_BATCH_LIMIT", 50)
 	if err != nil {
@@ -119,28 +177,17 @@ func run(logger Logger) error {
 	// jobs.Cleanup (delegation-cleanup, LLD §18.4/GAP-09) only ever runs
 	// through this binary — cmd/server has no HTTP entry point for it
 	// (unlike DLG-I1/I2's shared expiry/review path, DLG-D17) — so
-	// ProcessedEvents.CleanupExpired is wired here or nowhere.
-	processedEvents := consumer.NewProcessedEvents(sysPool)
+	// ProcessedEvents.Prune is wired here or nowhere.
+	processedEvents := pgadapter.NewProcessedEventsRepository(sysPool)
 
-	// GAP-27 (DLG-D19 partial closure): registered here for jobs.Context
-	// symmetry with cmd/server's real *metrics.Metrics (both binaries call
-	// jobs.Expiry/ReviewSweep, which call jctx.Metrics unconditionally when
-	// non-nil). Registered through gincommon.MetricsRegisterer() — every
-	// Prometheus registration in this repo goes through platform-gincommon,
-	// never a hand-rolled prometheus.NewRegistry() — even though this binary
-	// never runs gincommon.ObservabilityMiddlewares/DefaultMiddlewares, so
-	// MetricsRegisterer() falls back to prometheus.DefaultRegisterer (see
-	// that function's doc comment). This binary is a one-shot batch process
-	// with no /metrics scrape endpoint of its own, so these increments are
-	// never exported anywhere regardless of which registry they land in —
-	// the alert-visible deferred counters reach Prometheus only via
-	// cmd/server's DLG-I1/I2 on-demand entry points, which do have a live
-	// scrape target. See .claude/operations.md's Metrics section.
-	reconcilerMetrics, err := metrics.Register(gincommon.MetricsRegisterer())
-	if err != nil {
-		return fmt.Errorf("register metrics: %w", err)
-	}
-
+	// GAP-27 (DLG-D19 partial closure): registered above via
+	// metrics.Register() after ObservabilityMiddlewares so collectors
+	// share gincommon's {service, version} labels (iam-realm-provisioner).
+	// This binary is a one-shot batch process with no /metrics scrape
+	// endpoint of its own, so these increments are never exported
+	// anywhere — the alert-visible deferred counters reach Prometheus
+	// only via cmd/server's DLG-I1/I2 on-demand entry points. See
+	// .claude/operations.md.
 	jctx := &jobs.Context{
 		Delegations:     pgadapter.NewDelegationRepository(sysPool),
 		UserProfile:     userProfileClient,

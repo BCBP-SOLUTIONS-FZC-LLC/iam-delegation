@@ -21,11 +21,18 @@ type CascadeService struct {
 	settings    port.SettingsRepository
 	userProfile port.UserProfileClient
 	txRunner    port.TxRunner
+	metrics     Metrics
 }
 
 // NewCascadeService builds a CascadeService.
 func NewCascadeService(d port.DelegationRepository, settings port.SettingsRepository, up port.UserProfileClient, txRunner port.TxRunner) *CascadeService {
 	return &CascadeService{delegations: d, settings: settings, userProfile: up, txRunner: txRunner}
+}
+
+// WithMetrics attaches an optional recorder. Nil is valid (no-op).
+func (s *CascadeService) WithMetrics(m Metrics) *CascadeService {
+	s.metrics = m
+	return s
 }
 
 // EndForUser handles MembershipRevoked (LLD §11.5). It ends every active
@@ -72,25 +79,36 @@ func (s *CascadeService) EndForUser(ctx context.Context, tenantID, userID uuid.U
 		if d.DelegatorID == userID {
 			continue // the removed user was the delegator — no pointer to clear for them
 		}
-		//nolint:errcheck // best-effort: the row is already ended/inert
 		// (§7.6.5) — a UP failure here is not retried by this cascade, only
 		// logged upstream by the consumer; the delegation-expiry cron only
 		// revisits still-active rows, so there's nothing to retry against.
-		_ = s.userProfile.SetAvailability(ctx, port.SetAvailabilityRequest{
+		if err := s.userProfile.SetAvailability(ctx, port.SetAvailabilityRequest{
 			TenantID: tenantID, UserID: d.DelegatorID, ClearDelegate: true,
-		})
+		}); err != nil && s.metrics != nil {
+			s.metrics.RecordUPAvailabilityFailure("cascade")
+		}
+	}
+	if s.metrics != nil {
+		for _, d := range ended {
+			if d.DelegateID == userID {
+				s.metrics.RecordEnded(string(domain.EndReasonDelegateRemoved))
+			}
+		}
 	}
 	return nil
 }
 
 // EndForDisabledDelegate handles User Profile's UserUpdated{status:
 // disabled} (Bug 2). It ends every active/scheduled delegation where
-// delegateID is the delegate and emits DelegationEnded per row —
-// end_reason=delegate_disabled, distinct from EndForUser's
-// delegate_removed (that fires on tenant-membership removal, a different
-// signal; "disabled" is not "removed"). DEL-7/DLG-EVT-4's delegator-side
-// silence rule does not apply here: every row this query matches is, by
-// definition, delegate-side.
+// delegateID is the delegate and emits, per row in the same transaction:
+// DelegationEnded{ended_reason: delegate_disabled} (distinct from
+// EndForUser's delegate_removed — that fires on tenant-membership removal,
+// a different signal; "disabled" is not "removed"), immediately followed
+// by DelegationEscalationRequested (Bug 2a) — the generic "this grant
+// ended" notice alone doesn't tell anyone the delegator may now have NO
+// valid handler for their work while still OOO. DEL-7/DLG-EVT-4's
+// delegator-side silence rule does not apply here: every row this query
+// matches is, by definition, delegate-side.
 //
 // No User Profile pointer-clear call here (unlike EndForUser): the
 // delegate pointer on the delegator's own user_availability row was
@@ -99,11 +117,13 @@ func (s *CascadeService) EndForUser(ctx context.Context, tenantID, userID uuid.U
 // UserUpdated event (LLD §8.8.16 K1 in iam-user-profile) — by the time
 // this consumer sees the event, User Profile's side is guaranteed done.
 func (s *CascadeService) EndForDisabledDelegate(ctx context.Context, tenantID, delegateID uuid.UUID) error {
-	return s.txRunner.RunInTx(ctx, func(txCtx context.Context) error {
+	var n int
+	err := s.txRunner.RunInTx(ctx, func(txCtx context.Context) error {
 		rows, err := s.delegations.EndForDisabledDelegate(txCtx, tenantID, delegateID)
 		if err != nil {
 			return err
 		}
+		n = len(rows)
 		for _, d := range rows {
 			if err := enqueue(txCtx, domain.EventDelegationEnded, tenantID, d.ID.String(), "iam-system",
 				domain.DelegationEndedPayload{
@@ -115,9 +135,28 @@ func (s *CascadeService) EndForDisabledDelegate(ctx context.Context, tenantID, d
 				}); err != nil {
 				return err
 			}
+			if err := enqueue(txCtx, domain.EventDelegationEscalationRequested, tenantID, d.ID.String(), "iam-system",
+				domain.DelegationEscalationRequestedPayload{
+					DelegationID: d.ID, TenantID: tenantID,
+					DelegatorID: d.DelegatorID, DelegateID: d.DelegateID,
+					Scope: d.Scope, ScopeID: d.ScopeID,
+					Reason:  domain.EndReasonDelegateDisabled,
+					ActorID: domain.SystemActorID,
+				}); err != nil {
+				return err
+			}
 		}
 		return nil
 	})
+	if err != nil {
+		return err
+	}
+	if s.metrics != nil {
+		for i := 0; i < n; i++ {
+			s.metrics.RecordEnded(string(domain.EndReasonDelegateDisabled))
+		}
+	}
+	return nil
 }
 
 // ScrubTenant handles TenantMembershipsPurged (LLD §11.6) — soft-deletes every
@@ -125,8 +164,10 @@ func (s *CascadeService) EndForDisabledDelegate(ctx context.Context, tenantID, d
 // emission (stale rows are inert, §7.6.5); the monthly delegation-cleanup
 // job hard-purges after the 90-day retention window (§18.4).
 func (s *CascadeService) ScrubTenant(ctx context.Context, tenantID uuid.UUID) error {
-	if err := s.delegations.SoftDeleteTenant(ctx, tenantID); err != nil {
-		return err
-	}
-	return s.settings.SoftDeleteTenant(ctx, tenantID)
+	return s.txRunner.RunInTx(ctx, func(txCtx context.Context) error {
+		if err := s.delegations.SoftDeleteTenant(txCtx, tenantID); err != nil {
+			return err
+		}
+		return s.settings.SoftDeleteTenant(txCtx, tenantID)
+	})
 }

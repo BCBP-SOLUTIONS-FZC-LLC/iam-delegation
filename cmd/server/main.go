@@ -15,14 +15,14 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
+	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"golang.org/x/sync/errgroup"
 
 	awsconfig "github.com/aws/aws-sdk-go-v2/config"
 	"github.com/aws/aws-sdk-go-v2/service/glue"
 	"github.com/aws/aws-sdk-go-v2/service/sqs"
-
-	"go.opentelemetry.io/otel"
 
 	events "github.com/BCBP-SOLUTIONS-FZC-LLC/platform-events/pkg/events"
 	"github.com/BCBP-SOLUTIONS-FZC-LLC/platform-events/pkg/outbox"
@@ -30,6 +30,7 @@ import (
 	gclogger "github.com/BCBP-SOLUTIONS-FZC-LLC/platform-gincommon/pkg/logger"
 	pgmigrate "github.com/BCBP-SOLUTIONS-FZC-LLC/platform-pgcommon/pkg/migrate"
 	pgcommon "github.com/BCBP-SOLUTIONS-FZC-LLC/platform-pgcommon/pkg/pgcommon"
+	"github.com/BCBP-SOLUTIONS-FZC-LLC/platform-pgcommon/pkg/pgmetrics"
 
 	"github.com/BCBP-SOLUTIONS-FZC-LLC/iam-delegation/cmd/reconciler/jobs"
 	// Blank-imported for its init()-time swaggo spec registration, read by
@@ -53,8 +54,15 @@ import (
 // buildVersion is stamped at build time via -ldflags="-X main.buildVersion=...".
 var buildVersion = "dev"
 
+const serviceName = "iam-delegation"
+
 func main() {
-	logger, err := gclogger.NewLogger(getEnv("ENVIRONMENT", "development"))
+	ensureGincommonEnv(buildVersion)
+	appEnv := resolveAppEnv()
+	if appEnv != "dev" {
+		gin.SetMode(gin.ReleaseMode)
+	}
+	logger, err := gclogger.NewLogger(appEnv)
 	if err != nil {
 		panic("init logger: " + err.Error())
 	}
@@ -73,23 +81,31 @@ func run(logger Logger) error {
 	baseCtx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
-	// Tracing is entirely gincommon's — ObservabilityMiddlewares lazily
-	// installs the real OTel TracerProvider the first time it runs, using
-	// the Tracing options below. There is no separate hand-rolled
-	// TracerProvider/exporter setup in this process (LLD §14.3).
-	insecure := cfg.Environment != "production"
-	sampleRatio := 1.0
-	if cfg.Environment == "production" {
-		sampleRatio = 0.1
+	// Tracing + metrics init through platform-gincommon, matching
+	// iam-realm-provisioner line-for-line:
+	//   1. InitTracingFromEnv installs the TracerProvider first so any
+	//      later otel.Tracer (NewOTelTracer / otelhttp) gets a real
+	//      provider, even when OTEL_EXPORTER_OTLP_ENDPOINT is unset (dev).
+	//   2. ObservabilityMiddlewares is gincommon's public metrics-init
+	//      API — call it before any collector registration so business /
+	//      events / pgcommon metrics land on MetricsRegisterer with
+	//      matching {service, version} const labels. NewRouter applies
+	//      the same middleware slice; gincommon's metrics.Init is sync.Once.
+	//   3. metrics.Register() + events/pgmetrics Init immediately after,
+	//      before DB or outbound clients.
+	shutdownTracing := gincommon.InitTracingFromEnv()
+	defer shutdownTracing()
+	ginCfg := gincommon.Config{
+		Logger:       logger,
+		ServiceName:  getEnv("APP_NAME", serviceName),
+		BuildVersion: getEnv("BUILD_VERSION", buildVersion),
 	}
-	tracing := &gincommon.TracingOptions{
-		Endpoint:    cfg.OTELExporterOTLPEndpoint,
-		Insecure:    &insecure,
-		SampleRatio: &sampleRatio,
-	}
-	tracer := otel.Tracer("iam-delegation")
+	_ = gincommon.ObservabilityMiddlewares(ginCfg)
+	appMetrics := metrics.Register()
+	events.InitWithRegisterer(ginCfg.ServiceName, ginCfg.BuildVersion, gincommon.MetricsRegisterer())
+	pgmetrics.InitWithRegisterer(ginCfg.ServiceName, ginCfg.BuildVersion, gincommon.MetricsRegisterer())
 	defer func() {
-		if shutdownErr := gincommon.Shutdown(nil); shutdownErr != nil {
+		if shutdownErr := gincommon.Shutdown(logger); shutdownErr != nil {
 			logger.Error("telemetry shutdown failed", map[string]interface{}{"error": shutdownErr.Error()})
 		}
 	}()
@@ -106,15 +122,10 @@ func run(logger Logger) error {
 	// ignored when DATABASE_URL is set verbatim, per ApplyStatementTimeout's
 	// own contract.
 	dsn := pgadapter.DSNFromEnv()
-	// Migrations run at startup against the delegation_migrator (BYPASSRLS)
-	// role — MIGRATION_DATABASE_URL, falling back to DSNFromEnv() (LLD §7.4).
+	// Migrations must bypass PgBouncer because the runner acquires a
+	// pg_advisory_lock, which is session-scoped. MIGRATION_DATABASE_URL
+	// points directly at Postgres; falls back to dsn when unset (LLD §7.4).
 	migratorDSN := pgadapter.MigrationDSNFromEnv()
-	if err := pgadapter.RunMigrations(baseCtx, migratorDSN, pgadapter.NewLoggerAdapter(logger)); err != nil {
-		return fmt.Errorf("run migrations: %w", err)
-	}
-	if err := outbox.ApplySchema(baseCtx, &pgmigrate.Runner{DSN: migratorDSN}); err != nil {
-		return fmt.Errorf("apply outbox schema: %w", err)
-	}
 
 	// The RLS-scoped delegation_app pool — every public-route write and
 	// read goes through this pool, with app.tenant_id bound per-request by
@@ -122,12 +133,24 @@ func run(logger Logger) error {
 	pgCfg.DSN = dsn
 	pgCfg.GUCProvider = pgcommon.GUCSetFromContext
 	pgCfg.Logger = pgadapter.NewLoggerAdapter(logger)
+	// One shared query tracer on both pools — iam-realm-provisioner.
+	queryTracer := pgadapter.NewOTelTracer(ginCfg.ServiceName)
+	pgCfg.Tracer = queryTracer
 	pool, err := pgcommon.NewPool(baseCtx, pgCfg)
 	if err != nil {
 		return fmt.Errorf("connect app pool: %w", err)
 	}
-	//nolint:errcheck // best-effort shutdown cleanup — an error here has no recovery action at process exit.
-	defer func() { _ = pool.DrainAndClose(context.Background()) }()
+	// DrainAndClose waits for in-flight WithConn/RunInTx then force-closes
+	// — pgcommon's documented graceful path (iam-realm-provisioner). A 30s
+	// budget matches the HTTP/outbox drain above so a hung checkout cannot
+	// block process exit indefinitely.
+	defer func() {
+		drainCtx, cancelDrain := context.WithTimeout(context.Background(), 30*time.Second)
+		defer cancelDrain()
+		if err := pool.DrainAndClose(drainCtx); err != nil {
+			logger.Error("app pool drain error", map[string]interface{}{"error": err.Error()})
+		}
+	}()
 
 	// The BYPASSRLS delegation_migrator-privileged pool the cross-tenant
 	// cron sweep queries and the RLS-exempt processed_events ledger need
@@ -136,27 +159,46 @@ func run(logger Logger) error {
 	// degrades the reconciler's sweeps to RLS-filtered (incomplete) rather
 	// than failing startup.
 	sysDSN := pgadapter.SystemDSNFromEnv()
-	sysPool, err := pgcommon.NewPool(baseCtx, pgcommon.Config{
-		DSN: sysDSN, Logger: pgadapter.NewLoggerAdapter(logger), Tracer: otelSpanTracer{tracer: tracer}, PGBouncerMode: true,
-	})
+	sysCfg := pgadapter.SystemPoolConfig(sysDSN, logger)
+	sysCfg.Tracer = queryTracer
+	sysPool, err := pgcommon.NewPool(baseCtx, sysCfg)
 	if err != nil {
 		return fmt.Errorf("connect system pool: %w", err)
 	}
 	if sysDSN == dsn {
 		logger.Warn("SYSTEM_DATABASE_URL not set — sysPool reuses app DSN; cross-tenant cron/internal sweeps will be RLS-filtered", nil)
 	}
-	//nolint:errcheck // best-effort shutdown cleanup — an error here has no recovery action at process exit.
-	defer func() { _ = sysPool.DrainAndClose(context.Background()) }()
+	defer func() {
+		drainCtx, cancelDrain := context.WithTimeout(context.Background(), 30*time.Second)
+		defer cancelDrain()
+		if err := sysPool.DrainAndClose(drainCtx); err != nil {
+			logger.Error("sysPool drain error", map[string]interface{}{"error": err.Error()})
+		}
+	}()
 
-	// Event schema validation (enqueue-time) + SNS publisher w/ optional
-	// Glue codec (publish-time) — the enqueue-vs-publish split, LLD §10.3.1.
-	validator, err := eventbus.NewSchemaValidator()
-	if err != nil {
-		return fmt.Errorf("build schema validator: %w", err)
+	// Migration order is critical (postgres.Migrate / iam-realm-provisioner):
+	// outbox.ApplySchema creates outbox_events BEFORE the domain migration,
+	// which GRANTs delegation_app on that table. Domain-then-outbox (the
+	// iam-user-profile order) fails every fresh-database bring-up.
+	if err := outbox.ApplySchema(baseCtx, &pgmigrate.Runner{DSN: migratorDSN}); err != nil {
+		return fmt.Errorf("apply outbox schema: %w", err)
 	}
-	txRunner := pgadapter.NewTxRunner(pool, validator)
+	if err := pgadapter.RunMigrations(baseCtx, migratorDSN, pgadapter.NewLoggerAdapter(logger)); err != nil {
+		return fmt.Errorf("run migrations: %w", err)
+	}
 
-	var codec events.Codec = eventbus.NoopCodec{}
+	// Event enqueue (ValidatingCodec + Publisher) + SNS publisher w/ optional
+	// Glue codec (publish-time) — the enqueue-vs-publish split, LLD §10.3.1,
+	// matching iam-realm-provisioner. postgres.TxRunner injects the publisher;
+	// it does not import platform-events.
+	enqueueCodec, err := eventbus.NewValidatingCodec(eventbus.NoopCodec{})
+	if err != nil {
+		return fmt.Errorf("build enqueue codec: %w", err)
+	}
+	outboxPublisher := eventbus.New(domain.Source, enqueueCodec).WithLogger(logger)
+	txRunner := pgadapter.NewTxRunner(pool, outboxPublisher)
+
+	var codec events.Codec = events.NoopCodec{}
 	if cfg.GlueRegistryName != "" {
 		awsCfg, err := awsconfig.LoadDefaultConfig(baseCtx, awsconfig.WithRegion(cfg.AWSRegion))
 		if err != nil {
@@ -169,6 +211,7 @@ func run(logger Logger) error {
 		})
 		gc, err := eventbus.NewGlueCodec(baseCtx, glueClient, cfg.GlueRegistryName, []string{
 			domain.EventDelegationStarted, domain.EventDelegationEnded, domain.EventDelegationReviewRequested,
+			domain.EventDelegationEscalationRequested,
 		})
 		if err != nil {
 			return fmt.Errorf("build Glue codec: %w", err)
@@ -198,20 +241,13 @@ func run(logger Logger) error {
 		return fmt.Errorf("build outbox runner: %w", err)
 	}
 
-	// Metrics — iam_delegation_* counters/gauges land in gincommon's own
-	// Prometheus registry (LLD §14.2), alongside its HTTP metrics.
-	appMetrics, err := metrics.Register(gincommon.MetricsRegisterer())
-	if err != nil {
-		return fmt.Errorf("register metrics: %w", err)
-	}
-	events.InitWithRegisterer("iam-delegation", buildVersion, gincommon.MetricsRegisterer())
-
-	// Outbound clients.
-	userProfileClient, err := userprofile.NewHTTPClient(cfg.UserProfileBaseURL, &http.Client{Timeout: cfg.UserProfileTimeout}, cfg.UserProfileTimeout)
+	// Outbound clients — nil *http.Client so NewHTTPClient wraps
+	// httpx.NewClient (otelhttp transport; iam-realm-provisioner).
+	userProfileClient, err := userprofile.NewHTTPClient(cfg.UserProfileBaseURL, nil, cfg.UserProfileTimeout)
 	if err != nil {
 		return fmt.Errorf("build User Profile client: %w", err)
 	}
-	membershipCheckClient, err := orgmembership.NewHTTPChecker(cfg.OrgMembershipBaseURL, &http.Client{Timeout: cfg.OrgMembershipTimeout}, cfg.OrgMembershipTimeout)
+	membershipCheckClient, err := orgmembership.NewHTTPChecker(cfg.OrgMembershipBaseURL, nil, cfg.OrgMembershipTimeout)
 	if err != nil {
 		return fmt.Errorf("build Org Membership client: %w", err)
 	}
@@ -234,9 +270,9 @@ func run(logger Logger) error {
 	settingsRepo := pgadapter.NewSettingsRepository(pool)
 
 	// Core services.
-	delegationService := service.NewDelegationService(delegationRepo, settingsRepo, membershipCheckClient, userProfileClient, idempotencyStore, cache, txRunner)
+	delegationService := service.NewDelegationService(delegationRepo, settingsRepo, membershipCheckClient, userProfileClient, idempotencyStore, cache, txRunner).WithMetrics(appMetrics)
 	settingsService := service.NewSettingsService(settingsRepo)
-	cascadeService := service.NewCascadeService(delegationRepo, settingsRepo, userProfileClient, txRunner)
+	cascadeService := service.NewCascadeService(delegationRepo, settingsRepo, userProfileClient, txRunner).WithMetrics(appMetrics)
 
 	// Reconciler jobs — shared with cmd/reconciler (DLG-D17).
 	jctx := &jobs.Context{
@@ -268,8 +304,8 @@ func run(logger Logger) error {
 	}
 	router := httpadapter.NewRouter(
 		delegationHandler, settingsHandler, internalHandler,
-		pool, redisPinger{client: redisClient}, outboxPinger{runner: outboxRunner},
-		logger, tracing, docs, bindTenantGUC,
+		pool, sysPool, redisPinger{client: redisClient}, outboxPinger{runner: outboxRunner},
+		ginCfg, docs, bindTenantGUC,
 	)
 
 	httpServer := &http.Server{
@@ -278,10 +314,23 @@ func run(logger Logger) error {
 		ReadHeaderTimeout: 10 * time.Second,
 	}
 
+	// Metrics on a dedicated port/listener, separate from the API server
+	// — so a NetworkPolicy can grant the monitoring namespace scrape
+	// access without also granting it the tenant-facing/gateway API.
+	// Helm ServiceMonitor scrapes :9090/metrics (service.metricsPort).
+	// Mirrors iam-realm-provisioner's identical split.
+	metricsMux := http.NewServeMux()
+	metricsMux.Handle("/metrics", promhttp.Handler())
+	metricsServer := &http.Server{
+		Addr:              ":" + cfg.MetricsPort,
+		Handler:           metricsMux,
+		ReadHeaderTimeout: 5 * time.Second,
+	}
+
 	// Cascade consumer — Core's MembershipRevoked/TenantMembershipsPurged on
 	// delegation-cascade-q (LLD §10.1/§11.5/§11.6).
-	processedEvents := consumer.NewProcessedEvents(sysPool)
-	cascadeConsumer := consumer.NewCascadeConsumer(cascadeService, processedEvents, pgadapter.WithTenantGUC, logger)
+	processedEvents := pgadapter.NewProcessedEventsRepository(sysPool)
+	cascadeConsumer := consumer.NewCascadeConsumer(cascadeService, processedEvents, pgadapter.WithTenantGUC, txRunner, logger)
 	awsCfg, err := awsconfig.LoadDefaultConfig(baseCtx, awsconfig.WithRegion(cfg.AWSRegion))
 	if err != nil {
 		return fmt.Errorf("load AWS config: %w", err)
@@ -297,8 +346,10 @@ func run(logger Logger) error {
 	// is set — independently of this service's outbound publish-side Glue
 	// config — so the inbound consumer needs decode support regardless of
 	// whether this service's own events are Glue-encoded (LLD §10.1, DLG-D21).
-	sqsConsumer, err := consumer.NewCascadeSQSConsumer(sqsClient, cfg.CascadeQueueURL, logger, cascadeConsumer,
-		events.WithConsumerCodec(eventbus.GlueDecodeCodec{}))
+	sqsConsumer, err := consumer.NewCascadeSQSConsumer(sqsClient, cfg.CascadeQueueURL, cfg.AWSRegion, cfg.AWSEndpointURL, logger, cascadeConsumer,
+		events.WithConsumerCodec(eventbus.GlueDecodeCodec{}),
+		events.WithConcurrency(cfg.CascadeSQSConcurrency),
+	)
 	if err != nil {
 		return fmt.Errorf("build cascade SQS consumer: %w", err)
 	}
@@ -306,6 +357,14 @@ func run(logger Logger) error {
 	g, gCtx := errgroup.WithContext(baseCtx)
 	g.Go(func() error { return outboxRunner.Start(gCtx) })
 	g.Go(func() error { return sqsConsumer.Start(gCtx) })
+	// iam_delegation_active_gauge is a count of current table state, so
+	// no request or reconciler path can maintain it. Refreshed here from
+	// the BYPASSRLS sysPool, matching iam-realm-provisioner's exporter
+	// goroutines. Returns when gCtx is canceled at shutdown.
+	g.Go(func() error {
+		runActiveGaugeExporter(gCtx, pgadapter.NewGaugeRepository(sysPool), logger, appMetrics)
+		return nil
+	})
 	// Outbox prune sweep — outbox.Runner.PrunePublished never runs on its
 	// own; without this, published outbox_events rows accumulate forever
 	// (LLD gap, matching iam-user-profile's identical runMaintenanceSweep
@@ -335,6 +394,13 @@ func run(logger Logger) error {
 		return nil
 	})
 	g.Go(func() error {
+		logger.Info("metrics server starting", map[string]interface{}{"addr": metricsServer.Addr})
+		if err := metricsServer.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+			return fmt.Errorf("metrics server: %w", err)
+		}
+		return nil
+	})
+	g.Go(func() error {
 		<-gCtx.Done()
 		// shutdownCtx is deliberately not derived from gCtx: gCtx is already
 		// Done() at this point, so a context.WithTimeout(gCtx, ...) would be
@@ -345,6 +411,10 @@ func run(logger Logger) error {
 		//nolint:contextcheck // see shutdownCtx's comment above
 		if err := httpServer.Shutdown(shutdownCtx); err != nil {
 			logger.Error("http server shutdown failed", map[string]interface{}{"error": err.Error()})
+		}
+		//nolint:contextcheck // see shutdownCtx's comment above
+		if err := metricsServer.Shutdown(shutdownCtx); err != nil {
+			logger.Error("metrics server shutdown failed", map[string]interface{}{"error": err.Error()})
 		}
 		if err := outboxRunner.Stop(); err != nil {
 			logger.Error("outbox runner shutdown failed", map[string]interface{}{"error": err.Error()})

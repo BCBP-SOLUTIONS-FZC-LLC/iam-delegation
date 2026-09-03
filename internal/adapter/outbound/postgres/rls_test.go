@@ -336,17 +336,25 @@ func TestRLS_MigratorRoleHasBypassRLS(t *testing.T) {
 func TestRLS_EnableAndForceOnBothTenantTables(t *testing.T) {
 	db := setupTestDB(t)
 	ctx := context.Background()
-	rows, err := db.Raw.Query(ctx, `
+	got := map[string]bool{}
+	err := pgcommon.RunInTx(ctx, db.Bypass, pgx.TxOptions{}, func(_ context.Context, tx pgx.Tx) error {
+		rows, err := tx.Query(ctx, `
 		SELECT c.relname FROM pg_class c JOIN pg_namespace n ON c.relnamespace = n.oid
 		WHERE n.nspname = 'public' AND c.relkind = 'r' AND c.relrowsecurity AND c.relforcerowsecurity`)
+		if err != nil {
+			return err
+		}
+		defer rows.Close()
+		for rows.Next() {
+			var name string
+			if err := rows.Scan(&name); err != nil {
+				return err
+			}
+			got[name] = true
+		}
+		return rows.Err()
+	})
 	require.NoError(t, err)
-	defer rows.Close()
-	got := map[string]bool{}
-	for rows.Next() {
-		var name string
-		require.NoError(t, rows.Scan(&name))
-		got[name] = true
-	}
 	assert.True(t, got["delegations"])
 	assert.True(t, got["delegation_tenant_settings"])
 	assert.False(t, got["rls_violation_log"], "rls_violation_log must have RLS disabled to avoid recursion")

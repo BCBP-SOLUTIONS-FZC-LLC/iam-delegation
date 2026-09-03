@@ -29,10 +29,25 @@ func Activation(ctx context.Context, jctx *Context) (Result, error) {
 
 	for _, d := range targets {
 		res.Attempted++
+		// DLG-D29: an open-ended scheduled delegation (EndsAt == nil) has no
+		// bounded end date, but User Profile's ValidateOOOWindow
+		// unconditionally requires ooo_until whenever status="ooo" — the
+		// exact same bug DelegationService.Create was fixed for, missed
+		// here originally because this is a separate call site. d.ReviewDueAt
+		// is always populated for an open-ended row by the now-fixed Create
+		// (or by Reassign, which delegates to Create), so it's available
+		// here without a settings lookup. Without this fallback, an
+		// open-ended scheduled delegation would defer every single tick
+		// forever — the same wrong payload rejected the same way each time
+		// — never actually activating.
+		oooUntil := d.EndsAt
+		if oooUntil == nil {
+			oooUntil = d.ReviewDueAt
+		}
 		oooStatus := "ooo"
 		if err := jctx.UserProfile.SetAvailability(ctx, port.SetAvailabilityRequest{
 			TenantID: d.TenantID, UserID: d.DelegatorID,
-			Status: &oooStatus, OOOFrom: &d.StartsAt, OOOUntil: d.EndsAt,
+			Status: &oooStatus, OOOFrom: &d.StartsAt, OOOUntil: oooUntil,
 			DelegateID: &d.DelegateID, Note: d.Reason,
 		}); err != nil {
 			jctx.Logger.Warn("delegation-activation: UP set-availability failed — DLG-D25 defer",
@@ -40,6 +55,7 @@ func Activation(ctx context.Context, jctx *Context) (Result, error) {
 			res.Deferred++
 			if jctx.Metrics != nil {
 				jctx.Metrics.RecordActivationDeferred()
+				jctx.Metrics.RecordUPAvailabilityFailure("activation-cron")
 			}
 			continue
 		}

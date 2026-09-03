@@ -43,6 +43,7 @@ var (
 	// 503 — dependency
 	ErrOrgMembershipUnavailable = errors.New("org_membership_unavailable")
 	ErrUserProfileUnavailable   = errors.New("user_profile_unavailable")
+	ErrDBUnavailable            = errors.New("db_unavailable")
 )
 
 // Error wraps a sentinel with a human-readable message and optional

@@ -11,8 +11,13 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"github.com/BCBP-SOLUTIONS-FZC-LLC/iam-delegation/internal/core/domain"
+	gincommon "github.com/BCBP-SOLUTIONS-FZC-LLC/platform-gincommon/pkg/gincommon"
 	pgcommon "github.com/BCBP-SOLUTIONS-FZC-LLC/platform-pgcommon/pkg/pgcommon"
 )
+
+func testGinConfig() gincommon.Config {
+	return gincommon.Config{Logger: testLogger(), ServiceName: "iam-delegation"}
+}
 
 // fakeLogger is a no-op Logger for tests that need to pass one to NewRouter
 // but don't assert on log output.
@@ -35,8 +40,8 @@ func newTestRouter(docs DocsConfig) (*Router, *fakeDelegationService, *fakeDeleg
 	settingsHandler := NewSettingsHandler(settingsSvc)
 	internalHandler := NewInternalHandler(&fakeExpiryRunner{}, &fakeReviewRunner{}, reader)
 	r := NewRouter(delegationHandler, settingsHandler, internalHandler,
-		fakePostgresHealth{status: pgcommon.HealthStatus{Healthy: true}}, fakePinger{}, fakePinger{},
-		testLogger(), nil, docs, nil)
+		fakePostgresHealth{status: pgcommon.HealthStatus{Healthy: true}}, nil, fakePinger{}, fakePinger{},
+		testGinConfig(), docs, nil)
 	return r, svc, reader, settingsSvc
 }
 
@@ -59,8 +64,8 @@ func TestRouter_BindTenantGUC(t *testing.T) {
 	}
 
 	r := NewRouter(delegationHandler, settingsHandler, internalHandler,
-		fakePostgresHealth{status: pgcommon.HealthStatus{Healthy: true}}, fakePinger{}, fakePinger{},
-		testLogger(), nil, DocsConfig{Environment: "development"}, bind)
+		fakePostgresHealth{status: pgcommon.HealthStatus{Healthy: true}}, nil, fakePinger{}, fakePinger{},
+		testGinConfig(), DocsConfig{Environment: "development"}, bind)
 
 	req := httptest.NewRequest(http.MethodGet, "/api/v1/delegations", nil)
 	req.Header.Set("x-user-id", userID.String())
@@ -196,6 +201,22 @@ func TestRouter_Docs_NonProduction(t *testing.T) {
 	w = httptest.NewRecorder()
 	r.Handler().ServeHTTP(w, req)
 	require.Equal(t, http.StatusOK, w.Code)
+}
+
+func TestRouter_Docs_SwaggerAssetOverrides(t *testing.T) {
+	r, _, _, _ := newTestRouter(DocsConfig{Environment: "development"})
+
+	req := httptest.NewRequest(http.MethodGet, "/swagger/index.css", nil)
+	w := httptest.NewRecorder()
+	r.Handler().ServeHTTP(w, req)
+	require.Equal(t, http.StatusOK, w.Code)
+	require.Contains(t, w.Header().Get("Content-Type"), "text/css")
+
+	req = httptest.NewRequest(http.MethodGet, "/swagger/swagger-initializer.js", nil)
+	w = httptest.NewRecorder()
+	r.Handler().ServeHTTP(w, req)
+	require.Equal(t, http.StatusOK, w.Code)
+	require.Contains(t, w.Header().Get("Content-Type"), "javascript")
 }
 
 func TestRouter_Docs_ProductionDisabled(t *testing.T) {

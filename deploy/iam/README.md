@@ -18,7 +18,7 @@ serviceAccount:
 
 The SAME role is assumed by both the `cmd/server` Deployment (publishes to
 the `iam-delegation-events` SNS topic; consumes `delegation-cascade-q`) and
-all three `cmd/reconciler` CronJobs (LLD §16.1 — one ServiceAccount, shared
+all four `cmd/reconciler` CronJobs (LLD §16.1 — one ServiceAccount, shared
 by every pod this chart creates).
 
 ## Grants breakdown

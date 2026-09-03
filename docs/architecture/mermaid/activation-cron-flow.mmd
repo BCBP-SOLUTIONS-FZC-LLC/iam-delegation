@@ -1,0 +1,19 @@
+sequenceDiagram
+    autonumber
+    participant CR as delegation-activation CronJob (*/5 * * * *)
+    participant DLG as Delegation Service
+    participant UP as User Profile
+    participant PG as Delegation Postgres
+
+    CR->>DLG: (in-process job call, mirrors DLG-I1/I2's reconciler topology — §16.1)
+    DLG->>PG: ListScheduledBefore: SELECT ... WHERE status='scheduled' AND starts_at <= now() AND deleted_at IS NULL ORDER BY starts_at LIMIT 100
+    loop per due delegation
+        DLG->>UP: PUT /internal/users/:delegator_id/availability {status ooo, delegate_id, ooo_note, ends_at}
+        alt UP fail
+            DLG->>DLG: leave scheduled, increment iam_delegation_activation_deferred_total, retry next tick
+        else UP 200
+            DLG->>PG: RunInTx { Activate: UPDATE status=active WHERE status='scheduled' AND record_version=v, then outbox DelegationStarted }
+            Note over DLG,PG: Activate returns nil (not an error) if the row already raced to another terminal/active state — counted as neither succeeded nor failed
+        end
+    end
+    DLG-->>CR: {attempted, succeeded, deferred, failed}

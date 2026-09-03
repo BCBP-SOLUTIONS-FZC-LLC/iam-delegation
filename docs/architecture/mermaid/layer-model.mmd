@@ -2,31 +2,31 @@ graph TD
     subgraph cmd["Composition Roots — cmd/"]
         main["server/main.go\nHTTP composition root (DLG-1..7, DLG-I1..I4)\n+ delegation-cascade-q SQS consumer, one process\nwires TxRunner/validator/GlueCodec/OutboxRunner\ntenantGUCMiddleware on the public route group"]
         reconciler["reconciler/main.go\n--job=<name> dispatch (this chart's own convention)\nsysPool (BYPASSRLS from SYSTEM_DATABASE_URL)"]
-        jobs["reconciler/jobs/\ndelegation_expiry.go    -- DLG-I1 (*/5 * * * *)\ndelegation_review.go    -- DLG-I2 (0 * * * *, 3-day daily cascade warn)\ndelegation_cleanup.go   -- soft-delete purge (0 4 1 * *)\nshares implementation with cmd/server's HTTP handlers\nvia cmd/server/adapters.go's reconcilerRunner (DLG-D17)"]
+        jobs["reconciler/jobs/\ndelegation_activation.go -- DLG-D25 (*/5 * * * *, scheduled -> active)\ndelegation_expiry.go    -- DLG-I1 (*/5 * * * *)\ndelegation_review.go    -- DLG-I2 (0 * * * *, 3-day daily cascade warn)\ndelegation_cleanup.go   -- soft-delete purge (0 4 1 * *)\nshares implementation with cmd/server's HTTP handlers\nvia cmd/server/adapters.go's reconcilerRunner (DLG-D17)"]
     end
 
     subgraph adapters_in["Inbound Adapters — internal/adapter/inbound/"]
         http_h["http/\nrouter.go — DLG-1..7, DLG-I1..I4, health, docs\ntenantGUCMiddleware · gucBoundReader (DLG-D18)\nAsyncAPI/Swagger doc handlers"]
-        consumer["consumer/\nCascadeConsumer\n(MembershipRevoked -> CascadeService.EndForUser,\nTenantMembershipsPurged -> CascadeService.ScrubTenant)\nprocessed_events idempotency dedup"]
+        consumer["consumer/\nCascadeConsumer\n(MembershipRevoked -> CascadeService.EndForUser,\nTenantMembershipsPurged -> CascadeService.ScrubTenant,\nUserUpdated{status:disabled} -> CascadeService.EndForDisabledDelegate, DLG-D26)\nprocessed_events idempotency dedup, three consumer buckets"]
     end
 
     subgraph adapters_out["Outbound Adapters — internal/adapter/outbound/"]
-        postgres["postgres/\nDelegationRepository · SettingsRepository\nTxRunner (PayloadValidator hook) · migrations/\nWithTenantGUC · SystemDSNFromEnv (LLD §4.4-equivalent)"]
+        postgres["postgres/\nDelegationRepository · SettingsRepository\nTxRunner (injects port.EventPublisher) · migrations/\nWithTenantGUC · SystemDSNFromEnv (LLD §4.4-equivalent)"]
         userprofile["userprofile/\nHTTPClient — UserProfileClient impl\n(DEL-6 availability-first pointer set/clear)"]
         orgmembership["orgmembership/\nHTTPChecker — MembershipCheckClient impl\n(DLG-D3 grant-time membership-existence checks)"]
-        eventbus["eventbus/\nSchemaValidator (jsonschema/v6, enqueue-time)\nGlueCodec · NoopCodec (events.Codec, wired via\nevents.WithCodec at SNS-publish time — iam-delegation-events)"]
+        eventbus["eventbus/\nPublisher + ValidatingCodec (enqueue-time)\nGlueCodec · events.NoopCodec (SNS-publish time — iam-delegation-events)"]
         valkey["valkey/\ndel: cache — del:list: (60s) · del:idem: (24h)"]
         metrics["metrics/\niam_delegation_* Prometheus instruments\n(RecordCreated/Ended/ReviewWarned/CascadeProcessed/...)"]
     end
 
     subgraph eventschema_grp["Generated Schemas — internal/eventschema/"]
-        eventschema["eventschema/\nEmbedded JSON Schemas for the three published events\nDelegationStarted · DelegationEnded · DelegationReviewRequested"]
+        eventschema["eventschema/\nEmbedded JSON Schemas for the four published events\nDelegationStarted · DelegationEnded · DelegationReviewRequested · DelegationEscalationRequested"]
     end
 
     subgraph core["Core — internal/core/"]
-        service["service/\nDelegationService  -- DLG-1..5 orchestration\nSettingsService    -- DLG-6/7\nCascadeService     -- delegation-cascade-q business logic"]
+        service["service/\nDelegationService  -- DLG-1..5 orchestration\nSettingsService    -- DLG-6/7\nCascadeService     -- delegation-cascade-q business logic (incl. EndForDisabledDelegate, DLG-D26/D27)"]
         port["port/\nDelegationRepository · SettingsRepository\nUserProfileClient · MembershipCheckClient\nIdempotencyStore · EventPublisher · Cache · TxRunner"]
-        domain["domain/\nDelegation · DelegationTenantSettings\nEventDelegation{Started,Ended,ReviewRequested}\ndelegation_* sentinel error taxonomy (LLD §20)"]
+        domain["domain/\nDelegation · DelegationTenantSettings\nEventDelegation{Started,Ended,ReviewRequested,EscalationRequested}\ndelegation_* sentinel error taxonomy (LLD §20)"]
     end
 
     subgraph pkg["Shared Packages — pkg/"]

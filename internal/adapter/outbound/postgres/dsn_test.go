@@ -80,6 +80,38 @@ func TestApplyStatementTimeout_EmptyDSN_ReturnsEmpty(t *testing.T) {
 	assert.Equal(t, "", ApplyStatementTimeout(""))
 }
 
+func TestApplyStatementTimeout_Idempotent(t *testing.T) {
+	t.Setenv("PG_STATEMENT_TIMEOUT", "5s")
+	once := ApplyStatementTimeout("postgres://u@h/db?sslmode=disable")
+	assert.Equal(t, once, ApplyStatementTimeout(once))
+}
+
+func TestSystemPoolConfig_ForcesPGBouncerMode(t *testing.T) {
+	t.Setenv("PG_BOUNCER_MODE", "false")
+	t.Setenv("PG_MAX_CONNS", "20")
+	t.Setenv("PG_SLOW_QUERY_THRESHOLD", "200ms")
+	t.Setenv("PG_STATEMENT_TIMEOUT", "")
+
+	cfg := SystemPoolConfig("postgres://sys@host/db", nil)
+	assert.Equal(t, "postgres://sys@host/db", cfg.DSN)
+	assert.True(t, cfg.PGBouncerMode, "sysPool must force PGBouncerMode:true — zero-value false breaks PgBouncer txn pooling")
+	assert.Nil(t, cfg.GUCProvider, "sysPool must not inject tenant GUCs")
+	assert.Nil(t, cfg.Tracer, "Tracer is wired by the call site, not SystemPoolConfig")
+	assert.Nil(t, cfg.Logger, "nil log must leave Logger unset")
+	assert.Equal(t, int32(20), cfg.MaxConns, "sysPool inherits pool sizing from ConfigFromEnv")
+}
+
+func TestSystemPoolConfig_NonNilLogger_WrapsWithAdapter(t *testing.T) {
+	cfg := SystemPoolConfig("postgres://sys@host/db", &fakeMapLogger{})
+	assert.NotNil(t, cfg.Logger, "a non-nil log must be wrapped, not dropped")
+}
+
+func TestSystemPoolConfig_AppliesStatementTimeout(t *testing.T) {
+	t.Setenv("PG_STATEMENT_TIMEOUT", "5s")
+	cfg := SystemPoolConfig("postgres://sys@host/db?sslmode=disable", nil)
+	assert.Contains(t, cfg.DSN, "statement_timeout%3D5000")
+}
+
 // TestSystemDSNFromEnv_UsesEnvVarWhenSet covers the SYSTEM_DATABASE_URL-set
 // branch of SystemDSNFromEnv.
 func TestSystemDSNFromEnv_UsesEnvVarWhenSet(t *testing.T) {
@@ -107,12 +139,17 @@ func TestSystemDSNFromEnv_FallsBackToAppDSN(t *testing.T) {
 	assert.Equal(t, want, SystemDSNFromEnv())
 }
 
-// TestMigrationDSNFromEnv_UsesEnvVarWhenSet covers the
-// MIGRATION_DATABASE_URL-set branch of MigrationDSNFromEnv.
-func TestMigrationDSNFromEnv_UsesEnvVarWhenSet(t *testing.T) {
-	const want = "postgres://migrator:migrator@directdb:5432/delegation?sslmode=disable"
-	t.Setenv("MIGRATION_DATABASE_URL", want)
-	assert.Equal(t, want, MigrationDSNFromEnv())
+func TestMigrationDSNFromEnv_PrefersMigrationDatabaseURL(t *testing.T) {
+	t.Setenv("MIGRATION_DATABASE_URL", "postgres://migrator@host/db")
+	t.Setenv("DATABASE_URL", "postgres://app@host/db")
+	t.Setenv("PG_STATEMENT_TIMEOUT", "")
+	assert.Equal(t, "postgres://migrator@host/db", MigrationDSNFromEnv())
+}
+
+func TestMigrationDSNFromEnv_AppliesStatementTimeout(t *testing.T) {
+	t.Setenv("MIGRATION_DATABASE_URL", "postgres://m:x@migrations.example:5432/db?sslmode=disable")
+	t.Setenv("PG_STATEMENT_TIMEOUT", "5s")
+	assert.Contains(t, MigrationDSNFromEnv(), "statement_timeout%3D5000")
 }
 
 // TestMigrationDSNFromEnv_FallsBackToAppDSN covers the fallback branch —

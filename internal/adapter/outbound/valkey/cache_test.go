@@ -75,6 +75,24 @@ func TestCache_DownValkeyDegradesToMiss(t *testing.T) {
 	c.InvalidateDelegatorList(ctx, tenantID, delegatorID)
 }
 
+// TestCache_GetDelegatorList_DecodeFailureDegradesToMiss covers the
+// json.Unmarshal error branch — a value in Valkey that isn't the expected
+// shape (e.g. written by an incompatible prior version) must degrade to a
+// miss, not an error, per LLD §9.3.
+func TestCache_GetDelegatorList_DecodeFailureDegradesToMiss(t *testing.T) {
+	mr := miniredis.RunT(t)
+	fl := &fakeLogger{}
+	c := NewCache(NewClient("redis://"+mr.Addr()), fl)
+	ctx := context.Background()
+	tenantID, delegatorID := uuid.New(), uuid.New()
+
+	require.NoError(t, mr.Set(delegatorListKey(tenantID, delegatorID), "not-json"))
+
+	_, hit := c.GetDelegatorList(ctx, tenantID, delegatorID)
+	require.False(t, hit)
+	require.Equal(t, "delegator list cache decode failed", fl.msg)
+}
+
 func TestCache_NilLoggerIsSafe(t *testing.T) {
 	mr := miniredis.RunT(t)
 	addr := mr.Addr()

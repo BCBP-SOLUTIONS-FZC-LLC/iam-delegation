@@ -1,9 +1,8 @@
 #!/usr/bin/env bash
-# Creates the GitHub release with versioned assets attached: the two
-# release binaries (server + reconciler — still built and checksummed
-# separately, LLD §16.1) and the one image's SBOM/provenance (server +
-# reconciler ship in a single container image, per the repo-root
-# Dockerfile).
+# Creates the GitHub release with versioned assets attached: the two release
+# binaries (server + reconciler — still built and checksummed separately,
+# LLD §16.1) and the one image's SBOM/provenance (server + reconciler ship
+# in a single container image, per the repo-root Dockerfile).
 set -euo pipefail
 
 : "${RELEASE_TAG:?RELEASE_TAG is required}"

@@ -1,8 +1,7 @@
 # Pre-merge CHANGELOG check.
 # Fails if a PR modifies internal/, api/, cmd/, pkg/, or deploy/ without also
 # updating CHANGELOG.md. This catches missing entries before the release
-# workflow, reducing friction at tag time. Mirrors iam-tender-acl's
-# changelog-check.yml.
+# workflow, reducing friction at tag time.
 name: Changelog check
 
 "on":
@@ -26,7 +25,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
-        uses: actions/checkout@v7.0.0
+        uses: actions/checkout@v7.0.1
         with:
           fetch-depth: 0
           token: ${{ secrets.CI_REPO_READ_TOKEN || github.token }}

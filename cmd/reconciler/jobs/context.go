@@ -17,7 +17,6 @@ package jobs
 
 import (
 	"context"
-	"time"
 
 	"github.com/BCBP-SOLUTIONS-FZC-LLC/iam-delegation/internal/core/port"
 	"github.com/google/uuid"
@@ -41,10 +40,10 @@ type Logger interface {
 type BindTenantGUC func(ctx context.Context, tenantID uuid.UUID, userID string) context.Context
 
 // ProcessedEventsStore is the minimal interface needed by the cleanup job to
-// purge the idempotency ledger. Satisfied by
-// *consumer.ProcessedEvents (LLD §18.4, GAP-09).
+// prune the idempotency ledger. Satisfied by
+// *postgres.ProcessedEventsRepository (LLD §18.4, GAP-09).
 type ProcessedEventsStore interface {
-	CleanupExpired(ctx context.Context, olderThan time.Duration) error
+	Prune(ctx context.Context, ttlDays, limit int) (int, error)
 }
 
 // Metrics is the minimal recorder seam the expiry/review jobs need to close
@@ -56,6 +55,11 @@ type Metrics interface {
 	RecordExpiryDeferred()
 	RecordActivationDeferred()
 	RecordReviewDeferred()
+	RecordReviewWarned(daysRemaining string)
+	RecordReviewExpired()
+	RecordEnded(reason string)
+	RecordCreated(scope string)
+	RecordUPAvailabilityFailure(path string)
 }
 
 // Context carries every dependency a job needs. Delegations must be backed

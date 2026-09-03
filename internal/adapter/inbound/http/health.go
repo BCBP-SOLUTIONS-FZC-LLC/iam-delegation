@@ -31,9 +31,10 @@ type PostgresHealth interface {
 }
 
 type healthHandlers struct {
-	postgres PostgresHealth
-	cache    Pinger
-	outbox   Pinger
+	postgres    PostgresHealth
+	sysPostgres PostgresHealth
+	cache       Pinger
+	outbox      Pinger
 }
 
 // readyz checks Postgres (critical path for every route — 503 if
@@ -63,6 +64,23 @@ func (h *healthHandlers) readyz(c *gin.Context) {
 			healthy = false
 		}
 		checks["postgres_pool"] = gin.H{
+			"total_conns":    hs.TotalConns,
+			"idle_conns":     hs.IdleConns,
+			"acquired_conns": hs.AcquiredConns,
+			"max_conns":      hs.MaxConns,
+			"utilization":    hs.Utilization,
+		}
+	}
+
+	if h.sysPostgres != nil {
+		hs := h.sysPostgres.Health(ctx)
+		if hs.Healthy {
+			checks["sys_postgres"] = "ok"
+		} else {
+			checks["sys_postgres"] = "error"
+			healthy = false
+		}
+		checks["sys_postgres_pool"] = gin.H{
 			"total_conns":    hs.TotalConns,
 			"idle_conns":     hs.IdleConns,
 			"acquired_conns": hs.AcquiredConns,

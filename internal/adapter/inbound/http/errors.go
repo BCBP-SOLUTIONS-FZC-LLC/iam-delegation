@@ -3,11 +3,13 @@ package http
 import (
 	"errors"
 	"net/http"
+	"strings"
 
 	"github.com/gin-gonic/gin"
 
 	"github.com/BCBP-SOLUTIONS-FZC-LLC/iam-delegation/internal/core/domain"
 	gincommon "github.com/BCBP-SOLUTIONS-FZC-LLC/platform-gincommon/pkg/gincommon"
+	"github.com/BCBP-SOLUTIONS-FZC-LLC/platform-pgcommon/pkg/pgcommon"
 )
 
 // errorStatusByCode maps every domain.Err* sentinel's wire code to its HTTP
@@ -47,6 +49,7 @@ var errorStatusByCode = map[string]int{
 	// 503 — dependency
 	domain.ErrOrgMembershipUnavailable.Error(): http.StatusServiceUnavailable,
 	domain.ErrUserProfileUnavailable.Error():   http.StatusServiceUnavailable,
+	domain.ErrDBUnavailable.Error():            http.StatusServiceUnavailable,
 }
 
 // errorResponseWithDetails extends gincommon.ErrorResponse with a free-form
@@ -96,13 +99,32 @@ func writeErrorWithDetails(c *gin.Context, status int, code string, details map[
 // leaking implementation detail.
 func HandleError(c *gin.Context, err error) {
 	var derr *domain.Error
-	if !errors.As(err, &derr) {
-		writeError(c, http.StatusInternalServerError, "internal_server_error")
+	if errors.As(err, &derr) {
+		status, ok := errorStatusByCode[derr.Code]
+		if !ok {
+			status = http.StatusInternalServerError
+		}
+		writeErrorWithDetails(c, status, derr.Code, derr.Details)
 		return
 	}
-	status, ok := errorStatusByCode[derr.Code]
-	if !ok {
-		status = http.StatusInternalServerError
+	// Raw pgconn.PgError that wrapConnErr did not catch. Classes 08/53 via
+	// pgcommon v1.3.0 helpers; 57/58 via SQLSTATE text — matching
+	// iam-realm-provisioner. Inbound HTTP must not import pgconn.
+	if pgcommon.IsConnectionException(err) || pgcommon.IsInsufficientResources(err) || isOperatorOrSystemErrorSQLState(err) {
+		writeError(c, http.StatusServiceUnavailable, domain.ErrDBUnavailable.Error())
+		return
 	}
-	writeErrorWithDetails(c, status, derr.Code, derr.Details)
+	writeError(c, http.StatusInternalServerError, "internal_server_error")
+}
+
+// isOperatorOrSystemErrorSQLState reports whether err is a Postgres error
+// in SQLSTATE class 57 or 58. pgcommon v1.3.0 has no dedicated helper for
+// these two, so we match the "(SQLSTATE 57…)" / "(SQLSTATE 58…)" text
+// pgconn puts in Error().
+func isOperatorOrSystemErrorSQLState(err error) bool {
+	if !pgcommon.IsPgError(err) {
+		return false
+	}
+	msg := err.Error()
+	return strings.Contains(msg, "SQLSTATE 57") || strings.Contains(msg, "SQLSTATE 58")
 }

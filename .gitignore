@@ -26,6 +26,12 @@ go.work.sum
 
 # Compiled binaries (make build / build-server / build-reconciler)
 /bin/
+# Stray root-level binaries from a manual `go build ./cmd/server` /
+# `go build ./cmd/reconciler` run outside the Makefile's /bin/ output.
+/server
+/reconciler
+/iam-delegation-server
+/iam-delegation-reconciler
 
 # env file
 .env

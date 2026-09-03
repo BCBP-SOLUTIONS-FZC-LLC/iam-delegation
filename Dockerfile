@@ -8,8 +8,8 @@
 #                               delegation-cascade-q SQS consumer, in one
 #                               process via errgroup — the image's default
 #                               ENTRYPOINT.
-#   /iam-delegation-reconciler  the three CronJob entry points
-#                               (delegation-expiry/-review/-cleanup,
+#   /iam-delegation-reconciler  the four CronJob entry points
+#                               (delegation-activation/-expiry/-review/-cleanup,
 #                               jobs/delegation_*.go), selected at
 #                               invocation time via --job=<name>. No
 #                               long-running HTTP/metrics server, no ports
@@ -78,7 +78,7 @@ ARG BUILD_VERSION=dev
 ENV BUILD_VERSION=${BUILD_VERSION}
 
 LABEL org.opencontainers.image.title="iam-delegation" \
-      org.opencontainers.image.description="Delegation Service — HTTP API (DLG-1..7, DLG-I1..I4) + cascade SQS consumer + the three reconciler CronJobs — ADR-0008 Wave 4 extraction from iam-org-membership" \
+      org.opencontainers.image.description="Delegation Service — HTTP API (DLG-1..7, DLG-I1..I4) + cascade SQS consumer + the four reconciler CronJobs — ADR-0008 Wave 4 extraction from iam-org-membership" \
       org.opencontainers.image.source="https://github.com/BCBP-SOLUTIONS-FZC-LLC/iam-delegation" \
       org.opencontainers.image.vendor="BCBP Solutions" \
       org.opencontainers.image.licenses="Proprietary" \

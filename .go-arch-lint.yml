@@ -24,7 +24,7 @@ excludeFiles:
 # (LLD §6/§6.2). Package layout is fixed by the LLD's own tree (§6):
 #   internal/core/{domain,port,service}
 #   internal/adapter/inbound/{http,consumer}
-#   internal/adapter/outbound/{postgres,valkey,eventbus,userprofile,orgmembership,metrics}
+#   internal/adapter/outbound/{postgres,valkey,eventbus,userprofile,orgmembership,httpx,metrics}
 #   pkg/requestctx, internal/eventschema, api/, cmd/{server,reconciler}
 components:
   domain:
@@ -70,9 +70,20 @@ components:
       - internal/adapter/inbound/http
       - internal/adapter/inbound/consumer
 
+  # postgres is its own component (not folded into adapters_outbound) so
+  # eventbus can import TxFromContext without a false intra-component
+  # cycle — matching iam-realm-provisioner.
+  postgres:
+    in: internal/adapter/outbound/postgres
+
+  # httpx is its own component so userprofile/orgmembership can wrap
+  # otelhttp without a false intra-component cycle (iam-realm-provisioner
+  # httptransport).
+  httptransport:
+    in: internal/adapter/outbound/httpx
+
   adapters_outbound:
     in:
-      - internal/adapter/outbound/postgres
       - internal/adapter/outbound/valkey
       - internal/adapter/outbound/eventbus
       - internal/adapter/outbound/userprofile
@@ -151,16 +162,26 @@ deps:
       - api
       - observability
 
+  postgres:
+    mayDependOn:
+      - domain
+      - port
+
+  httptransport:
+    anyVendorDeps: true
+
   # outbound adapters: port + domain + eventschema (+ observability for
-  # instrumenting outbound call latency, e.g.
-  # iam_delegation_membership_check_duration_seconds) — never service, never
-  # inbound.
+  # instrumenting outbound call latency) — never service, never inbound.
+  # postgres/httptransport are sibling components so eventbus can import
+  # TxFromContext and HTTP clients can wrap httpx.
   adapters_outbound:
     mayDependOn:
       - port
       - domain
       - eventschema
       - observability
+      - postgres
+      - httptransport
 
   # docs_swagger: pure generated assets, no internal deps.
   docs_swagger:
@@ -189,5 +210,7 @@ deps:
       - observability
       - adapters_inbound
       - adapters_outbound
+      - postgres
+      - httptransport
       - docs_swagger
       - jobs

@@ -5,8 +5,10 @@ info:
   version: 1.0.0
   description: |
     Outbound events published to iam.delegation.events (SNS → SQS fan-out),
-    plus the two Core-origin signals this service consumes on
-    delegation-cascade-q (LLD §10).
+    plus the three upstream signals this service consumes on
+    delegation-cascade-q (LLD §10): two from Core (MembershipRevoked,
+    TenantMembershipsPurged) and one from User Profile (UserUpdated, a
+    second SNS subscription onto the same queue — Bug 2/DLG-D26).
 
     Wire format: each SNS message body is prefixed with an 18-byte AWS Glue
     Schema Registry header before the EventEnvelope JSON:
@@ -14,14 +16,16 @@ info:
       byte 1     : compression    (0x00 = none)
       bytes 2-17 : schema version UUID (big-endian)
 
-    Glue registry : iam-delegation-events (ap-south-1, JSON data format).
+    Glue registry : iam-delegation-events (us-east-1, JSON data format).
     Schemas       : one per PUBLISHED event type, named identically to the
                     event `type` (PascalCase) — DelegationStarted,
-                    DelegationEnded, DelegationReviewRequested (LLD §10.3.1).
-                    MembershipRevoked / TenantMembershipsPurged are registered under
-                    their producing services' own Glue registries, not
-                    iam-delegation-events — they are documented below purely
-                    as this service's consumer-side contract.
+                    DelegationEnded, DelegationReviewRequested,
+                    DelegationEscalationRequested (Bug 2a/LLD §10.3.1).
+                    MembershipRevoked / TenantMembershipsPurged / UserUpdated
+                    are registered under their producing services' own Glue
+                    registries, not iam-delegation-events — they are
+                    documented below purely as this service's consumer-side
+                    contract.
 
     Encoding is split between enqueue time (plain JSON written to the
     outbox, validated against the JSON Schemas in internal/eventschema/) and
@@ -127,10 +131,10 @@ tags:
 
 servers:
   production:
-    host: sns.ap-south-1.amazonaws.com
+    host: sns.us-east-1.amazonaws.com
     protocol: sns
     description: |
-      AWS SNS in ap-south-1. Topic ARN configured via the SNS_TOPIC_ARN env
+      AWS SNS in us-east-1. Topic ARN configured via the SNS_TOPIC_ARN env
       var. Pod IAM role requires, scoped to the iam-delegation-events Glue
       registry: glue:GetRegistry, glue:GetSchema, glue:GetSchemaVersion,
       glue:QuerySchemaVersionMetadata. Schema registration
@@ -139,22 +143,30 @@ servers:
       - $ref: '#/components/securitySchemes/iamRole'
 
   sqsDelegationCascade:
-    host: sqs.ap-south-1.amazonaws.com
+    host: sqs.us-east-1.amazonaws.com
     protocol: sqs
     description: |
       SQS queue owned and managed by this service — delegation-cascade-q
-      (DLQ: delegation-cascade-q-dlq, maxReceiveCount=5) — fed by a single
-      upstream SNS topic this service does not own, via cross-topic
-      subscriptions (LLD §10.1). Both consumed event types are produced by
-      Core / Org & Membership on the SAME topic:
+      (DLQ: delegation-cascade-q-dlq, maxReceiveCount=5) — fed by TWO
+      upstream SNS topics this service does not own, via cross-topic
+      subscriptions (LLD §10.1). Two event types are produced by Core / Org
+      & Membership on one topic; a third is produced by User Profile on a
+      second, distinct topic (Bug 2/DLG-D26):
         iam.membership.events -> MembershipRevoked        (filter: EventType IN [MembershipRevoked])
         iam.membership.events -> TenantMembershipsPurged  (filter: EventType IN [TenantMembershipsPurged])
+        iam.user.events       -> UserUpdated               (filter: EventType IN [user.updated])
       TenantMembershipsPurged was renamed from TenantOffboarded by Core
       specifically to avoid colliding with Realm Provisioner's own,
       differently-scoped TenantOffboarded event on iam.tenant.events, which
-      this service does NOT consume.
-      Drives the delegate-side removal cascade (§11.5) and tenant-lifecycle
-      cleanup (§11.6). Idempotent via processed_events keyed on the envelope
+      this service does NOT consume. UserUpdated's filter policy can only
+      match on EventType (dot-notation — User Profile's own convention,
+      unlike Core's PascalCase above), not payload content, so most
+      deliveries are unrelated field changes this service acks without
+      dispatching; only a decoded payload with status="disabled" reaches
+      CascadeService.EndForDisabledDelegate.
+      Drives the delegate-side removal cascade (§11.5), tenant-lifecycle
+      cleanup (§11.6), and the delegate-disabled cascade (§11.5a, Bug 2/2a).
+      Idempotent via processed_events keyed on the envelope
       id (UUID v7); a redelivery is a no-op. A message whose payload fails
       schema-decode is routed to the DLQ rather than retried indefinitely.
     security:
@@ -165,21 +177,24 @@ channels:
     address: iam.delegation.events
     description: |
       Single dedicated SNS topic this service publishes to (DLG-Q1) — one
-      topic, three event types, no RoutingPublisher.
+      topic, four event types (Bug 2a added DelegationEscalationRequested),
+      no RoutingPublisher.
     bindings:
       sns:
         name: iam-delegation-events
     messages:
-      DelegationStarted:         { $ref: '#/components/messages/DelegationStarted' }
-      DelegationEnded:           { $ref: '#/components/messages/DelegationEnded' }
-      DelegationReviewRequested: { $ref: '#/components/messages/DelegationReviewRequested' }
+      DelegationStarted:              { $ref: '#/components/messages/DelegationStarted' }
+      DelegationEnded:                { $ref: '#/components/messages/DelegationEnded' }
+      DelegationReviewRequested:      { $ref: '#/components/messages/DelegationReviewRequested' }
+      DelegationEscalationRequested:  { $ref: '#/components/messages/DelegationEscalationRequested' }
 
   iam/delegation/cascade:
     address: delegation-cascade-q
     description: |
       This service's own SQS queue (delegation-cascade-q), not a topic it
-      owns — subscribed to Core / Org & Membership's single SNS topic
-      (iam.membership.events) per LLD §10.1, filtered to two event types.
+      owns — subscribed to two upstream SNS topics per LLD §10.1: Core /
+      Org & Membership's iam.membership.events (two event types) and User
+      Profile's iam.user.events (one event type, Bug 2/DLG-D26).
       DLQ: delegation-cascade-q-dlq, maxReceiveCount=5.
     bindings:
       sqs:
@@ -187,8 +202,9 @@ channels:
           name: delegation-cascade-q
           fifoQueue: false
     messages:
-      MembershipRevoked: { $ref: '#/components/messages/MembershipRevoked' }
-      TenantMembershipsPurged:  { $ref: '#/components/messages/TenantMembershipsPurged' }
+      MembershipRevoked:       { $ref: '#/components/messages/MembershipRevoked' }
+      TenantMembershipsPurged: { $ref: '#/components/messages/TenantMembershipsPurged' }
+      UserUpdated:              { $ref: '#/components/messages/UserUpdated' }
 
 operations:
   publishDelegationEvents:
@@ -202,24 +218,29 @@ operations:
       - $ref: '#/channels/iam~1delegation~1events/messages/DelegationStarted'
       - $ref: '#/channels/iam~1delegation~1events/messages/DelegationEnded'
       - $ref: '#/channels/iam~1delegation~1events/messages/DelegationReviewRequested'
+      - $ref: '#/channels/iam~1delegation~1events/messages/DelegationEscalationRequested'
 
-  # ── Inbound operation — Core's removal/offboarding signals (LLD §10.1) ────
+  # ── Inbound operation — Core's removal/offboarding signals + User
+  # Profile's disabled-delegate signal (LLD §10.1, Bug 2/2a) ────────────────
   consumeDelegationCascade:
     action: receive
     channel:
       $ref: '#/channels/iam~1delegation~1cascade'
     tags:
       - $ref: '#/components/tags/consumed'
-    summary: Consume Core's removal/offboarding signals driving the delegate-side cascade
+    summary: Consume Core's removal/offboarding signals and User Profile's disabled-delegate signal driving the delegate-side cascade
     description: |
       Consumer: this service (iam-delegation).
-      Producer: Core / Org & Membership — both MembershipRevoked and
+      Producers: Core / Org & Membership — both MembershipRevoked and
         TenantMembershipsPurged are published on the same topic,
         iam.membership.events. TenantMembershipsPurged is Core's own
         tenant-scrub relay, renamed from TenantOffboarded to avoid
         colliding with Realm Provisioner's differently-scoped
         TenantOffboarded event on iam.tenant.events, which this service
-        does NOT consume.
+        does NOT consume. Additionally, User Profile publishes UserUpdated
+        on iam.user.events (Bug 2/DLG-D26) — a second, distinct upstream
+        topic feeding the same delegation-cascade-q queue via its own SNS
+        subscription.
       Queue: delegation-cascade-q | DLQ: delegation-cascade-q-dlq
         (maxReceiveCount=5).
 
@@ -230,6 +251,16 @@ operations:
         (DEL-7/DLG-EVT-4, §11.5).
       On TenantMembershipsPurged: CascadeService.ScrubTenant ends/cleans up every
         delegation row scoped to the tenant (§11.6).
+      On UserUpdated with payload.status="disabled" (all other UserUpdated
+        deliveries are acked without dispatch — the filter policy can only
+        match on EventType, not payload content): CascadeService.
+        EndForDisabledDelegate ends every active/scheduled delegation where
+        the disabled user is the delegate, emitting BOTH
+        DelegationEnded(ended_reason=delegate_disabled) AND
+        DelegationEscalationRequested per row (§11.5a, Bug 2/2a) —
+        deliberately without setting deleted_at (disabled ≠ removed) and
+        without a User Profile pointer-clear call (already done atomically
+        on User Profile's side before this event was even published).
 
       Idempotent via processed_events keyed on the envelope id (UUID v7); a
       redelivery is a no-op. A message whose payload fails schema-decode is
@@ -237,6 +268,7 @@ operations:
     messages:
       - $ref: '#/channels/iam~1delegation~1cascade/messages/MembershipRevoked'
       - $ref: '#/channels/iam~1delegation~1cascade/messages/TenantMembershipsPurged'
+      - $ref: '#/channels/iam~1delegation~1cascade/messages/UserUpdated'
 
 components:
   securitySchemes:
@@ -252,13 +284,16 @@ components:
       description: |
         This service is the producer. Emitted onto the iam.delegation.events
         SNS topic via the transactional outbox (DLG-EVT-1): DelegationStarted,
-        DelegationEnded, DelegationReviewRequested, and the publishDelegationEvents
-        send operation all carry this tag.
+        DelegationEnded, DelegationReviewRequested,
+        DelegationEscalationRequested (Bug 2a), and the
+        publishDelegationEvents send operation all carry this tag.
     consumed:
       name: consumed
       description: |
         This service is the consumer, not the producer, of MembershipRevoked
-        and TenantMembershipsPurged, both on iam.membership.events.
+        and TenantMembershipsPurged (both on iam.membership.events), and of
+        UserUpdated (on iam.user.events, Bug 2/DLG-D26 — a distinct
+        upstream topic, not iam.membership.events).
         Canonical schema ownership for anything tagged consumed sits with the
         producing service, not this file — treat these definitions as this
         service's consumer-side documentation (LLD §10.1), kept in sync with
@@ -384,6 +419,51 @@ components:
               dataType: String
               description: Dynamic — set from envelope.subject (the delegation_id).
 
+    DelegationEscalationRequested:
+      name: DelegationEscalationRequested
+      title: Delegation ended with no replacement — escalation needed (Bug 2a)
+      summary: |
+        Fired alongside DelegationEnded, in the same transaction, whenever
+        a delegation ends because the delegate was disabled
+        (ended_reason=delegate_disabled, §11.5a). This service owns no
+        org-structure data (no "supervisor"/"team lead" concept), so it
+        escalates to tenant_admin/tenant_owner — the only role it already
+        recognizes as escalation-capable (also notified on
+        DelegationReviewRequested, and the only role that can call DLG-5
+        Reassign). Notify-only: this service never auto-creates a
+        replacement delegation.
+      x-lifecycle:
+        status: active    # active | deprecated | retired
+      x-owner:
+        team: iam-team
+        slack: "#delegation-events"
+      tags:
+        - $ref: '#/components/tags/published'
+      contentType: application/json
+      traits:
+        - $ref: '#/components/messageTraits/glueWireFormat'
+      payload:
+        $ref: '#/components/schemas/DelegationEscalationRequestedPayload'
+      bindings:
+        sns:
+          messageAttributes:
+            EventType:
+              dataType: String
+              value: DelegationEscalationRequested
+              description: PascalCase event type — used by consumer SNS filter policies.
+            TenantID:
+              dataType: String
+              description: Dynamic — set from envelope.tenant_id at publish time.
+            Source:
+              dataType: String
+              value: iam-delegation
+            EventID:
+              dataType: String
+              description: Dynamic — RFC 4122 UUID v7 echoed from envelope.id.
+            Subject:
+              dataType: String
+              description: Dynamic — set from envelope.subject (the delegation_id).
+
     # ── Consumed messages (LLD §10.1) — producer is Core, not this service ──
     MembershipRevoked:
       name: MembershipRevoked
@@ -447,6 +527,42 @@ components:
               dataType: String
               description: Dynamic — envelope id, used as the processed_events dedup key.
 
+    UserUpdated:
+      name: UserUpdated
+      title: User profile fields changed (delegate-disable signal, Bug 2/DLG-D26)
+      summary: |
+        Consumed by this service (not published). Produced by User Profile
+        (iam-user-profile) on iam.user.events — a distinct topic from
+        Core's iam.membership.events above. This queue's filter policy can
+        only match on EventType ("user.updated", dot-notation — User
+        Profile's own convention), not payload content, so most
+        deliveries are unrelated field changes this service acks without
+        dispatching. Only a decoded payload with status="disabled" drives
+        CascadeService.EndForDisabledDelegate (§11.5a). Only the fields
+        this service actually reads are documented below — User Profile's
+        own contract carries more (email, other changed_fields).
+      tags:
+        - $ref: '#/components/tags/consumed'
+      contentType: application/json
+      payload:
+        $ref: '#/components/schemas/UserUpdatedPayload'
+      bindings:
+        sns:
+          messageAttributes:
+            EventType:
+              dataType: String
+              value: user.updated
+              description: Set by the producer (dot-notation). Matches this queue's SNS filter policy.
+            TenantID:
+              dataType: String
+              description: Dynamic — envelope.tenant_id. UserUpdatedPayload itself carries no tenant_id field.
+            Source:
+              dataType: String
+              description: Producing service identifier (iam-user-profile).
+            EventID:
+              dataType: String
+              description: Dynamic — envelope id, used as the processed_events dedup key.
+
   schemas:
     # Shared envelope fields (embedded in every published message)
     EventEnvelope:
@@ -478,6 +594,7 @@ components:
             scope_id:      { type: string, format: uuid, nullable: true }
             starts_at:     { type: string, format: date-time }
             ends_at:       { type: string, format: date-time, nullable: true }
+            actor_id:      { type: string, format: uuid, description: Who triggered this create/reassign — the requestctx caller, or a system sentinel on the create leg of an automated flow. }
 
     DelegationEndedPayload:
       allOf:
@@ -488,7 +605,10 @@ components:
             delegation_id: { type: string, format: uuid }
             delegator_id:  { type: string, format: uuid }
             delegate_id:   { type: string, format: uuid }
-            ended_reason:  { type: string, enum: [expired, cancelled, delegate_removed, review_expired] }  # review_expired added (DLG-Q5)
+            scope:         { type: string, enum: [all, department, tender] }
+            scope_id:      { type: string, format: uuid, nullable: true }
+            ended_reason:  { type: string, enum: [expired, cancelled, delegate_removed, review_expired, delegate_disabled] }  # review_expired added (DLG-Q5); delegate_disabled added (Bug 2/DLG-D26)
+            actor_id:      { type: string, format: uuid, description: Who triggered the end — the requestctx caller for cancel/reassign, or SystemActorID for cron/cascade-driven ends. }
 
     DelegationReviewRequestedPayload:
       allOf:
@@ -499,7 +619,24 @@ components:
             delegation_id: { type: string, format: uuid }
             delegator_id:  { type: string, format: uuid }
             delegate_id:   { type: string, format: uuid }
+            scope:         { type: string, enum: [all, department, tender] }
+            scope_id:      { type: string, format: uuid, nullable: true }
             days_remaining: { type: integer, enum: [3, 2, 1] }   # the 3-day daily cascade (DLG-Q6)
+            actor_id:      { type: string, format: uuid, description: Always SystemActorID — this only ever fires from the review-sweep cron. }
+
+    DelegationEscalationRequestedPayload:
+      allOf:
+        - $ref: '#/components/schemas/EventEnvelope'
+        - type: object
+          required: [delegation_id, delegator_id, delegate_id, reason]
+          properties:
+            delegation_id: { type: string, format: uuid }
+            delegator_id:  { type: string, format: uuid }
+            delegate_id:   { type: string, format: uuid, description: The now-disabled delegate whose grant just ended. }
+            scope:         { type: string, enum: [all, department, tender] }
+            scope_id:      { type: string, format: uuid, nullable: true }
+            reason:        { type: string, enum: [delegate_disabled] }   # Bug 2a — the only trigger this service currently recognizes
+            actor_id:      { type: string, format: uuid, description: Always SystemActorID — this only ever fires from the background delegate-disabled cascade, never a human action. }
 
     # ── Consumed payload schemas (LLD §10.1) — flat, no EventEnvelope allOf;
     # these mirror MembershipRevokedPayload/TenantMembershipsPurgedPayload exactly
@@ -518,3 +655,29 @@ components:
       properties:
         tenant_id: { type: string, format: uuid }
         actor_id:  { type: string, format: uuid, description: Who performed the offboarding. }
+
+    UserUpdatedPayload:
+      type: object
+      description: |
+        Flat, no EventEnvelope allOf — mirrors the subset of
+        iam-user-profile's UserUpdatedPayload this service actually reads
+        (internal/core/domain/event_payloads.go). No tenant_id field of its
+        own; this service uses the envelope's tenant_id instead. Carries no
+        Email field either — this service never reads it, even though
+        User Profile's own contract populates it when relevant.
+      required: [user_id, changed_fields]
+      properties:
+        user_id:        { type: string, format: uuid }
+        changed_fields:
+          type: array
+          items: { type: string }
+          description: Full enum lives in iam-user-profile's own asyncapi.yaml; this service only branches on "status" being present.
+        status:
+          type: string
+          enum: [active, disabled, deleted]
+          description: |
+            Populated only when "status" is in changed_fields (added to
+            iam-user-profile's contract for Bug 2/DLG-D26 specifically so
+            this service could react to it — changed_fields alone cannot
+            say what status changed TO). This service dispatches only on
+            "disabled".

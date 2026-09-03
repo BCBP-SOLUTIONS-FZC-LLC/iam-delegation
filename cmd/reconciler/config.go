@@ -14,6 +14,40 @@ func getEnv(key, fallback string) string {
 	return fallback
 }
 
+// resolveAppEnv matches iam-realm-provisioner's APP_ENV contract (the
+// value platform-gincommon's InitTracingFromEnv / logger.NewLogger read)
+// while still honoring this service's existing ENVIRONMENT var.
+func resolveAppEnv() string {
+	if v := os.Getenv("APP_ENV"); v != "" {
+		return v
+	}
+	switch getEnv("ENVIRONMENT", "development") {
+	case "development", "dev", "local":
+		return "dev"
+	default:
+		return getEnv("ENVIRONMENT", "production")
+	}
+}
+
+// ensureGincommonEnv fills the env vars InitTracingFromEnv / NewLogger
+// read so a CronJob that only sets ENVIRONMENT still exports traces
+// under iam-delegation-reconciler, matching iam-realm-provisioner's
+// reconciler (distinct service name from cmd/server).
+func ensureGincommonEnv() {
+	if os.Getenv("APP_ENV") == "" {
+		//nolint:errcheck // os.Setenv on the current process's own env cannot fail
+		_ = os.Setenv("APP_ENV", resolveAppEnv())
+	}
+	if os.Getenv("APP_NAME") == "" {
+		//nolint:errcheck // os.Setenv on the current process's own env cannot fail
+		_ = os.Setenv("APP_NAME", "iam-delegation-reconciler")
+	}
+	if os.Getenv("OTEL_SERVICE_NAME") == "" {
+		//nolint:errcheck // os.Setenv on the current process's own env cannot fail
+		_ = os.Setenv("OTEL_SERVICE_NAME", "iam-delegation-reconciler")
+	}
+}
+
 func getEnvDurationMS(key string, fallback time.Duration) (time.Duration, error) {
 	v := os.Getenv(key)
 	if v == "" {

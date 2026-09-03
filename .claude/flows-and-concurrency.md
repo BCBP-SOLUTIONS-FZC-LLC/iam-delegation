@@ -29,6 +29,26 @@ grounded in the actual code (`internal/core/service/*.go`, `cmd/reconciler/jobs/
 7. Idempotency record save and cache invalidation happen **after** the tx commits, best-effort
    (`//nolint:errcheck` — a failed idempotency-save must never fail an already-committed create).
 
+## Activation cron (`delegation-activation`, DLG-D25) — `jobs.Activation`
+
+Mirrors Expiry's shape exactly but runs the opposite transition, `scheduled → active`, closing the
+gap `Create` (above) opens: a genuinely future `starts_at` skips the User Profile call and
+`DelegationStarted` entirely at create time, inserting the row as `scheduled`.
+
+1. `ListScheduledBefore` finds rows `WHERE status='scheduled' AND starts_at <= now()`.
+2. Per row, User Profile's `SetAvailability` is called first (same availability-first ordering as
+   Create) — a failure leaves the row `scheduled`, increments
+   `iam_delegation_activation_deferred_total`, and retries next tick; it does **not** proceed to
+   activate on a UP failure, mirroring Expiry's defer-and-retry pattern exactly.
+3. Only on UP success does `Activate` run inside a tenant-GUC-bound tx (`UPDATE status='active'
+   WHERE status='scheduled' AND record_version=$expected`, then enqueue `DelegationStarted`) — the
+   optimistic-lock guard means a row that already raced to another terminal/active state returns
+   `nil`, not an error, counted toward neither `Succeeded` nor `Failed`.
+4. `OOOUntil` sent to User Profile is `d.EndsAt`, falling back to `d.ReviewDueAt` for open-ended
+   rows — the identical DLG-D29 fix applied at Create's own `SetAvailability` call site, found at
+   a second independent call site during a follow-up audit. Get this wrong here and an open-ended
+   scheduled delegation defers activation forever, resending the same rejected payload every tick.
+
 ## Cancel (DLG-3) — `DelegationService.Cancel`
 
 **Asymmetric with Create**: the User Profile call here is fail-open, not fail-closed. `SetAvailability`
@@ -88,14 +108,43 @@ the exact same implementation — not two independently-maintained code paths.
 
 ## Cascade removal — `CascadeService.EndForUser` (`MembershipRevoked`)
 
-Ends every row where the removed user is delegator OR delegate, inside one tx, but **event emission
-is asymmetric by design (DEL-7/DLG-EVT-4)**: only delegate-side rows get `DelegationEnded
-{delegate_removed}` enqueued — `if d.DelegateID != userID { continue }` skips enqueue entirely for
-delegator-side rows. Read this in `cascade_service.go` directly; it's easy to assume both sides fire
-an event. The User Profile pointer-clear for each affected delegator happens **after the tx commits**,
-outside the transaction, and is fire-and-forget (`//nolint:errcheck`) — the row is already ended and
-inert once the user has no membership (§7.6.5), so there's nothing to retry against; a failed clear
-here is not revisited by any cron (the expiry cron only scans still-*active* rows).
+Ends every row where the removed user is delegator OR delegate — **both `active` and `scheduled`
+rows** since DLG-D25 broadened the terminal-state check, so a scheduled delegation for a member who
+leaves before `starts_at` is cancelled rather than left to activate against a departed member —
+inside one tx, but **event emission is asymmetric by design (DEL-7/DLG-EVT-4)**: only delegate-side
+rows get `DelegationEnded{delegate_removed}` enqueued — `if d.DelegateID != userID { continue }`
+skips enqueue entirely for delegator-side rows. Read this in `cascade_service.go` directly; it's
+easy to assume both sides fire an event. The User Profile pointer-clear for each affected delegator
+happens **after the tx commits**, outside the transaction, and is fire-and-forget
+(`//nolint:errcheck`) — the row is already ended and inert once the user has no membership (§7.6.5),
+so there's nothing to retry against; a failed clear here is not revisited by any cron (the expiry
+cron only scans still-*active* rows).
+
+## Cascade removal — `CascadeService.EndForDisabledDelegate` (`UserUpdated{status:disabled}`, Bug 2/DLG-D26)
+
+**A separate inbound signal from `EndForUser` above, not a variant of it** — "disabled" is a status
+flip within the tenant, not a departure, so this reacts to a different upstream topic
+(`iam.user.events`, User Profile) via a second SNS subscription onto the same `delegation-cascade-q`.
+`CascadeConsumer.Handle` decodes every `UserUpdated` delivery and dispatches only when
+`status == "disabled"` — the SNS filter policy can only match on `EventType`, not payload content,
+so most deliveries are unrelated field changes that get acked without dispatch, not an error.
+
+Ends every active/scheduled delegation where the disabled user is the **delegate** (never the
+delegator — a disabled delegator's own OOO state is User Profile's concern, not this service's) —
+`deleted_at` is deliberately **left unset** (unlike `EndForUser`'s hard soft-delete): the user is
+still a tenant member, so the row stays a normal historical record. **No User Profile pointer-clear
+call is made** — User Profile's own disable flow already clears the delegate pointer atomically,
+inside the same transaction that publishes the very `UserUpdated` event this consumer reacts to, so
+by the time it's seen, User Profile's side is guaranteed done; calling `SetAvailability` again here
+would be redundant, not a missing safety net.
+
+Every ended row here enqueues **both** `DelegationEnded{delegate_disabled}` and
+`DelegationEscalationRequested{delegate_disabled}` in the same per-row transaction (Bug 2a/DLG-D27)
+— unlike `EndForUser`'s delegator-side silence (DLG-EVT-4), there is no silent side here: every row
+is delegate-side by construction, so both events always fire together. **Pre-deploy gap:** the
+`iam.user.events` SNS subscription this flow depends on is documented but not yet provisioned in any
+environment — this code path is fully implemented and tested but will never run until platform/infra
+adds it.
 
 ## Cascade removal — `CascadeService.ScrubTenant` (`TenantMembershipsPurged`)
 
@@ -124,16 +173,17 @@ error — a concurrent admin cancel or another tick already reached the desired 
 ## Transaction discipline
 
 Every write that emits an event goes through `port.TxRunner.RunInTx`, backed by
-`pgcommon.RunInTx` (`internal/adapter/outbound/postgres/db.go`). **This repo has no
-`RunInTxWithRetry`-equivalent** — unlike some sibling services, there is no automatic retry on
-Postgres serialization failures (`40001`/`40P01`); a serialization conflict surfaces as a plain error
-to the caller. Don't assume retry-on-conflict semantics exist here without adding them.
+`pgcommon.RunInTxWithRetryOpts` (`internal/adapter/outbound/postgres/db.go`, DLG-D32,
+matching `iam-realm-provisioner`). Deadlock (`40P01`) and serialization failure (`40001`)
+retry up to 3 times with exponential backoff + jitter (10ms–500ms). Nested `withPool`
+joins (already inside a tx) do not retry — the outer `TxRunner` owns the attempt.
 
 ## Shutdown ordering (`cmd/server/main.go`)
 
-The real order, inside an `errgroup` with one goroutine per: outbox runner, SQS consumer, the
-outbox-prune sweep (DLG-D24), HTTP server, and a shutdown-trigger goroutine that fires on
-`gCtx.Done()`:
+The real order, inside an `errgroup` with **six** real background goroutines — outbox runner, SQS
+consumer, the outbox-prune sweep (DLG-D24), the `iam_delegation_active_gauge` exporter
+(`runActiveGaugeExporter`, `cmd/server/exporters.go`), the HTTP API server, and a dedicated
+`:METRICS_PORT` metrics server — plus a shutdown-trigger goroutine that fires on `gCtx.Done()`:
 
 1. `httpServer.Shutdown(shutdownCtx)` — stop accepting new requests, drain in-flight (30s budget).
    `shutdownCtx` is deliberately built from `context.Background()`, not derived from `gCtx` (which is
@@ -142,12 +192,16 @@ outbox-prune sweep (DLG-D24), HTTP server, and a shutdown-trigger goroutine that
 3. `sqsConsumer.Stop()` — wait for in-flight cascade-consumer handlers.
 4. `g.Wait()` returns → the deferred `redisClient.Close()` in `run()` fires last.
 
-The outbox-prune goroutine has no explicit `Stop()` call in step 1-3: it's a plain
-`select { case <-gCtx.Done(): return nil; case <-ticker.C: ... }` loop, so it exits on its own the
-moment `gCtx` cancels (before the shutdown-trigger goroutine even starts running its steps) — there
-is nothing in-flight for it to drain, unlike the outbox runner/SQS consumer's explicit `Stop()`s.
+The outbox-prune goroutine and the active-gauge exporter both have no explicit `Stop()` call in
+step 1-3: each is a plain `select { case <-gCtx.Done(): return nil; case <-ticker.C: ... }` loop, so
+both exit on their own the moment `gCtx` cancels (before the shutdown-trigger goroutine even starts
+running its steps) — there is nothing in-flight for either to drain, unlike the outbox
+runner/SQS consumer's explicit `Stop()`s. The dedicated metrics server is a second `http.Server`
+with no drain call of its own in this sequence either — it is expected to be scraped, not to serve
+in-flight request bodies that need draining the way the API listener does.
 
-Since DLG-D24, this repo *does* have one long-running background sweep goroutine inside
-`cmd/server` (the outbox-prune sweep, matching `iam-user-profile`'s `runMaintenanceSweep`) — but
-expiry/review/cleanup are still cron-triggered externally (CronJob → HTTP or CronJob binary), not
-long-running goroutines inside `cmd/server`; only the outbox prune runs as a `cmd/server` ticker.
+Since DLG-D24/DLG-D31, this repo has **two** long-running background sweep/exporter goroutines
+inside `cmd/server` beyond the outbox runner and SQS consumer (the outbox-prune sweep, matching
+`iam-user-profile`'s `runMaintenanceSweep`, and the active-gauge exporter) — but
+activation/expiry/review/cleanup are still cron-triggered externally (CronJob → HTTP or CronJob
+binary), not long-running goroutines inside `cmd/server`.

@@ -10,11 +10,11 @@
 # Prometheus --rule-files directory) in environments not installing this
 # service via the Helm chart; keep both in sync when adding a new alert.
 #
-# Labels on all HTTP metrics (from platform-gincommon):
-#   service  — "iam-delegation"
-#   method   — HTTP method
-#   path     — route pattern (e.g. /api/v1/delegations/:id)
-#   status   — HTTP status code
+# Labels on all HTTP metrics (from platform-gincommon v1.3.0):
+#   method        — HTTP method
+#   route         — route pattern (e.g. /api/v1/delegations/:id)
+#   status_class  — "2xx" | "3xx" (3xx bucketed as 2xx) | "4xx" | "5xx"
+#   error_class   — "success" | "client_error" | "server_error"
 
 groups:
   - name: iam_delegation_availability
@@ -56,9 +56,9 @@ groups:
       # ── HTTP 5xx error rate ───────────────────────────────────────────────────
       - alert: IAMDelegationHighErrorRate
         expr: |
-          sum(rate(http_requests_total{job="iam-delegation", status=~"5.."}[5m]))
+          sum(rate(http_requests_total{job="iam-delegation", status_class="5xx"}[5m]))
             /
-          sum(rate(http_requests_total{job="iam-delegation"}[5m]))
+          clamp_min(sum(rate(http_requests_total{job="iam-delegation"}[5m])), 0.001)
           > 0.05
         for: 5m
         labels:
@@ -75,9 +75,9 @@ groups:
       # ── HTTP 5xx error rate — critical ────────────────────────────────────────
       - alert: IAMDelegationCriticalErrorRate
         expr: |
-          sum(rate(http_requests_total{job="iam-delegation", status=~"5.."}[5m]))
+          sum(rate(http_requests_total{job="iam-delegation", status_class="5xx"}[5m]))
             /
-          sum(rate(http_requests_total{job="iam-delegation"}[5m]))
+          clamp_min(sum(rate(http_requests_total{job="iam-delegation"}[5m])), 0.001)
           > 0.20
         for: 2m
         labels:
@@ -131,6 +131,27 @@ groups:
             delegate pointer via User Profile for at least 30 minutes
             (DEL-6 fail-open defer). Rows stay active past their ends_at
             until this clears. Check iam-user-profile health.
+
+      # ── DLG-D25 availability-first activation deferrals sustained (added
+      #    alongside the delegation-activation CronJob; without it a stuck
+      #    iam-user-profile leaves `scheduled` delegations un-activated
+      #    forever with no page) ────────────────────────────────────────────
+      - alert: IAMDelegationActivationDeferredSustained
+        expr: |
+          increase(iam_delegation_activation_deferred_total[30m]) > 0
+        for: 30m
+        labels:
+          severity: warning
+          team: platform
+        annotations:
+          summary: iam-delegation activation cron is deferring rows (User Profile unreachable)
+          description: >-
+            The delegation-activation CronJob (DLG-D25) has been unable to
+            call SetAvailability via User Profile for at least 30 minutes.
+            Delegations past starts_at are stuck in `scheduled` — the
+            delegator is not shown OOO and the delegate is not routed work,
+            even though the leave has actually begun. Check iam-user-profile
+            health.
 
       - alert: IAMDelegationReviewDeferredSustained
         expr: |
@@ -194,7 +215,7 @@ groups:
         expr: |
           sum(rate(iam_delegation_membership_check_failures_total[5m]))
             /
-          sum(rate(iam_delegation_membership_check_duration_seconds_count[5m]))
+          clamp_min(sum(rate(iam_delegation_membership_check_duration_seconds_count[5m])), 0.001)
           > 0.05
         for: 5m
         labels:

@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
-# Extracts the RELEASE_TAG section from CHANGELOG.md and appends metadata
-# for the published image (one image carries both binaries — server +
-# reconciler, per the repo-root Dockerfile).
+# Extracts RELEASE_TAG section from CHANGELOG.md and appends image metadata
+# (one image carries both binaries — server + reconciler, per the repo-root
+# Dockerfile).
 set -euo pipefail
 
 : "${RELEASE_TAG:?RELEASE_TAG is required}"

@@ -1,25 +1,23 @@
 // Package postgres is the outbound Postgres adapter: the RLS-scoped
 // delegation_app connection pool, the TxRunner that wraps
-// pgcommon.RunInTx and binds a tx-scoped port.EventPublisher into context,
-// and the DelegationRepository / SettingsRepository implementations.
+// pgcommon.RunInTx and injects port.EventPublisher into context,
+// and the DelegationRepository / SettingsRepository / GaugeRepository implementations.
 package postgres
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
+	"strings"
 	"time"
 
 	"github.com/BCBP-SOLUTIONS-FZC-LLC/iam-delegation/internal/core/domain"
 	"github.com/BCBP-SOLUTIONS-FZC-LLC/iam-delegation/internal/core/port"
-	"github.com/BCBP-SOLUTIONS-FZC-LLC/platform-events/pkg/events"
-	"github.com/BCBP-SOLUTIONS-FZC-LLC/platform-events/pkg/outbox"
 	"github.com/BCBP-SOLUTIONS-FZC-LLC/platform-pgcommon/pkg/pgcommon"
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
-	"github.com/jackc/pgx/v5/pgconn"
+	"github.com/jackc/puddle/v2"
 )
 
 // DSNFromEnv builds a PostgreSQL connection URL for the application pool by
@@ -53,18 +51,49 @@ func DSNFromEnv() string {
 // (e.g. "5s", "500ms"). This has no pgcommon equivalent — pgcommon.Config has
 // no statement-timeout field — so it remains a small extension layered on
 // top of the pgcommon-built DSN rather than a full DSN builder. Ignored when
-// dsn is empty or PG_STATEMENT_TIMEOUT is unset.
+// dsn is empty or PG_STATEMENT_TIMEOUT is unset. Idempotent: a DSN that
+// already carries statement_timeout is returned unchanged.
 func ApplyStatementTimeout(dsn string) string {
 	if dsn == "" {
 		return dsn
 	}
 	if t := os.Getenv("PG_STATEMENT_TIMEOUT"); t != "" {
 		if d, err := time.ParseDuration(t); err == nil && d > 0 {
-			// PostgreSQL expects milliseconds as an integer.
+			if strings.Contains(dsn, "statement_timeout") {
+				return dsn
+			}
 			dsn += fmt.Sprintf("&options=-c%%20statement_timeout%%3D%d", d.Milliseconds())
 		}
 	}
 	return dsn
+}
+
+// SystemPoolConfig returns pgcommon.Config for the BYPASSRLS system pool
+// (LLD §7.2.3), matching iam-user-profile. The system pool deliberately has
+// no GUCProvider — cross-tenant reconciler/sweep queries run under a
+// BYPASSRLS role — but still connects through PgBouncer in production, so
+// PGBouncerMode is forced true unconditionally (SimpleProtocol + MinConns:0).
+// A bare pgcommon.Config{DSN, Logger} literal would leave PGBouncerMode at
+// the Go zero-value false and drop ConfigFromEnv pool sizing, breaking
+// transaction-pooling deployments even when the app pool correctly reads
+// PG_BOUNCER_MODE.
+//
+// Pool sizing, lifetimes, and SlowQueryThreshold are copied from
+// ConfigFromEnv so sysPool and the app pool share one env-driven source
+// of truth. Tracer is left unset — call sites wire NewOTelTracer so
+// db.query spans export through gincommon's TracerProvider.
+func SystemPoolConfig(dsn string, log Logger) pgcommon.Config {
+	cfg, _ := pgcommon.ConfigFromEnv()
+	cfg.DSN = ApplyStatementTimeout(dsn)
+	cfg.GUCProvider = nil
+	cfg.PGBouncerMode = true
+	cfg.Tracer = nil
+	if log != nil {
+		cfg.Logger = NewLoggerAdapter(log)
+	} else {
+		cfg.Logger = nil
+	}
+	return cfg
 }
 
 // SystemDSNFromEnv returns the DSN to use for the delegation_migrator
@@ -96,7 +125,7 @@ func SystemDSNFromEnv() string {
 // identical MigrationDSNFromEnv.
 func MigrationDSNFromEnv() string {
 	if dsn := os.Getenv("MIGRATION_DATABASE_URL"); dsn != "" {
-		return dsn
+		return ApplyStatementTimeout(dsn)
 	}
 	return DSNFromEnv()
 }
@@ -120,90 +149,60 @@ func WithTenantGUC(ctx context.Context, tenantID uuid.UUID, userID string) conte
 // TxRunner implements port.TxRunner over pgcommon.RunInTx. Inside the
 // callback it binds the active pgx.Tx into context (so repository methods
 // called via port.DelegationRepository/SettingsRepository join the same
-// transaction rather than opening a new one) and binds a tx-scoped
-// port.EventPublisher via port.WithEventPublisher so service code can
+// transaction rather than opening a new one) and, when a publisher is
+// provided, binds it via port.WithEventPublisher so service code can
 // enqueue events atomically with the state change (DLG-EVT-1) without ever
 // importing this package or touching pgx.Tx directly.
+// Matching iam-realm-provisioner: postgres does not import platform-events;
+// eventbus.Publisher reads the tx via TxFromContext and calls outbox.Enqueue.
 type TxRunner struct {
-	pool      *pgcommon.Pool
-	validator PayloadValidator
+	pool   *pgcommon.Pool
+	events port.EventPublisher
 }
 
 var _ port.TxRunner = (*TxRunner)(nil)
 
-// PayloadValidator validates an event payload against its registered JSON
-// Schema before it is written to the outbox (LLD §10.3.1: "validated
-// against the registered schema" at enqueue time). Satisfied by
-// *eventbus.SchemaValidator, injected via NewTxRunner rather than imported
-// directly so this package doesn't depend on eventbus (Clean Architecture —
-// both are outbound adapters, neither should import the other; cmd/server
-// wires the concrete type). Nil skips validation.
-type PayloadValidator interface {
-	Validate(ctx context.Context, eventType string, payload json.RawMessage) error
+// writeRetryOpts is pgcommon's documented high-throughput OLTP preset.
+// Deadlock (40P01) and serialization failure (40001) retry with exponential
+// backoff + jitter. Nested withPool joins (already inside a tx) do not
+// retry — the outer TxRunner owns the attempt. Matching iam-realm-provisioner.
+var writeRetryOpts = pgcommon.RetryOptions{
+	MaxAttempts:    3,
+	InitialWait:    10 * time.Millisecond,
+	MaxWait:        500 * time.Millisecond,
+	Multiplier:     2.0,
+	JitterFraction: 0.25,
 }
 
-// NewTxRunner builds a TxRunner over pool, validating every enqueued
-// event's payload with validator (nil skips validation).
-func NewTxRunner(pool *pgcommon.Pool, validator PayloadValidator) *TxRunner {
-	return &TxRunner{pool: pool, validator: validator}
+// NewTxRunner constructs a TxRunner. Pass nil for events during bootstrap
+// paths where no outbox writes occur. Matching iam-realm-provisioner.
+func NewTxRunner(pool *pgcommon.Pool, events port.EventPublisher) *TxRunner {
+	return &TxRunner{pool: pool, events: events}
 }
 
 // RunInTx implements port.TxRunner (see the TxRunner doc comment above).
+// Contended writes retry via pgcommon.RunInTxWithRetryOpts on deadlock /
+// serialization failure (iam-realm-provisioner).
 func (r *TxRunner) RunInTx(ctx context.Context, fn func(ctx context.Context) error) error {
-	return wrapConnErr(pgcommon.RunInTx(ctx, r.pool, pgx.TxOptions{}, func(ctx context.Context, tx pgx.Tx) error {
-		txCtx := withTx(ctx, tx)
-		txCtx = port.WithEventPublisher(txCtx, &txBoundPublisher{tx: tx, validator: r.validator})
+	return wrapConnErr(pgcommon.RunInTxWithRetryOpts(ctx, r.pool, pgx.TxOptions{}, writeRetryOpts, func(ctx context.Context, tx pgx.Tx) error {
+		txCtx := WithTx(ctx, tx)
+		if r.events != nil {
+			txCtx = port.WithEventPublisher(txCtx, r.events)
+		}
 		return fn(txCtx)
 	}))
 }
 
-// txBoundPublisher is the port.EventPublisher bound into ctx by TxRunner for
-// the lifetime of one transaction. EnqueueCtx JSON-marshals evt.Data itself
-// (plain JSON at enqueue time — the Glue codec, if any, is a publish-time
-// concern that lives in a different package) and writes the resulting
-// envelope into outbox_events within the caller's active pgx.Tx via
-// outbox.Enqueue, atomic with the surrounding state change.
-type txBoundPublisher struct {
-	tx        pgx.Tx
-	validator PayloadValidator
-}
-
-func (p *txBoundPublisher) EnqueueCtx(ctx context.Context, evt *domain.DomainEvent) error {
-	payload, err := json.Marshal(evt.Data)
-	if err != nil {
-		return fmt.Errorf("marshal event payload: %w", err)
-	}
-	if p.validator != nil {
-		if err := p.validator.Validate(ctx, evt.Type, payload); err != nil {
-			return fmt.Errorf("event payload failed schema validation: %w", err)
-		}
-	}
-	env := events.NewEnvelope(
-		evt.Type,
-		domain.Source,
-		json.RawMessage(payload),
-		events.WithTenantID(evt.TenantID.String()),
-		events.WithSchemaVersion("1"),
-		events.WithTraceID(events.TraceIDFromContext(ctx)),
-		events.WithActor(evt.Actor),
-		events.WithIPAddress(evt.IPAddress),
-		events.WithUserAgent(evt.UserAgent),
-		events.WithSubject(evt.Subject),
-	)
-	return outbox.Enqueue(ctx, p.tx, env)
-}
-
-// txKey stores the active pgx.Tx opened by TxRunner.RunInTx in context so
-// repository methods can join it instead of opening a second, independent
-// transaction (which would deadlock or, worse, silently split one logical
-// unit of work across two DB transactions).
 type txKey struct{}
 
-func withTx(ctx context.Context, tx pgx.Tx) context.Context {
+// WithTx stores the active pgx.Tx in ctx so repository withPool joins and
+// EventPublisher.Enqueue writes the outbox on the same transaction.
+func WithTx(ctx context.Context, tx pgx.Tx) context.Context {
 	return context.WithValue(ctx, txKey{}, tx)
 }
 
-func txFromContext(ctx context.Context) (pgx.Tx, bool) {
+// TxFromContext retrieves the active pgx.Tx set by RunInTx, if any.
+func TxFromContext(ctx context.Context) (pgx.Tx, bool) {
 	tx, ok := ctx.Value(txKey{}).(pgx.Tx)
 	return tx, ok
 }
@@ -212,7 +211,7 @@ func txFromContext(ctx context.Context) (pgx.Tx, bool) {
 // no tx is bound (a plain read-only call outside a TxRunner.RunInTx
 // closure), opens a short-lived transaction of its own via pgcommon.RunInTx.
 func withPool(ctx context.Context, pool *pgcommon.Pool, fn func(pgx.Tx) error) error {
-	if tx, ok := txFromContext(ctx); ok {
+	if tx, ok := TxFromContext(ctx); ok {
 		return wrapConnErr(fn(tx))
 	}
 	return wrapConnErr(pgcommon.RunInTx(ctx, pool, pgx.TxOptions{}, func(_ context.Context, tx pgx.Tx) error {
@@ -220,12 +219,18 @@ func withPool(ctx context.Context, pool *pgcommon.Pool, fn func(pgx.Tx) error) e
 	}))
 }
 
-// wrapConnErr converts connectivity failures (network unreachable, pool
-// exhausted, TLS handshake) to port.ErrDependencyUnavailable so service code
-// can distinguish "the database is down" from a SQL-level rejection.
-// *domain.Error, *pgconn.PgError (a real SQL error the server returned),
-// pgx.ErrNoRows, and context cancellation/deadline errors all pass through
-// unchanged — none of those are connectivity failures.
+// wrapConnErr converts non-protocol database errors into
+// domain.ErrDBUnavailable (503). SQL-protocol errors that are not
+// connectivity/resource classes pass through so the service layer can
+// distinguish an integrity violation from a network outage.
+//
+// SQLSTATE class 08 (connection exception), 53 (insufficient resources),
+// 57 (operator intervention) and 58 (system error) are remapped here so
+// HTTP HandleError never needs to inspect a raw *pgconn.PgError.
+// puddle.ErrClosedPool is the other positively-identifiable connectivity
+// failure. Everything else — including a plain Go error a caller's own
+// RunInTx/withPool callback returns — passes through unchanged.
+// Matching iam-realm-provisioner (pgcommon v1.3.0 helpers).
 func wrapConnErr(err error) error {
 	if err == nil {
 		return nil
@@ -234,15 +239,20 @@ func wrapConnErr(err error) error {
 	if errors.As(err, &de) {
 		return err
 	}
-	var pgErr *pgconn.PgError
-	if errors.As(err, &pgErr) {
-		return err
+	if pgcommon.IsConnectionException(err) || pgcommon.IsInsufficientResources(err) || isOperatorOrSystemErrorSQLState(err) || errors.Is(err, puddle.ErrClosedPool) {
+		return domain.NewError(domain.ErrDBUnavailable, "database unavailable")
 	}
-	if errors.Is(err, pgx.ErrNoRows) {
-		return err
+	return err
+}
+
+// isOperatorOrSystemErrorSQLState reports whether err is a Postgres error
+// in SQLSTATE class 57 or 58. pgcommon v1.3.0 has dedicated helpers for
+// 08/53 but not these two; we classify via the pgconn Error() text
+// ("… (SQLSTATE 57P01)") so this package never imports pgconn.
+func isOperatorOrSystemErrorSQLState(err error) bool {
+	if !pgcommon.IsPgError(err) {
+		return false
 	}
-	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
-		return err
-	}
-	return fmt.Errorf("%w: %s", port.ErrDependencyUnavailable, err.Error())
+	msg := err.Error()
+	return strings.Contains(msg, "SQLSTATE 57") || strings.Contains(msg, "SQLSTATE 58")
 }

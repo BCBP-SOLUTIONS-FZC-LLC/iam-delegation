@@ -6,19 +6,23 @@
 #
 #   OUTBOUND (this service publishes):
 #   - iam-delegation-events SNS topic — DelegationStarted, DelegationEnded,
-#     DelegationReviewRequested via platform-events transactional outbox (§10.4)
+#     DelegationReviewRequested, DelegationEscalationRequested (Bug 2a) via
+#     platform-events transactional outbox (§10.4)
 #
 #   DOWNSTREAM SUBSCRIBERS (owned by other services; created here for local dev):
 #   - delegation-workflow-q / -dlq      — Workflow Service
-#       filter: EventType IN [DelegationStarted, DelegationEnded]
+#       filter: EventType IN [DelegationStarted, DelegationEnded, DelegationEscalationRequested]
 #   - delegation-notification-q / -dlq  — Notification Service
-#       filter: EventType IN [DelegationStarted, DelegationEnded, DelegationReviewRequested]
+#       filter: EventType IN [DelegationStarted, DelegationEnded, DelegationReviewRequested, DelegationEscalationRequested]
 #   - delegation-audit-q / -dlq         — Audit Log Service
-#       filter: none (receives all three types)
+#       filter: none (receives all four types)
 #
 #   INBOUND (this service consumes):
-#   - delegation-cascade-q / -dlq       — MembershipRevoked, TenantOffboarded
-#       (published by iam-org-membership; send directly to exercise the consumer)
+#   - delegation-cascade-q / -dlq       — MembershipRevoked, TenantMembershipsPurged
+#       (published by iam-org-membership) and UserUpdated (published by
+#       iam-user-profile, Bug 2/DLG-D26, a second upstream topic feeding the
+#       same queue) — send directly to exercise the consumer, no SNS
+#       subscription is modeled by this script for the inbound side
 #
 #   To send a test message to the inbound queue:
 #     awslocal sqs send-message --queue-url <cascade-q-url> --message-body \
@@ -52,9 +56,10 @@ if awslocal glue create-registry --registry-name iam-delegation-events 2>/dev/nu
       --schema-definition "$(cat "$FILE")"
     echo "Glue schema $NAME created (from $(basename "$FILE"))"
   }
-  register_schema "${SCHEMA_DIR}/delegation_started.json"          DelegationStarted
-  register_schema "${SCHEMA_DIR}/delegation_ended.json"            DelegationEnded
-  register_schema "${SCHEMA_DIR}/delegation_review_requested.json" DelegationReviewRequested
+  register_schema "${SCHEMA_DIR}/delegation_started.json"              DelegationStarted
+  register_schema "${SCHEMA_DIR}/delegation_ended.json"                DelegationEnded
+  register_schema "${SCHEMA_DIR}/delegation_review_requested.json"     DelegationReviewRequested
+  register_schema "${SCHEMA_DIR}/delegation_escalation_requested.json" DelegationEscalationRequested
 else
   echo "Glue not available — skipping registry setup (GLUE_REGISTRY_NAME must remain empty)"
 fi
@@ -132,15 +137,20 @@ provision_queue "delegation-cascade-q"
 echo ""
 echo "==> Downstream subscribers (Workflow, Notification, Audit):"
 
-# Workflow Service — reroute on DelegationStarted, restore on DelegationEnded
+# Workflow Service — reroute on DelegationStarted, restore on DelegationEnded;
+# DelegationEscalationRequested (Bug 2a) is this service's hook for Workflow
+# to build a hold/escalate fallback on — not yet consumed as of this
+# revision (tracked as a cross-team dependency, LLD §11.5b), included here
+# for local-dev parity with api/asyncapi.yaml's documented fan-out anyway.
 provision_subscriber "delegation-workflow-q" \
-  '{"EventType":["DelegationStarted","DelegationEnded"]}'
+  '{"EventType":["DelegationStarted","DelegationEnded","DelegationEscalationRequested"]}'
 
-# Notification Service — all lifecycle events including review warnings
+# Notification Service — all lifecycle events including review warnings and
+# delegate-disable escalations (Bug 2a, tenant_admin/tenant_owner only)
 provision_subscriber "delegation-notification-q" \
-  '{"EventType":["DelegationStarted","DelegationEnded","DelegationReviewRequested"]}'
+  '{"EventType":["DelegationStarted","DelegationEnded","DelegationReviewRequested","DelegationEscalationRequested"]}'
 
-# Audit Log — all three event types, no filter (immutable audit trail)
+# Audit Log — all four event types, no filter (immutable audit trail)
 provision_subscriber "delegation-audit-q" ""
 
 echo ""
@@ -148,7 +158,7 @@ echo "LocalStack init complete."
 echo ""
 echo "Resources:"
 echo "  SNS topic  : $TOPIC_ARN"
-echo "  Inbound  q : delegation-cascade-q  (MembershipRevoked / TenantOffboarded)"
-echo "  Subscriber : delegation-workflow-q      (DelegationStarted, DelegationEnded)"
-echo "  Subscriber : delegation-notification-q  (DelegationStarted, DelegationEnded, DelegationReviewRequested)"
+echo "  Inbound  q : delegation-cascade-q  (MembershipRevoked / TenantMembershipsPurged / UserUpdated)"
+echo "  Subscriber : delegation-workflow-q      (DelegationStarted, DelegationEnded, DelegationEscalationRequested)"
+echo "  Subscriber : delegation-notification-q  (DelegationStarted, DelegationEnded, DelegationReviewRequested, DelegationEscalationRequested)"
 echo "  Subscriber : delegation-audit-q         (all events — no filter)"

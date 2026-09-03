@@ -8,6 +8,7 @@ import (
 
 	"github.com/BCBP-SOLUTIONS-FZC-LLC/iam-delegation/internal/core/domain"
 	"github.com/BCBP-SOLUTIONS-FZC-LLC/iam-delegation/internal/core/port"
+	"github.com/BCBP-SOLUTIONS-FZC-LLC/iam-delegation/pkg/requestctx"
 	"github.com/google/uuid"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -392,6 +393,71 @@ func TestDelegationService_Create_HappyPath(t *testing.T) {
 	assert.WithinDuration(t, got.StartsAt, payload.StartsAt, time.Second)
 }
 
+// TestDelegationService_Create_OpenEnded_SendsReviewDueAtAsOOOUntil is a
+// regression test for a confirmed cross-service bug: open-ended delegations
+// (EndsAt == nil, DEL-8 — DLG-4 Extend's and DLG-I2's entire reason for
+// existing, not an edge case) used to send OOOUntil: nil to User Profile.
+// User Profile's real ValidateOOOWindow unconditionally requires ooo_until
+// whenever status="ooo" (reproduced directly against the real HTTP handler
+// in iam-user-profile's TestPutAvailability_OOO_NoUntil_IamSystemCaller_
+// ReproducesOpenEndedDelegationCreateFailure — 422 "ooo_until is required
+// when status is ooo") — so every open-ended Create silently failed in
+// production while this repo's own fake UserProfileClient let it pass.
+// Fixed by sending the already-computed review_due_at as OOOUntil instead.
+func TestDelegationService_Create_OpenEnded_SendsReviewDueAtAsOOOUntil(t *testing.T) {
+	h := newDelegationHarness()
+	tenantID, delegatorID := uuid.New(), uuid.New()
+	req := validCreateInput() // EndsAt is nil — open-ended, per validCreateInput's own doc comment
+	h.activeBoth(delegatorID, req.DelegateID)
+
+	before := time.Now().UTC()
+	got, err := h.svc.Create(context.Background(), tenantID, delegatorID, "", req)
+	require.NoError(t, err)
+	require.NotNil(t, got)
+
+	require.Len(t, h.up.calls, 1)
+	upCall := h.up.calls[0]
+	require.NotNil(t, upCall.OOOUntil,
+		"OOOUntil must never be nil when Status is ooo — User Profile's real "+
+			"ValidateOOOWindow rejects that combination unconditionally")
+	settings := domain.DefaultDelegationTenantSettings(tenantID)
+	wantUntil := before.Add(time.Duration(settings.ReviewWindowDays) * 24 * time.Hour)
+	assert.WithinDuration(t, wantUntil, *upCall.OOOUntil, 5*time.Second,
+		"OOOUntil must equal starts_at + tenant review_window_days (the same value stored as review_due_at)")
+
+	// The stored row's own review_due_at must match what was sent to UP —
+	// both must stay in sync, or Extend (which re-syncs from the stored
+	// value) would silently diverge from what UP actually has.
+	require.Len(t, h.repo.insertCalls, 1)
+	require.NotNil(t, h.repo.insertCalls[0].ReviewDueAt)
+	assert.True(t, upCall.OOOUntil.Equal(*h.repo.insertCalls[0].ReviewDueAt),
+		"the ooo_until sent to User Profile must be the exact same value stored as review_due_at")
+}
+
+// TestDelegationService_Create_FixedEnd_StillSendsEndsAtAsOOOUntil confirms
+// the open-ended fix above didn't regress the ordinary fixed-end case: UP
+// still gets the delegation's real ends_at, not review_due_at (which is nil
+// for a fixed-end delegation in the first place — only open-ended rows get
+// a review_due_at at all).
+func TestDelegationService_Create_FixedEnd_StillSendsEndsAtAsOOOUntil(t *testing.T) {
+	h := newDelegationHarness()
+	tenantID, delegatorID := uuid.New(), uuid.New()
+	req := validCreateInput()
+	endsAt := time.Now().UTC().Add(48 * time.Hour)
+	req.EndsAt = &endsAt
+	h.activeBoth(delegatorID, req.DelegateID)
+
+	_, err := h.svc.Create(context.Background(), tenantID, delegatorID, "", req)
+	require.NoError(t, err)
+
+	require.Len(t, h.up.calls, 1)
+	require.NotNil(t, h.up.calls[0].OOOUntil)
+	assert.True(t, endsAt.Equal(*h.up.calls[0].OOOUntil))
+
+	require.Len(t, h.repo.insertCalls, 1)
+	assert.Nil(t, h.repo.insertCalls[0].ReviewDueAt, "a fixed-end delegation has no review_due_at")
+}
+
 // ── Create: idempotency replay (DLG-D8) ─────────────────────────────────
 
 func TestDelegationService_Create_IdempotencyReplay(t *testing.T) {
@@ -415,6 +481,40 @@ func TestDelegationService_Create_IdempotencyReplay(t *testing.T) {
 	assert.Equal(t, membershipCallsBefore, h.membership.callCount(), "replay must not re-check membership")
 	assert.Equal(t, upCallsBefore, h.up.callCount(), "replay must not re-call user profile")
 	assert.Equal(t, insertCallsBefore, len(h.repo.insertCalls), "replay must not write again")
+}
+
+// ── List / WithMetrics ───────────────────────────────────────────────────
+
+func TestDelegationService_WithMetrics_ReturnsSameInstance(t *testing.T) {
+	h := newDelegationHarness()
+	fm := &fakeMetrics{}
+	got := h.svc.WithMetrics(fm)
+	assert.Same(t, h.svc, got)
+}
+
+func TestDelegationService_List_CacheMiss_PopulatesCache(t *testing.T) {
+	h := newDelegationHarness()
+	tenantID, delegatorID := uuid.New(), uuid.New()
+
+	list, err := h.svc.List(context.Background(), tenantID, delegatorID)
+	require.NoError(t, err)
+	assert.Nil(t, list)
+
+	cached, hit := h.cache.GetDelegatorList(context.Background(), tenantID, delegatorID)
+	assert.True(t, hit, "List must populate the cache on a miss")
+	assert.Nil(t, cached)
+}
+
+func TestDelegationService_List_CacheHit_SkipsRepository(t *testing.T) {
+	h := newDelegationHarness()
+	tenantID, delegatorID := uuid.New(), uuid.New()
+	want := []domain.Delegation{{ID: uuid.New(), TenantID: tenantID, DelegatorID: delegatorID}}
+	h.cache.SetDelegatorList(context.Background(), tenantID, delegatorID, want)
+
+	got, err := h.svc.List(context.Background(), tenantID, delegatorID)
+	require.NoError(t, err)
+	assert.Equal(t, want, got)
+	assert.NotContains(t, h.rec.snapshot(), "delegationRepo.ListByDelegator", "cache hit must not fall through to the repository")
 }
 
 // ── Cancel ────────────────────────────────────────────────────────────────
@@ -442,6 +542,44 @@ func TestDelegationService_Cancel_FailOpenOnUserProfileFailure(t *testing.T) {
 	payload, ok := events[0].Data.(domain.DelegationEndedPayload)
 	require.True(t, ok)
 	assert.Equal(t, domain.EndReasonCancelled, payload.EndedReason)
+}
+
+func TestDelegationService_Cancel_RecordsMetrics(t *testing.T) {
+	h := newDelegationHarness()
+	fm := &fakeMetrics{}
+	h.svc.WithMetrics(fm)
+	tenantID := uuid.New()
+	d := h.repo.seed(domain.Delegation{
+		TenantID: tenantID, DelegatorID: uuid.New(), DelegateID: uuid.New(),
+		Scope: domain.ScopeAll, Status: domain.DelegationActive, RecordVersion: 1,
+	})
+	h.up.fn = func(ctx context.Context, r port.SetAvailabilityRequest) error {
+		return errors.New("user-profile down")
+	}
+
+	_, err := h.svc.Cancel(context.Background(), tenantID, d.ID, d.RecordVersion)
+	require.NoError(t, err)
+
+	assert.Equal(t, []string{"cancel"}, fm.upAvailabilityFailures)
+	assert.Equal(t, []string{string(domain.EndReasonCancelled)}, fm.ended)
+}
+
+func TestDelegationService_Create_RecordsCreatedAndIdempotencyHitMetrics(t *testing.T) {
+	h := newDelegationHarness()
+	fm := &fakeMetrics{}
+	h.svc.WithMetrics(fm)
+	tenantID, delegatorID := uuid.New(), uuid.New()
+	input := validCreateInput()
+	h.activeBoth(delegatorID, input.DelegateID)
+
+	_, err := h.svc.Create(context.Background(), tenantID, delegatorID, "idem-key-1", input)
+	require.NoError(t, err)
+	assert.Equal(t, []string{string(domain.ScopeAll)}, fm.created)
+
+	// Replay with the same idempotency key.
+	_, err = h.svc.Create(context.Background(), tenantID, delegatorID, "idem-key-1", input)
+	require.NoError(t, err)
+	assert.Equal(t, 1, fm.idempotencyHits)
 }
 
 func TestDelegationService_Cancel_PropagatesOptimisticLockAndNotFound(t *testing.T) {
@@ -528,6 +666,70 @@ func TestDelegationService_Extend_WindowDaysPriority(t *testing.T) {
 			assert.Equal(t, tc.want, h.repo.extendCalls[0].windowDays)
 		})
 	}
+}
+
+// TestDelegationService_Extend_ResyncsUserProfileOOOUntil is a regression
+// test for the Extend half of the open-ended OOOUntil fix: without this,
+// extending an open-ended delegation moved review_due_at forward in this
+// service's own DB but left User Profile's ooo_until at the OLD value —
+// User Profile's own expiry sweep would then reset the delegator to
+// 'available' once that stale bound passed, even though the delegation was
+// still active (the same class of cross-service desync Create's fix
+// closes, reintroduced via a different code path).
+func TestDelegationService_Extend_ResyncsUserProfileOOOUntil(t *testing.T) {
+	h := newDelegationHarness()
+	tenantID, delegatorID, delegateID := uuid.New(), uuid.New(), uuid.New()
+	starts := time.Now().UTC().Add(-72 * time.Hour)
+	newReviewDueAt := time.Now().UTC().Add(20 * 24 * time.Hour)
+	d := h.repo.seed(domain.Delegation{
+		TenantID: tenantID, DelegatorID: delegatorID, DelegateID: delegateID,
+		Status: domain.DelegationActive, EndsAt: nil, StartsAt: starts,
+		Reason: "annual leave", RecordVersion: 1,
+	})
+	h.repo.extendResult = &domain.Delegation{
+		ID: d.ID, TenantID: tenantID, DelegatorID: delegatorID, DelegateID: delegateID,
+		Status: domain.DelegationActive, EndsAt: nil, StartsAt: starts,
+		Reason: "annual leave", ReviewDueAt: &newReviewDueAt, RecordVersion: 2,
+	}
+
+	_, err := h.svc.Extend(context.Background(), tenantID, d.ID, ptrInt(20), 1)
+	require.NoError(t, err)
+
+	require.Len(t, h.up.calls, 1, "Extend must re-sync User Profile's OOO window")
+	upCall := h.up.calls[0]
+	require.NotNil(t, upCall.Status)
+	assert.Equal(t, "ooo", *upCall.Status)
+	assert.Equal(t, delegatorID, upCall.UserID)
+	require.NotNil(t, upCall.DelegateID)
+	assert.Equal(t, delegateID, *upCall.DelegateID)
+	require.NotNil(t, upCall.OOOUntil)
+	assert.True(t, newReviewDueAt.Equal(*upCall.OOOUntil),
+		"must send the NEW review_due_at, not the pre-extend value")
+	require.NotNil(t, upCall.OOOFrom)
+	assert.True(t, starts.Equal(*upCall.OOOFrom))
+}
+
+// TestDelegationService_Extend_UserProfileFailure_FailsOpen confirms the
+// re-sync call is best-effort: a User Profile outage must not block the
+// user's own Extend action, matching Cancel's existing DEL-6 fail-open
+// pattern (though unlike Cancel, there is no later cron that retries this
+// specific re-sync if it fails here — an accepted residual risk).
+func TestDelegationService_Extend_UserProfileFailure_FailsOpen(t *testing.T) {
+	h := newDelegationHarness()
+	fm := &fakeMetrics{}
+	h.svc.WithMetrics(fm)
+	tenantID := uuid.New()
+	d := h.repo.seed(domain.Delegation{
+		TenantID: tenantID, Status: domain.DelegationActive, EndsAt: nil, RecordVersion: 1,
+	})
+	h.up.fn = func(ctx context.Context, r port.SetAvailabilityRequest) error {
+		return errors.New("user-profile down")
+	}
+
+	got, err := h.svc.Extend(context.Background(), tenantID, d.ID, ptrInt(20), 1)
+	require.NoError(t, err, "Extend must fail-open on a User Profile error")
+	require.NotNil(t, got)
+	assert.Equal(t, []string{"extend"}, fm.upAvailabilityFailures)
 }
 
 // ── Reassign ─────────────────────────────────────────────────────────────
@@ -630,4 +832,60 @@ func TestDelegationService_Reassign_EndsAtProvidedNilIsOpenEnded(t *testing.T) {
 	inserted := h.repo.insertCalls[0]
 	assert.Nil(t, inserted.EndsAt)
 	assert.NotNil(t, inserted.ReviewDueAt)
+}
+
+func TestDelegationService_Reassign_NotActiveRejected(t *testing.T) {
+	h := newDelegationHarness()
+	tenantID := uuid.New()
+	d := h.repo.seed(domain.Delegation{
+		TenantID: tenantID, DelegatorID: uuid.New(), DelegateID: uuid.New(),
+		Scope: domain.ScopeAll, Status: domain.DelegationCancelled, RecordVersion: 1,
+	})
+
+	_, err := h.svc.Reassign(context.Background(), tenantID, d.ID, d.RecordVersion, ReassignInput{})
+	requireDomainCode(t, err, domain.ErrDelegationNotFound.Error())
+}
+
+func TestDelegationService_Reassign_FindByIDError_Propagates(t *testing.T) {
+	h := newDelegationHarness()
+	tenantID := uuid.New()
+	h.repo.findByIDFn = func(ctx context.Context, gotTenant, gotID uuid.UUID) (*domain.Delegation, error) {
+		return nil, domain.NewError(domain.ErrDelegationNotFound, "gone")
+	}
+
+	_, err := h.svc.Reassign(context.Background(), tenantID, uuid.New(), 1, ReassignInput{})
+	requireDomainCode(t, err, domain.ErrDelegationNotFound.Error())
+}
+
+func TestDelegationService_Reassign_CancelError_Propagates(t *testing.T) {
+	h := newDelegationHarness()
+	tenantID := uuid.New()
+	d, delegatorID, delegateID := seedReassignable(h, tenantID)
+	h.activeBoth(delegatorID, delegateID)
+	h.repo.endErr = domain.NewError(domain.ErrOptimisticLockConflict, "stale version")
+
+	_, err := h.svc.Reassign(context.Background(), tenantID, d.ID, d.RecordVersion, ReassignInput{})
+	requireDomainCode(t, err, domain.ErrOptimisticLockConflict.Error())
+	assert.Empty(t, h.repo.insertCalls, "a new delegation must never be created when the cancel leg fails")
+}
+
+// ── enqueue ──────────────────────────────────────────────────────────────
+
+func TestEnqueue_NoPublisherInContext_NoOp(t *testing.T) {
+	err := enqueue(context.Background(), domain.EventDelegationStarted, uuid.New(), "subj", "actor", map[string]string{"k": "v"})
+	require.NoError(t, err)
+}
+
+func TestEnqueue_CopiesRequestContextIPAndUserAgent(t *testing.T) {
+	pub := &fakeEventPublisher{}
+	ctx := port.WithEventPublisher(context.Background(), pub)
+	ctx = requestctx.WithContext(ctx, &requestctx.Context{ClientIP: "10.0.0.1", UserAgent: "test-agent"})
+
+	err := enqueue(ctx, domain.EventDelegationStarted, uuid.New(), "subj", "actor", map[string]string{"k": "v"})
+	require.NoError(t, err)
+
+	events := pub.snapshot()
+	require.Len(t, events, 1)
+	assert.Equal(t, "10.0.0.1", events[0].IPAddress)
+	assert.Equal(t, "test-agent", events[0].UserAgent)
 }

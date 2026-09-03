@@ -74,6 +74,8 @@ spec:
               containerPort: {{ .Values.service.metricsPort }}
               protocol: TCP
           env:
+            - name: BUILD_VERSION
+              value: {{ include "iam-delegation.imageTag" . | quote }}
             {{- range $key, $val := .Values.env }}
             - name: {{ $key }}
               value: {{ $val | quote }}

@@ -4,8 +4,7 @@
 # all target platforms and writes per-binary checksums. The artifact
 # directory is the working directory when this runs.
 #
-# Unlike iam-tender-acl (single binary, single process running both the
-# HTTP server and its SQS consumer), this service ships two binaries:
+# This service ships two binaries:
 #   cmd/server      -- HTTP API (DLG-1..7, DLG-I1..I4) + cascade SQS consumer
 #   cmd/reconciler  -- the three CronJob entry points (jobs/delegation_*.go)
 #

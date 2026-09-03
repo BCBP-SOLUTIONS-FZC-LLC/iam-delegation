@@ -88,34 +88,36 @@ Cache is advisory — correctness never depends on it (LLD §9.3); a Valkey outa
 
 Unlike most O&M-extraction siblings, this is a structural highlight of the service (see `README.md § Mental model`).
 
-## Published — `iam.delegation.events` (one dedicated SNS topic, three types, no RoutingPublisher)
+## Published — `iam.delegation.events` (one dedicated SNS topic, four types, no RoutingPublisher)
 
 | Event | Emitted when | Consumers (LLD §10.5) |
 |---|---|---|
 | `DelegationStarted` | DLG-2 create, create-leg of DLG-5 reassign | **Workflow Service** (reroute — authoritative signal), Notification, Audit |
-| `DelegationEnded` | DLG-3 cancel, `ends_at` expiry (DLG-I1), review auto-end (DLG-I2), end-leg of DLG-5, delegate-removed cascade (§11.5) — `ended_reason ∈ {expired, cancelled, delegate_removed, review_expired}` | **Workflow Service** (restore), Notification, Audit |
+| `DelegationEnded` | DLG-3 cancel, `ends_at` expiry (DLG-I1), review auto-end (DLG-I2), end-leg of DLG-5, delegate-removed cascade (§11.5), delegate-disabled cascade (§11.5a, Bug 2) — `ended_reason ∈ {expired, cancelled, delegate_removed, review_expired, delegate_disabled}` | **Workflow Service** (restore), Notification, Audit |
 | `DelegationReviewRequested` | `delegation-review` sweep — once per calendar day for each of the 3 days before `review_due_at` — `days_remaining ∈ {3,2,1}` | Notification, Audit |
+| `DelegationEscalationRequested` | Immediately after `DelegationEnded`, same tx, only when `ended_reason=delegate_disabled` (§11.5b, Bug 2a) | Notification (tenant_admin/tenant_owner only), Workflow Service (hook, not yet consumed — cross-team), Audit |
 
-Cron-origin events carry system sentinels: `ip_address: "system"`, `user_agent: "iam-delegation/<job>-cron"`, `actor: SystemActorID`. The delegator-side end of a removal cascade is intentionally **silent — no event** (DEL-7 asymmetry, DLG-EVT-4) — only the delegate-side row emits `DelegationEnded`.
+Cron-origin events carry system sentinels: `ip_address: "system"`, `user_agent: "iam-delegation/<job>-cron"`, `actor: SystemActorID`. The delegator-side end of a removal cascade is intentionally **silent — no event** (DEL-7 asymmetry, DLG-EVT-4) — only the delegate-side row emits `DelegationEnded`; this silence rule does not apply to the delegate-disabled cascade, where every ended row is delegate-side by construction and emits both `DelegationEnded` and `DelegationEscalationRequested`.
 
-Every published envelope carries `specversion: "1"` (`postgres.txBoundPublisher.EnqueueCtx` → `events.WithSchemaVersion("1")`, DLG-D24) — matching `iam-user-profile`/`iam-org-membership` exactly; this was missing before DLG-D24 and silently omitted from every event this service ever published.
+Every published envelope carries `specversion: "1"` (`eventbus.Publisher.EnqueueCtx` → `events.WithSchemaVersion("1")`, DLG-D24/DLG-D33) — matching `iam-realm-provisioner`. TraceID and CorrelationID are stamped from the OTel span when present. IP/UA are omitted when empty.
 
 `outbox.Runner`'s own tunables (`PollInterval`/`BatchSize`/`MaxAttempts`/`DrainTimeout`/`PublishConcurrency`/`PublishTimeout`/`StartupJitter`/`ClaimLeaseDuration`) are `OUTBOX_*`-env-configurable (DLG-D24, matching `iam-org-membership`'s surface) rather than hardcoded. A fourth `cmd/server` background goroutine calls `outboxRunner.PrunePublished` on a ticker (`OUTBOX_PRUNE_INTERVAL`/`_RETENTION`/`_LIMIT`, default daily/7d/1000 rows, matching `iam-user-profile`'s `runMaintenanceSweep`) — without it, published `outbox_events` rows accumulate forever. `outbox_dead_letters_total` (the library's own dead-letter metric) is alerted on in both `deploy/helm/iam-delegation/templates/prometheusrule.yaml` and `deploy/monitoring/app-alerts.yml`.
 
-## Consumed — `delegation-cascade-q` (one SQS queue, one upstream producer, two event types)
+## Consumed — `delegation-cascade-q` (one SQS queue, two upstream producers, three event types)
 
 | Source topic | Event | Dispatched to | `processed_events.consumer` bucket |
 |---|---|---|---|
 | `iam.membership.events` | `MembershipRevoked` | `CascadeService.EndForUser` (§11.5) | `"cascade"` |
 | `iam.membership.events` | `TenantMembershipsPurged` | `CascadeService.ScrubTenant` (§11.6) | `"offboarding"` |
+| `iam.user.events` | `UserUpdated` (only when decoded `status=="disabled"`; other deliveries are acked without dispatch) | `CascadeService.EndForDisabledDelegate` (§11.5a, Bug 2/DLG-D26) | `"delegate_disable"` |
 
-Both event types are produced by Core / Org & Membership on the same topic. `TenantMembershipsPurged` was renamed from `TenantOffboarded` by Core to avoid colliding with Realm Provisioner's own, differently-scoped `TenantOffboarded` event on `iam.tenant.events`, which this service does not consume.
+The first two event types are produced by Core / Org & Membership on `iam.membership.events`. `TenantMembershipsPurged` was renamed from `TenantOffboarded` by Core to avoid colliding with Realm Provisioner's own, differently-scoped `TenantOffboarded` event on `iam.tenant.events`, which this service does not consume. `UserUpdated` is produced by User Profile on a third, distinct topic — `iam.user.events` — a second SNS subscription onto this same queue (Bug 2/DLG-D26); its filter policy can only match on `EventType`, not payload content, so this service decodes every delivery and dispatches only on `status=="disabled"`.
 
-Two distinct idempotency buckets (not one hardcoded consumer name like `iam-user-profile`'s single-subscription case) — `internal/adapter/inbound/consumer/cascade_consumer.go`'s `consumerCascade = "cascade"` / offboarding equivalent, keyed into `processed_events (event_id, consumer)`. DLQ: `delegation-cascade-q-dlq`, `maxReceiveCount=5`.
+Three distinct idempotency buckets (not one hardcoded consumer name like `iam-user-profile`'s single-subscription case) — `internal/adapter/inbound/consumer/cascade_consumer.go`'s `consumerCascade = "cascade"` / `consumerOffboarding = "offboarding"` / `consumerDelegateDisable = "delegate_disable"`, keyed into `processed_events (event_id, consumer)`. DLQ: `delegation-cascade-q-dlq`, `maxReceiveCount=5`.
 
 # AWS Glue Schema Registry — `iam-delegation-events`
 
-**Key difference from `iam-user-profile`: no runtime name translation.** User-profile's `domain.GlueSchemaName(eventType)` maps dot-notation event types (`user.provisioned`) to PascalCase Glue names (`UserProvisioned`) via an explicit switch. **This repo's event-type constants (`internal/core/domain/event.go`) already ARE the PascalCase Glue schema name** — `DelegationStarted`, `DelegationEnded`, `DelegationReviewRequested` — used verbatim as both the envelope `type` and the Glue `SchemaName`, no translation function exists or is needed (`internal/adapter/outbound/eventbus/codec.go`'s doc comment confirms this explicitly).
+**Key difference from `iam-user-profile`: no runtime name translation.** User-profile's `domain.GlueSchemaName(eventType)` maps dot-notation event types (`user.provisioned`) to PascalCase Glue names (`UserProvisioned`) via an explicit switch. **This repo's event-type constants (`internal/core/domain/event.go`) already ARE the PascalCase Glue schema name** — `DelegationStarted`, `DelegationEnded`, `DelegationReviewRequested`, `DelegationEscalationRequested` — used verbatim as both the envelope `type` and the Glue `SchemaName`, no translation function exists or is needed (`internal/adapter/outbound/eventbus/codec.go`'s doc comment confirms this explicitly).
 
 **Wire format** — identical 18-byte header mechanism to every sibling service:
 ```
@@ -124,15 +126,15 @@ byte 1     : 0x00  (no compression)
 bytes 2-17 : schema version UUID (big-endian)
 ```
 
-**Encoding flow** — same architecture as user-profile: validate at enqueue time (plain JSON), encode at publish time (never touching Postgres):
+**Encoding flow** — same architecture as iam-realm-provisioner: validate at enqueue time (plain JSON via ValidatingCodec), encode at publish time (never touching Postgres):
 ```
-json.Marshal(payload) → eventbus.SchemaValidator.Validate(ctx, eventType, rawJSON) → outbox.Enqueue(ctx, tx, env)
+json.Marshal(payload) → ValidatingCodec.Encode (schema pass-through if unregistered) → events.NewEnvelope → outbox.Enqueue(ctx, tx, env)
                                                                                               ↓
                                                                                 outbox.Runner polls outbox_events
                                                                                               ↓
-                                              events.WithCodec(GlueCodec|NoopCodec) → codec.Encode(...) → SNS Publish
+                                              events.WithCodec(GlueCodec|events.NoopCodec) → codec.Encode(...) → SNS Publish
 ```
-`internal/adapter/outbound/eventbus/validator.go`'s `SchemaValidator` compiles the 3 embedded `internal/eventschema/*.json` schemas (draft-07, `additionalProperties: true`) via `jsonschema/v6` and validates before the outbox INSERT — fail-closed, an unregistered event type or invalid payload rolls back the whole transaction. `codec.go`'s `GlueCodec` pre-fetches each schema's latest version ID from Glue at startup (fails fast — panics — if any lookup fails); `NoopCodec` is the dev/test pass-through when `GLUE_REGISTRY_NAME` is unset.
+`eventbus.Publisher` (injected by `postgres.TxRunner`) owns enqueue. Missing schema is a pass-through (realm); `SchemaValidator` remains the fail-closed unit-test helper. `GlueCodec` pre-fetches each schema's latest version ID from Glue at startup; `events.NoopCodec` is the SNS pass-through when `GLUE_REGISTRY_NAME` is unset.
 
 **CI governance pipeline naming reconciliation (this session's addition, `.github/workflows/schema-registry.yml`):** the JSON schema files on disk are snake_case (`delegation_started.json`) to satisfy `schema-gov validate`'s Pass 7 coverage rule, but the *registered* Glue names are PascalCase. This is purely a CI-script concern — the workflow's hand-rolled `aws glue get-schema`/`diff` steps need a `SCHEMA_NAME_MAP` bash associative array (`delegation_started → DelegationStarted`, etc.) to resolve the actual registered name, since a raw file-basename lookup would never find the real schema. This is **not** a runtime translation — `GlueCodec` never sees the snake_case filenames, only the PascalCase Go constants. See `docs/runbook-schema-registry.md` for the full CI pipeline and required IAM SIDs.
 

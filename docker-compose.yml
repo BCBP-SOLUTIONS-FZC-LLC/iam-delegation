@@ -87,6 +87,8 @@ services:
       METRICS_PORT: "9090"
       LOG_LEVEL: debug
       ENVIRONMENT: development
+      APP_ENV: dev
+      APP_NAME: iam-delegation
 
       # The runtime app role — delegation_app has no BYPASSRLS, so Row-
       # Level Security is actually enforced even in this dev stack. The
@@ -95,11 +97,15 @@ services:
       # against DATABASE_URL — there is no separate migrate service/Job
       # here, matching how it runs in production.
       DATABASE_URL: postgres://delegation_app:delegation_app_dev_password@postgres:5432/delegation?sslmode=disable
-      # BYPASSRLS role used ONLY for the startup migration run.
+      # BYPASSRLS role for startup migration AND the sysPool (cron sweeps,
+      # cascade processed_events, active-gauge exporter). Direct Postgres
+      # in this compose stack — PG_BOUNCER_MODE stays false.
       MIGRATION_DATABASE_URL: postgres://delegation:delegation@postgres:5432/delegation?sslmode=disable
-      DATABASE_LOGICAL_NAME: delegation
+      SYSTEM_DATABASE_URL: postgres://delegation:delegation@postgres:5432/delegation?sslmode=disable
       PG_MAX_CONNS: "10"
       PG_MIN_CONNS: "2"
+      PG_BOUNCER_MODE: "false"
+      PG_STATEMENT_TIMEOUT: "5s"
       PG_SLOW_QUERY_THRESHOLD: 200ms
 
       VALKEY_ADDR: valkey:6379

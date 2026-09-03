@@ -594,3 +594,39 @@ func (t *fakeTxRunner) RunInTx(ctx context.Context, fn func(ctx context.Context)
 }
 
 var _ port.TxRunner = (*fakeTxRunner)(nil)
+
+// ── fakeMetrics ──────────────────────────────────────────────────────────
+
+type fakeMetrics struct {
+	mu                     sync.Mutex
+	created                []string
+	ended                  []string
+	idempotencyHits        int
+	upAvailabilityFailures []string
+}
+
+func (m *fakeMetrics) RecordCreated(scope string) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.created = append(m.created, scope)
+}
+
+func (m *fakeMetrics) RecordEnded(reason string) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.ended = append(m.ended, reason)
+}
+
+func (m *fakeMetrics) RecordIdempotencyHit() {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.idempotencyHits++
+}
+
+func (m *fakeMetrics) RecordUPAvailabilityFailure(path string) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.upAvailabilityFailures = append(m.upAvailabilityFailures, path)
+}
+
+var _ Metrics = (*fakeMetrics)(nil)

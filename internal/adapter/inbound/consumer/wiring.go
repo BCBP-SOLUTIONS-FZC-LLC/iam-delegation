@@ -35,10 +35,12 @@ const (
 // events.NewSQSConsumerWithClient. logger is passed straight through to
 // SQSConfig.Logger: this package's Logger interface has the same method
 // set as platform-events' internal port.Logger, so no adapter is needed.
-func NewCascadeSQSConsumer(client events.SQSClientLike, queueURL string, logger Logger, cascadeConsumer *CascadeConsumer, opts ...events.ConsumerOption) (events.Consumer, error) {
+func NewCascadeSQSConsumer(client events.SQSClientLike, queueURL, region, endpointURL string, logger Logger, cascadeConsumer *CascadeConsumer, opts ...events.ConsumerOption) (events.Consumer, error) {
 	return events.NewSQSConsumerWithClient(
 		events.SQSConfig{
 			QueueURL:    queueURL,
+			Region:      region,
+			EndpointURL: endpointURL,
 			MaxMessages: cascadeQMaxMessages,
 			WaitSeconds: cascadeQWaitSeconds,
 			Logger:      logger,

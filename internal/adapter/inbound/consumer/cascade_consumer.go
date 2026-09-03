@@ -1,3 +1,8 @@
+// Package consumer implements the delegation-cascade-q SQS consumer —
+// Core's MembershipRevoked/TenantMembershipsPurged and User Profile's
+// user.updated (delegate-disabled) events — plus its idempotency dedup
+// (processed_events, backed by internal/adapter/outbound/postgres) and
+// the wiring that assembles the consumer from cmd/server.
 package consumer
 
 import (
@@ -7,13 +12,15 @@ import (
 
 	"github.com/google/uuid"
 
+	"github.com/BCBP-SOLUTIONS-FZC-LLC/iam-delegation/internal/adapter/outbound/metrics"
 	"github.com/BCBP-SOLUTIONS-FZC-LLC/iam-delegation/internal/core/domain"
+	"github.com/BCBP-SOLUTIONS-FZC-LLC/iam-delegation/internal/core/port"
 	events "github.com/BCBP-SOLUTIONS-FZC-LLC/platform-events/pkg/events"
 )
 
 // processed_events consumer-name buckets (LLD §7.2.3, "consumer ∈
-// {cascade, offboarding}") — see ProcessedEvents' doc comment for why one
-// Go consumer type uses two bucket names.
+// {cascade, offboarding, delegate_disable}") — see ProcessedEvents' doc
+// comment for why one Go consumer type uses multiple bucket names.
 const (
 	consumerCascade         = "cascade"
 	consumerOffboarding     = "offboarding"
@@ -39,8 +46,8 @@ type cascadeService interface {
 	EndForDisabledDelegate(ctx context.Context, tenantID, delegateID uuid.UUID) error
 }
 
-// idempotencyStore is the minimal slice of *ProcessedEvents this consumer
-// needs. Satisfied implicitly by *ProcessedEvents; lets tests inject a fake.
+// idempotencyStore is the minimal slice of *postgres.ProcessedEventsRepository
+// this consumer needs. Satisfied implicitly; lets tests inject a fake.
 type idempotencyStore interface {
 	IsProcessed(ctx context.Context, consumer, eventID string) (bool, error)
 	MarkProcessed(ctx context.Context, consumer, eventID string) error
@@ -94,19 +101,18 @@ type CascadeConsumer struct {
 	cascade     cascadeService
 	idempotency idempotencyStore
 	bindGUC     GUCBinder
+	tx          port.TxRunner
 	logger      Logger
 }
 
 // NewCascadeConsumer builds a CascadeConsumer.
 //
-//	NewCascadeConsumer(cascade *service.CascadeService, idempotency *ProcessedEvents, bindGUC GUCBinder, logger Logger) *CascadeConsumer
-//
-// cascade and idempotency are declared here against small local interfaces
-// (cascadeService, idempotencyStore) rather than the concrete types, but
-// *service.CascadeService and *ProcessedEvents both satisfy them
-// structurally, so cmd/server can pass the concrete types directly.
-func NewCascadeConsumer(cascade cascadeService, idempotency idempotencyStore, bindGUC GUCBinder, logger Logger) *CascadeConsumer {
-	return &CascadeConsumer{cascade: cascade, idempotency: idempotency, bindGUC: bindGUC, logger: logger}
+// cascade and idempotency are declared against small local interfaces
+// rather than the concrete types. tx is used to MarkProcessed inside
+// RunInTx after a successful handler (and for unknown-type ack) —
+// matching iam-realm-provisioner IDEMP-2. Nil tx marks directly (tests).
+func NewCascadeConsumer(cascade cascadeService, idempotency idempotencyStore, bindGUC GUCBinder, tx port.TxRunner, logger Logger) *CascadeConsumer {
+	return &CascadeConsumer{cascade: cascade, idempotency: idempotency, bindGUC: bindGUC, tx: tx, logger: logger}
 }
 
 // Handle implements the events.Handler function signature.
@@ -120,14 +126,12 @@ func NewCascadeConsumer(cascade cascadeService, idempotency idempotencyStore, bi
 // ack-and-drop) — redelivery can never fix a permanently malformed id, so
 // retrying it forever would just wedge the queue (mirrors
 // iam-user-profile's user_event_consumer.go). An unrecognized event type is
-// also acked without dispatching — this queue's SNS filter policy is meant
-// to admit only MembershipRevoked/TenantMembershipsPurged (on
-// iam.membership.events) and UserUpdated (on iam.user.events, Bug 2), so
-// anything else arriving is unexpected but must not crash the consumer. A
-// UserUpdated event whose payload.status isn't "disabled" — the filter
-// policy matches on EventType only, not payload content, so most
-// UserUpdated deliveries are for unrelated field changes — is also acked
-// without dispatching; only "disabled" ever reaches CascadeService. A
+// acked, counted, and recorded in processed_events inside RunInTx
+// (iam-realm-provisioner IDEMP-2) so redelivery does not storm the same
+// unknown type. A UserUpdated event whose payload.status isn't "disabled"
+// — the filter policy matches on EventType only, not payload content, so
+// most UserUpdated deliveries are for unrelated field changes — is also
+// acked without dispatching; only "disabled" ever reaches CascadeService. A
 // payload that fails to JSON-decode returns an error instead: LLD §10.1
 // routes a schema-decode failure to the DLQ rather than retrying
 // indefinitely, which happens automatically via the queue's redrive policy
@@ -163,18 +167,17 @@ func (c *CascadeConsumer) Handle(ctx context.Context, env events.Envelope[json.R
 		}
 		consumerName = consumerDelegateDisable
 	default:
-		c.logger.Warn("no handler registered for event type on delegation-cascade-q — acknowledging to prevent redelivery", map[string]interface{}{
-			"event_type": env.Type,
-			"event_id":   env.ID,
-		})
+		if err := ackUnknown(ctx, c.tx, c.idempotency, c.logger, consumerCascade, env); err != nil {
+			return fmt.Errorf("cascadeconsumer: %w", err)
+		}
 		return nil
 	}
 
-	processed, err := c.idempotency.IsProcessed(ctx, consumerName, eventID.String())
+	skip, err := skipDuplicate(ctx, c.idempotency, consumerName, eventID.String())
 	if err != nil {
 		return fmt.Errorf("cascadeconsumer: check idempotency for event %s: %w", eventID, err)
 	}
-	if processed {
+	if skip {
 		c.logger.Info("duplicate event delivery, skipping cascade", map[string]interface{}{
 			"event_type": env.Type,
 			"event_id":   eventID.String(),
@@ -193,13 +196,22 @@ func (c *CascadeConsumer) Handle(ctx context.Context, env events.Envelope[json.R
 		handleErr = c.handleUserDisabled(ctx, env)
 	}
 	if handleErr != nil {
+		if metrics.Live != nil {
+			metrics.Live.RecordCascadeDLQ()
+		}
 		return handleErr
 	}
 
-	if err := c.idempotency.MarkProcessed(ctx, consumerName, eventID.String()); err != nil {
+	if err := markProcessedInTx(ctx, c.tx, c.idempotency, consumerName, eventID.String()); err != nil {
+		if metrics.Live != nil {
+			metrics.Live.RecordCascadeDLQ()
+		}
 		return fmt.Errorf("cascadeconsumer: mark event %s processed: %w", eventID, err)
 	}
 
+	if metrics.Live != nil {
+		metrics.Live.RecordCascadeProcessed()
+	}
 	c.logger.Info("cascade complete", map[string]interface{}{
 		"event_type": env.Type,
 		"event_id":   eventID.String(),

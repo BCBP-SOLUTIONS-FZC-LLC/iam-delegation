@@ -49,6 +49,37 @@ func TestDelegationRepository_Insert_FindByID_RoundTrip(t *testing.T) {
 	assert.ErrorIs(t, err, domain.ErrDelegationNotFound)
 }
 
+// TestDelegationRepository_Insert_InsideRunInTx covers withPool's
+// TxFromContext hit-branch — repository methods called from inside a real
+// TxRunner.RunInTx closure must join that transaction rather than opening
+// their own, unlike every other repository test here which calls the
+// repository directly (exercising withPool's own-transaction fallback).
+func TestDelegationRepository_Insert_InsideRunInTx(t *testing.T) {
+	db := setupTestDB(t)
+	ctx := context.Background()
+	repo := NewDelegationRepository(db.App)
+	txRunner := NewTxRunner(db.App, nil)
+	tenantID := uuid.New()
+	ctxA := withTenant(ctx, tenantID)
+
+	var created *domain.Delegation
+	err := txRunner.RunInTx(ctxA, func(txCtx context.Context) error {
+		var err error
+		created, err = repo.Insert(txCtx, &domain.Delegation{
+			TenantID: tenantID, DelegatorID: uuid.New(), DelegateID: uuid.New(),
+			DelegatorMembershipID: uuid.New(), DelegateMembershipID: uuid.New(),
+			Scope: domain.ScopeAll, StartsAt: time.Now().UTC().Truncate(time.Millisecond),
+		})
+		return err
+	})
+	require.NoError(t, err)
+	require.NotNil(t, created)
+
+	got, err := repo.FindByID(ctxA, tenantID, created.ID)
+	require.NoError(t, err)
+	assert.Equal(t, created.ID, got.ID)
+}
+
 func TestDelegationRepository_Insert_OpenEnded_SetsNoEndsAt(t *testing.T) {
 	db := setupTestDB(t)
 	ctx := context.Background()
@@ -161,6 +192,19 @@ func TestDelegationRepository_ExtendReview(t *testing.T) {
 	})
 	_, err = repo.ExtendReview(ctxA, tenantID, fixedID, 30, 1)
 	assert.ErrorIs(t, err, domain.ErrNotReviewTracked)
+
+	// Non-existent delegation -> not found.
+	_, err = repo.ExtendReview(ctxA, tenantID, uuid.New(), 30, 1)
+	assert.ErrorIs(t, err, domain.ErrDelegationNotFound)
+
+	// Stale expected_version on an existing, still-active, open-ended row -> conflict.
+	_, err = repo.ExtendReview(ctxA, tenantID, id, 30, 999)
+	assert.ErrorIs(t, err, domain.ErrOptimisticLockConflict)
+
+	// Cancelled delegation -> not found (status != active).
+	cancelledID := seedDelegation(t, ctx, db.Raw, seedDelegationOpts{TenantID: tenantID, Status: "cancelled"})
+	_, err = repo.ExtendReview(ctxA, tenantID, cancelledID, 30, 1)
+	assert.ErrorIs(t, err, domain.ErrDelegationNotFound)
 }
 
 func TestDelegationRepository_ListExpiringBefore(t *testing.T) {

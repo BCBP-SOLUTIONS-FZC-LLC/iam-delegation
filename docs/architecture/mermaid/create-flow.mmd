@@ -17,14 +17,24 @@ sequenceDiagram
     else either not active
         Core-->>DLG: {active false}
         DLG-->>DR: 422 invalid_delegate
-    else both active (each returns tenant_membership_id)
+    else both active (each returns tenant_membership_id), starts_at within skewTolerance of now or omitted
         DLG->>UP: PUT /internal/users/:delegator_id/availability {status ooo, delegate_id, ooo_note, ends_at}
         alt UP 5xx/timeout
             DLG-->>DR: 503 user_profile_unavailable
         else UP 200
-            DLG->>PG: RunInTx { INSERT delegations with both membership ids, then outbox DelegationStarted }
-            DLG->>DLG: SET del:idem, DEL del:list cache
-            DLG-->>DR: 201 Created
-            Note over DLG,PG: DelegationStarted to iam.delegation.events, Workflow reroutes
+            DLG->>PG: RunInTx { INSERT delegations status=active (incl. review_window_days from tenant settings), outbox DelegationStarted }
+            alt RunInTx fails (DB error, pool exhaustion, etc.)
+                DLG->>UP: PUT /internal/users/:delegator_id/availability {delegate_id null} (best-effort compensating clear — BUG-05)
+                DLG-->>DR: 500 / appropriate error
+            else RunInTx ok
+                DLG->>DLG: SET del:idem, INVALIDATE del:list cache
+                DLG-->>DR: 201 Created
+                Note over DLG,PG: DelegationStarted → iam.delegation.events — Notification Service notifies A (confirmation) and B (assigned as delegate), Workflow reroutes
+            end
         end
+    else both active, starts_at genuinely in the future (DLG-D25)
+        DLG->>PG: RunInTx { INSERT delegations status=scheduled — no UP call, no outbox event yet }
+        DLG->>DLG: SET del:idem, INVALIDATE del:list cache
+        DLG-->>DR: 201 Created
+        Note over DLG,PG: no DelegationStarted yet — delegation-activation cron (§11.1a) calls UP and activates this row once starts_at is reached
     end

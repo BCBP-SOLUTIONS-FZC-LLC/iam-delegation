@@ -15,6 +15,7 @@ import (
 
 	"github.com/BCBP-SOLUTIONS-FZC-LLC/platform-gincommon/pkg/gincommon"
 
+	"github.com/BCBP-SOLUTIONS-FZC-LLC/iam-delegation/internal/adapter/outbound/httpx"
 	"github.com/BCBP-SOLUTIONS-FZC-LLC/iam-delegation/internal/core/port"
 )
 
@@ -41,12 +42,13 @@ func NewHTTPClient(baseURL string, httpClient *http.Client, timeout time.Duratio
 	if baseURL == "" {
 		return nil, fmt.Errorf("userprofile: baseURL is required")
 	}
-	if httpClient == nil {
-		if timeout <= 0 {
-			timeout = defaultTimeout
-		}
-		httpClient = &http.Client{Timeout: timeout}
+	if timeout <= 0 {
+		timeout = defaultTimeout
 	}
+	// Always wrap with httpx so W3C traceparent + a client span are
+	// emitted even when the caller supplied a raw *http.Client
+	// (iam-realm-provisioner: every outbound hop uses otelhttp).
+	httpClient = httpx.Instrument(httpClient, timeout)
 	return &HTTPClient{baseURL: strings.TrimRight(baseURL, "/"), httpClient: httpClient}, nil
 }
 

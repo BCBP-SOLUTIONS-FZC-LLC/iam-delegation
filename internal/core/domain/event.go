@@ -11,12 +11,12 @@ import (
 var SystemActorID = uuid.MustParse("00000000-0000-0000-0000-000000000002")
 
 // DomainEvent is the framework-agnostic event carrier passed from services
-// into the outbox layer. The eventbus adapter wraps this in an
+// into the outbox layer. The eventbus Publisher wraps this in an
 // events.Envelope[json.RawMessage] and inserts it into outbox_events within
 // the caller's active pgx.Tx, atomic with the state change (DLG-EVT-1).
 //
 // sits alongside platform-events' own events.Envelope/events.Handler at the
-// same call sites (see internal/adapter/outbound/postgres/db.go), and a
+// same call sites (see internal/adapter/outbound/eventbus/publisher.go), and a
 // bare domain.Event would read as ambiguously generic against that
 // neighboring vocabulary. The stutter is judged more readable here than
 // the alternative.
@@ -42,6 +42,20 @@ const (
 	EventDelegationStarted         = "DelegationStarted"
 	EventDelegationEnded           = "DelegationEnded"
 	EventDelegationReviewRequested = "DelegationReviewRequested"
+	// EventDelegationEscalationRequested is Bug 2a's fix — fired alongside
+	// DelegationEnded whenever a delegation ends because the delegate was
+	// disabled (ended_reason=delegate_disabled). A generic DelegationEnded
+	// only tells the delegator/delegate "this grant is over"; it gives
+	// Workflow/Notification no distinct signal that the delegator may now
+	// have NO valid handler for their work while still OOO. This service
+	// owns no org-structure data (no "supervisor"/"team lead" concept), so
+	// it escalates to the one role it already recognizes as
+	// escalation-capable: tenant_admin/tenant_owner (the only parties,
+	// besides the delegator/delegate, already notified for
+	// DelegationReviewRequested, and the only ones who can call DLG-5
+	// Reassign). Notify-only — this service never auto-creates a
+	// replacement delegation; a human decides who covers the work.
+	EventDelegationEscalationRequested = "DelegationEscalationRequested"
 )
 
 // Consumed event type constants — Core's (iam-org-membership's)
@@ -73,7 +87,8 @@ const (
 const EventUserUpdated = "user.updated"
 
 // Topic is the single dedicated SNS topic this service publishes to
-// (DLG-D5) — unlike O&M there is no RoutingPublisher; one topic, three types.
+// (DLG-D5) — unlike O&M there is no RoutingPublisher; one topic, four types
+// as of Bug 2a's DelegationEscalationRequested addition.
 const Topic = "iam.delegation.events"
 
 // Source is the envelope's `source` field (LLD §10.3 EventEnvelope).

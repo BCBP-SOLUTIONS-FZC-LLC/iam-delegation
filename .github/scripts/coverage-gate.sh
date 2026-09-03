@@ -1,16 +1,8 @@
 #!/usr/bin/env bash
-# Enforces minimum total test coverage.
-#
-# 70% matches iam-tender-acl's starting baseline (its own sibling and
-# closest precedent per the LLD §4 relationship note) — not an aspiration,
-# a floor. This service's LLD carries no different coverage bar (§17
-# Testing Strategy specifies suite composition, not a numeric threshold), so
-# there is no basis to diverge from the sibling default. Ratchet this up
-# over time as more tests are added; never lower it to make a failing PR
-# pass.
+# Enforces minimum total test coverage (default 95%).
 set -euo pipefail
 
-THRESHOLD="${COVERAGE_THRESHOLD:-70}"
+THRESHOLD="${COVERAGE_THRESHOLD:-95}"
 
 test -f coverage.out || {
   echo "::error file=coverage.out,title=Coverage gate::coverage.out missing — run 'make test-ci' before the coverage gate"

@@ -18,6 +18,8 @@ import (
 
 	"github.com/google/uuid"
 
+	"github.com/BCBP-SOLUTIONS-FZC-LLC/iam-delegation/internal/adapter/outbound/httpx"
+	"github.com/BCBP-SOLUTIONS-FZC-LLC/iam-delegation/internal/adapter/outbound/metrics"
 	"github.com/BCBP-SOLUTIONS-FZC-LLC/iam-delegation/internal/core/port"
 )
 
@@ -45,12 +47,13 @@ func NewHTTPChecker(baseURL string, httpClient *http.Client, timeout time.Durati
 	if baseURL == "" {
 		return nil, fmt.Errorf("orgmembership: baseURL is required")
 	}
-	if httpClient == nil {
-		if timeout <= 0 {
-			timeout = defaultTimeout
-		}
-		httpClient = &http.Client{Timeout: timeout}
+	if timeout <= 0 {
+		timeout = defaultTimeout
 	}
+	// Always wrap with httpx so W3C traceparent + a client span are
+	// emitted even when the caller supplied a raw *http.Client
+	// (iam-realm-provisioner: every outbound hop uses otelhttp).
+	httpClient = httpx.Instrument(httpClient, timeout)
 	return &HTTPChecker{baseURL: strings.TrimRight(baseURL, "/"), httpClient: httpClient}, nil
 }
 
@@ -68,6 +71,18 @@ type existsResponse struct {
 // unwrapped (the service layer's checkBothMemberships treats any non-nil
 // err from Exists identically, regardless of type).
 func (c *HTTPChecker) Exists(ctx context.Context, tenantID, userID uuid.UUID) (bool, uuid.UUID, error) {
+	started := time.Now()
+	active, id, err := c.exists(ctx, tenantID, userID)
+	if m := metrics.Live; m != nil {
+		m.ObserveMembershipCheckDuration(time.Since(started).Seconds())
+		if err != nil {
+			m.RecordMembershipCheckFailure()
+		}
+	}
+	return active, id, err
+}
+
+func (c *HTTPChecker) exists(ctx context.Context, tenantID, userID uuid.UUID) (bool, uuid.UUID, error) {
 	url := fmt.Sprintf("%s/api/v1/internal/tenants/%s/members/%s/exists", c.baseURL, tenantID, userID)
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, http.NoBody)
 	if err != nil {

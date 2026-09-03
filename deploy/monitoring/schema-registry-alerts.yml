@@ -21,7 +21,7 @@
 #   registry    — value of GLUE_REGISTRY_NAME (iam-delegation-events)
 #
 # glue_schema_version additionally carries:
-#   schema — individual schema name (DelegationStarted | DelegationEnded | DelegationReviewRequested)
+#   schema — individual schema name (DelegationStarted | DelegationEnded | DelegationReviewRequested | DelegationEscalationRequested)
 #   status — "created" | "new_version" | "unchanged"
 
 groups:
@@ -70,7 +70,7 @@ groups:
             docs/schema-archive/ before deleting).
 
       # ── Registration spike ───────────────────────────────────────────────────
-      # This service registers at most 3 schemas per run. A spike suggests a
+      # This service registers at most 4 schemas per run. A spike suggests a
       # bulk import, schema reset, or misconfiguration. Default threshold: 10.
       - alert: SchemaRegistrationSpike
         expr: glue_schema_registry_registrations_total > 10
@@ -84,8 +84,9 @@ groups:
           description: >-
             {{ $value | humanize }} schemas were processed in a single registration run
             for registry {{ $labels.registry }} ({{ $labels.environment }}).
-            This exceeds the expected maximum for this service (3 schemas —
-            DelegationStarted, DelegationEnded, DelegationReviewRequested).
+            This exceeds the expected maximum for this service (4 schemas —
+            DelegationStarted, DelegationEnded, DelegationReviewRequested,
+            DelegationEscalationRequested).
             Verify the changes are intentional — unexpected spikes may indicate a
             bulk import, schema directory reset, or misconfigured GLUE_REGISTRY_NAME.
 

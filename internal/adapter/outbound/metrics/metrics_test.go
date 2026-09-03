@@ -1,12 +1,33 @@
 package metrics
 
 import (
+	"os"
 	"testing"
 
 	"github.com/prometheus/client_golang/prometheus"
 	dto "github.com/prometheus/client_model/go"
+	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+
+	"github.com/BCBP-SOLUTIONS-FZC-LLC/platform-gincommon/pkg/gincommon"
 )
+
+func TestMain(m *testing.M) {
+	// ObservabilityMiddlewares is gincommon's public metrics-init API.
+	// Call it before Register() so collectors pick up {service, version}
+	// const labels and land on gincommon's registerer — the same order
+	// cmd/server/main.go uses (iam-realm-provisioner).
+	_ = gincommon.ObservabilityMiddlewares(gincommon.Config{
+		ServiceName:  "iam-delegation",
+		BuildVersion: "test",
+	})
+	os.Exit(m.Run())
+}
+
+func ensureRegistered(t testing.TB) *Metrics {
+	t.Helper()
+	return Register()
+}
 
 func counterValue(t *testing.T, c prometheus.Collector) float64 {
 	t.Helper()
@@ -22,7 +43,7 @@ func counterValue(t *testing.T, c prometheus.Collector) float64 {
 
 func TestRegister_RecordsIncrementCounters(t *testing.T) {
 	reg := prometheus.NewRegistry()
-	m, err := Register(reg)
+	m, err := RegisterOn(reg)
 	require.NoError(t, err)
 
 	m.RecordCreated("all")
@@ -32,6 +53,7 @@ func TestRegister_RecordsIncrementCounters(t *testing.T) {
 	m.RecordEnded("expired")
 	m.RecordReviewWarned("7")
 	m.RecordExpiryDeferred()
+	m.RecordActivationDeferred()
 	m.RecordReviewDeferred()
 	m.RecordReviewExpired()
 	m.RecordMembershipCheckFailure()
@@ -39,6 +61,8 @@ func TestRegister_RecordsIncrementCounters(t *testing.T) {
 	m.RecordIdempotencyHit()
 	m.RecordCascadeProcessed()
 	m.RecordCascadeDLQ()
+	m.RecordProcessedEventsDuplicate("cascade")
+	m.RecordUnknownEventAcknowledged("cascade", "SomeOtherEvent")
 	m.ObserveMembershipCheckDuration(0.01)
 	m.SetActiveGauge("tenant-1", 3)
 
@@ -55,6 +79,7 @@ func TestRegister_RecordsIncrementCounters(t *testing.T) {
 		"iam_delegation_ended_total",
 		"iam_delegation_active_gauge",
 		"iam_delegation_expiry_deferred_total",
+		"iam_delegation_activation_deferred_total",
 		"iam_delegation_review_deferred_total",
 		"iam_delegation_review_warned_total",
 		"iam_delegation_review_expired_total",
@@ -64,16 +89,94 @@ func TestRegister_RecordsIncrementCounters(t *testing.T) {
 		"iam_delegation_idempotency_hits_total",
 		"iam_delegation_cascade_processed_total",
 		"iam_delegation_cascade_dlq_total",
+		"iam_delegation_processed_events_duplicates_total",
+		"iam_delegation_unknown_event_acknowledged_total",
 	} {
 		require.True(t, names[want], "missing metric family %s", want)
 	}
 }
 
-func TestRegister_TwiceOnSameRegistryErrors(t *testing.T) {
+func TestRegisterOn_TwiceOnSameRegistryErrors(t *testing.T) {
 	reg := prometheus.NewRegistry()
-	_, err := Register(reg)
+	_, err := RegisterOn(reg)
 	require.NoError(t, err)
 
-	_, err = Register(reg)
-	require.Error(t, err, "a second Register on the same registry must surface the duplicate-collector error, not panic")
+	_, err = RegisterOn(reg)
+	require.Error(t, err, "a second RegisterOn on the same registry must surface the duplicate-collector error, not panic")
+}
+
+func TestRegister_IsIdempotent(t *testing.T) {
+	ensureRegistered(t)
+	assert.NotPanics(t, func() { Register() })
+}
+
+func TestRegister_LandsOnGincommonRegisterer(t *testing.T) {
+	m := ensureRegistered(t)
+	m.RecordCreated("all")
+
+	families, err := prometheus.DefaultGatherer.Gather()
+	require.NoError(t, err)
+	names := make(map[string]bool, len(families))
+	for _, f := range families {
+		names[f.GetName()] = true
+	}
+	assert.True(t, names["iam_delegation_created_total"], "collectors must land on gincommon's registerer (DefaultRegisterer after ObservabilityMiddlewares)")
+}
+
+func TestRegister_AppliesGincommonConstLabels(t *testing.T) {
+	m := ensureRegistered(t)
+
+	got := gincommonLabels()
+	want := gincommon.MetricsConstLabels()
+	assert.Equal(t, want, got)
+	assert.Equal(t, "iam-delegation", got["service"])
+	assert.Equal(t, "test", got["version"])
+
+	m.RecordCreated("tender")
+	families, err := prometheus.DefaultGatherer.Gather()
+	require.NoError(t, err)
+
+	var found bool
+	for _, f := range families {
+		if f.GetName() != "iam_delegation_created_total" {
+			continue
+		}
+		found = true
+		require.NotEmpty(t, f.GetMetric())
+		labels := map[string]string{}
+		for _, lp := range f.GetMetric()[0].GetLabel() {
+			labels[lp.GetName()] = lp.GetValue()
+		}
+		assert.Equal(t, "iam-delegation", labels["service"])
+		assert.Equal(t, "test", labels["version"])
+	}
+	assert.True(t, found, "iam_delegation_created_total must be gathered")
+}
+
+func TestReplaceActiveGauges_ResetDropsAbsentTenants(t *testing.T) {
+	reg := prometheus.NewRegistry()
+	m, err := RegisterOn(reg)
+	require.NoError(t, err)
+
+	m.ReplaceActiveGauges(map[string]int64{"tenant-a": 3, "tenant-b": 1})
+	require.Equal(t, float64(3), counterValue(t, m.activeGauge.WithLabelValues("tenant-a")))
+	require.Equal(t, float64(1), counterValue(t, m.activeGauge.WithLabelValues("tenant-b")))
+
+	m.ReplaceActiveGauges(map[string]int64{"tenant-b": 2})
+	require.Equal(t, float64(2), counterValue(t, m.activeGauge.WithLabelValues("tenant-b")))
+
+	ch := make(chan prometheus.Metric, 8)
+	m.activeGauge.Collect(ch)
+	close(ch)
+	var tenants []string
+	for metric := range ch {
+		dm := &dto.Metric{}
+		require.NoError(t, metric.Write(dm))
+		for _, lp := range dm.GetLabel() {
+			if lp.GetName() == "tenant" {
+				tenants = append(tenants, lp.GetValue())
+			}
+		}
+	}
+	assert.ElementsMatch(t, []string{"tenant-b"}, tenants, "a tenant that dropped to zero active rows must disappear, not linger")
 }

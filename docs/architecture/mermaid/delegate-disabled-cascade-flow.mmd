@@ -1,0 +1,15 @@
+sequenceDiagram
+    autonumber
+    participant UP as User Profile
+    participant DLG as Delegation Service
+    participant PG as Delegation Postgres
+
+    Note over UP: PatchIdentity(status=disabled): clears the delegate pointer on every<br/>delegator's user_availability row (ClearInboundDelegates) AND publishes<br/>UserUpdated{status:disabled} atomically in the same transaction (LLD §8.8.16 K1, iam-user-profile)
+    UP-->>DLG: UserUpdated{user_id, changed_fields:[status], status:"disabled"} (iam.user.events)
+    DLG->>DLG: decode payload — status != disabled: ack, no dispatch (most deliveries)
+    DLG->>PG: UPDATE delegations SET status='ended' WHERE tenant_id=$1 AND delegate_id=$2<br/>AND status IN ('active','scheduled') AND deleted_at IS NULL<br/>RETURNING *
+    Note over DLG,PG: deleted_at is NOT set (disabled ≠ removed) — unlike EndForUser's hard soft-delete
+    loop per ended delegation (every row is delegate-side by construction)
+        DLG->>PG: RunInTx { outbox DelegationEnded{delegate_disabled}, outbox DelegationEscalationRequested{delegate_disabled} }
+    end
+    Note over DLG,UP: No pointer-clear call back to User Profile — it already cleared the<br/>delegate pointer atomically before this event was even published
