@@ -314,9 +314,14 @@ _merge-coverage:
 	fi
 	@echo "==> coverage.out merged from all suites"
 
+# This repo has no build-tag split: unit/integration/rls all select ./...
+# (see TEST_*_PKGS). Running that suite three times in parallel with
+# -race + Testcontainers blew the 300s per-suite timeout on GitHub-hosted
+# runners (Makefile:317) after the coverage expansion. One pass writes
+# coverage.out directly for the coverage-gate.sh step.
 test-ci: | .coverage
-	$(MAKE) -j3 _test-unit-cov _test-integration-cov _test-rls-cov
-	$(MAKE) _merge-coverage
+	$(GO) test $(TEST_UNIT_PKGS) -race -count=1 -timeout 600s \
+	  -coverpkg=$(COVER_PKG_LIST) -coverprofile=coverage.out
 
 cover: test-ci
 	$(GO) tool cover -html=coverage.out

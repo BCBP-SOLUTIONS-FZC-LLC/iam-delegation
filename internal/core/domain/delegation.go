@@ -46,10 +46,11 @@ const (
 // added over the pre-extraction O&M enum. delegate_disabled is Bug 2.
 type EndReason string
 
-// The five ended_reason values (DEL-7, DLG-D6/DLG-Q5, Bug 2).
+// The six ended_reason values (DEL-7, DLG-D6/DLG-Q5, Bug 2, reassigned).
 const (
 	EndReasonExpired         EndReason = "expired"
 	EndReasonCancelled       EndReason = "cancelled"
+	EndReasonReassigned      EndReason = "reassigned"
 	EndReasonDelegateRemoved EndReason = "delegate_removed"
 	EndReasonReviewExpired   EndReason = "review_expired"
 	// EndReasonDelegateDisabled (Bug 2): the delegate's account was disabled

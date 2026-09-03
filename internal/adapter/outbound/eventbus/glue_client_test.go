@@ -25,7 +25,7 @@ func newTestGlueClient(t *testing.T, handler http.HandlerFunc) *glue.Client {
 	server := httptest.NewServer(handler)
 	t.Cleanup(server.Close)
 	return glue.New(glue.Options{
-		Region:           "us-east-1",
+		Region:           "ap-south-1",
 		Credentials:      aws.AnonymousCredentials{},
 		BaseEndpoint:     aws.String(server.URL),
 		RetryMaxAttempts: 1, // fail fast in tests — no exponential-backoff retries

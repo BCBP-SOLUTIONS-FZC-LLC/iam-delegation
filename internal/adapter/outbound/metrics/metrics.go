@@ -103,7 +103,7 @@ func registerOn(reg prometheus.Registerer) (*Metrics, error) {
 		endedTotal: prometheus.NewCounterVec(
 			prometheus.CounterOpts{
 				Name:        "iam_delegation_ended_total",
-				Help:        "Total delegations ended, labeled by ended_reason (expired/cancelled/delegate_removed/review_expired/delegate_disabled).",
+				Help:        "Total delegations ended, labeled by ended_reason (expired/cancelled/reassigned/delegate_removed/review_expired/delegate_disabled).",
 				ConstLabels: labels,
 			},
 			[]string{"ended_reason"},
@@ -235,7 +235,7 @@ func registerOn(reg prometheus.Registerer) (*Metrics, error) {
 	for _, scope := range []string{"all", "department", "tender"} {
 		m.createdTotal.WithLabelValues(scope)
 	}
-	for _, reason := range []string{"expired", "cancelled", "delegate_removed", "review_expired", "delegate_disabled"} {
+	for _, reason := range []string{"expired", "cancelled", "reassigned", "delegate_removed", "review_expired", "delegate_disabled"} {
 		m.endedTotal.WithLabelValues(reason)
 	}
 	for _, days := range []string{"3", "2", "1"} {

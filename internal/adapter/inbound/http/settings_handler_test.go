@@ -56,6 +56,28 @@ func TestSettingsHandler_Get(t *testing.T) {
 		require.Equal(t, 90, resp.MaxDurationDays)
 		require.Equal(t, 90, resp.ReviewWindowDays)
 	})
+
+	// FM-HDR-11: tenant with no settings row → service returns defaults → handler returns 200
+	t.Run("no settings row → service returns defaults 90/90 → 200 (FM-HDR-11)", func(t *testing.T) {
+		svc := &fakeSettingsService{
+			getFn: func(ctx context.Context, gotTenant uuid.UUID) (domain.DelegationTenantSettings, error) {
+				// simulate settings_service returning its defaults when repo has no row
+				return domain.DelegationTenantSettings{
+					TenantID:         gotTenant,
+					MaxDurationDays:  90,
+					ReviewWindowDays: 90,
+				}, nil
+			},
+		}
+		h := NewSettingsHandler(svc)
+		c, w := newRequestWithIdentity(http.MethodGet, "/api/v1/delegations/settings", nil, selfRC(userID, tenantID))
+		h.Get(c)
+		require.Equal(t, http.StatusOK, w.Code)
+		var resp SettingsResponse
+		require.NoError(t, json.Unmarshal(w.Body.Bytes(), &resp))
+		require.Equal(t, 90, resp.MaxDurationDays)
+		require.Equal(t, 90, resp.ReviewWindowDays)
+	})
 }
 
 // ── Set (DLG-7) ─────────────────────────────────────────────────────────
@@ -98,6 +120,21 @@ func TestSettingsHandler_Set(t *testing.T) {
 		require.Equal(t, http.StatusBadRequest, w.Code)
 	})
 
+	// FM-HDR-09: missing review_window_days (int defaults to 0) → service rejects → 400
+	t.Run("zero review_window_days → 400 invalid_delegation_review_window_days (FM-HDR-09)", func(t *testing.T) {
+		svc := &fakeSettingsService{
+			setFn: func(ctx context.Context, gotTenant uuid.UUID, maxDurationDays, reviewWindowDays int) (domain.DelegationTenantSettings, error) {
+				return domain.DelegationTenantSettings{}, domain.NewError(domain.ErrInvalidDelegationReviewWindow, "review_window_days must be >= 1")
+			},
+		}
+		h := NewSettingsHandler(svc)
+		// body only has max_duration_days; review_window_days absent → defaults to 0
+		body, _ := json.Marshal(SettingsSetRequest{MaxDurationDays: 60, ReviewWindowDays: 0})
+		c, w := newRequestWithIdentity(http.MethodPut, "/api/v1/delegations/settings", bytes.NewReader(body), adminRC(userID, tenantID))
+		h.Set(c)
+		require.Equal(t, http.StatusBadRequest, w.Code)
+	})
+
 	t.Run("happy path -> 200", func(t *testing.T) {
 		var gotMax, gotReview int
 		svc := &fakeSettingsService{
@@ -121,4 +158,13 @@ func TestSettingsHandler_Set(t *testing.T) {
 		require.Equal(t, 45, resp.ReviewWindowDays)
 		require.Equal(t, int64(2), resp.RecordVersion)
 	})
+}
+
+func TestSettingsHandler_Set_InvalidTenantID_Returns401(t *testing.T) {
+	h := NewSettingsHandler(&fakeSettingsService{})
+	c, w := newRequestWithIdentity(http.MethodPut, "/api/v1/delegations/settings",
+		bytes.NewReader([]byte(`{"max_duration_days":90,"review_window_days":30}`)),
+		&requestctx.Context{TenantID: "not-a-uuid", UserID: uuid.New().String(), Roles: []string{"tenant_admin"}})
+	h.Set(c)
+	require.Equal(t, http.StatusUnauthorized, w.Code)
 }

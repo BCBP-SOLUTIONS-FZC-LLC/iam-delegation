@@ -103,3 +103,36 @@ func TestCache_NilLoggerIsSafe(t *testing.T) {
 	_, hit := c.GetDelegatorList(ctx, uuid.New(), uuid.New())
 	require.False(t, hit)
 }
+
+// TestCache_GetDelegatorList_CorruptBytes covers the json.Unmarshal failure
+// path: a key exists but its value is not valid JSON.
+func TestCache_GetDelegatorList_CorruptBytes(t *testing.T) {
+	mr := miniredis.RunT(t)
+	fl := &fakeLogger{}
+	c := NewCache(NewClient("redis://"+mr.Addr()), fl)
+	ctx := context.Background()
+	tenantID, delegatorID := uuid.New(), uuid.New()
+
+	key := delegatorListKey(tenantID, delegatorID)
+	mr.Set(key, "not-valid-json")
+
+	list, hit := c.GetDelegatorList(ctx, tenantID, delegatorID)
+	require.False(t, hit)
+	require.Nil(t, list)
+	require.NotEmpty(t, fl.msg, "corrupt cache value must be logged via warn")
+}
+
+// TestCache_SetDelegatorList_RedisError covers the Set error path when Redis
+// is down after the Get succeeds (simulated by closing the server).
+func TestCache_SetDelegatorList_RedisError(t *testing.T) {
+	mr := miniredis.RunT(t)
+	fl := &fakeLogger{}
+	c := NewCache(NewClient("redis://"+mr.Addr()), fl)
+	ctx := context.Background()
+
+	mr.Close() // take Redis down before the Set
+	// Should not panic; error is logged internally
+	c.SetDelegatorList(ctx, uuid.New(), uuid.New(), []domain.Delegation{{ID: uuid.New()}})
+	// The warn is called for the Set error
+	require.NotEmpty(t, fl.msg)
+}

@@ -607,7 +607,7 @@ components:
             delegate_id:   { type: string, format: uuid }
             scope:         { type: string, enum: [all, department, tender] }
             scope_id:      { type: string, format: uuid, nullable: true }
-            ended_reason:  { type: string, enum: [expired, cancelled, delegate_removed, review_expired, delegate_disabled] }  # review_expired added (DLG-Q5); delegate_disabled added (Bug 2/DLG-D26)
+            ended_reason:  { type: string, enum: [expired, cancelled, reassigned, delegate_removed, review_expired, delegate_disabled] }  # review_expired added (DLG-Q5); delegate_disabled added (Bug 2/DLG-D26); reassigned added (DLG-5)
             actor_id:      { type: string, format: uuid, description: Who triggered the end — the requestctx caller for cancel/reassign, or SystemActorID for cron/cascade-driven ends. }
 
     DelegationReviewRequestedPayload:

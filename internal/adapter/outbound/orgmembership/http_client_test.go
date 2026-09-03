@@ -154,3 +154,52 @@ func TestHTTPChecker_Exists_NetworkError_WrapsErrDependencyUnavailable(t *testin
 	require.Error(t, err)
 	assert.True(t, errors.Is(err, port.ErrDependencyUnavailable))
 }
+
+// TestHTTPChecker_Exists_4xx_NonDependencyError verifies a 4xx (non-5xx) response
+// is returned as a plain error without the ErrDependencyUnavailable sentinel.
+func TestHTTPChecker_Exists_4xx_NonDependencyError(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusNotFound)
+	}))
+	defer server.Close()
+
+	checker, err := NewHTTPChecker(server.URL, nil, 0)
+	require.NoError(t, err)
+	active, _, err := checker.Exists(t.Context(), uuid.New(), uuid.New())
+	require.Error(t, err)
+	assert.False(t, active)
+	assert.False(t, errors.Is(err, port.ErrDependencyUnavailable), "4xx must not be wrapped as dependency unavailable")
+	assert.Contains(t, err.Error(), "404")
+}
+
+// TestHTTPChecker_Exists_200_InvalidJSON covers the decode error path.
+func TestHTTPChecker_Exists_200_InvalidJSON(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte("not-json"))
+	}))
+	defer server.Close()
+
+	checker, err := NewHTTPChecker(server.URL, nil, 0)
+	require.NoError(t, err)
+	_, _, err = checker.Exists(t.Context(), uuid.New(), uuid.New())
+	require.Error(t, err)
+}
+
+// TestHTTPChecker_Exists_ActiveNoMembershipID covers the path where the response
+// says active=true but omits tenant_membership_id — membershipID should be uuid.Nil.
+func TestHTTPChecker_Exists_ActiveNoMembershipID(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		// Omit tenant_membership_id
+		_ = json.NewEncoder(w).Encode(map[string]any{"active": true})
+	}))
+	defer server.Close()
+
+	checker, err := NewHTTPChecker(server.URL, nil, 0)
+	require.NoError(t, err)
+	active, membershipID, err := checker.Exists(t.Context(), uuid.New(), uuid.New())
+	require.NoError(t, err)
+	assert.True(t, active)
+	assert.Equal(t, uuid.Nil, membershipID, "missing tenant_membership_id must yield uuid.Nil")
+}

@@ -869,6 +869,29 @@ func TestDelegationService_Reassign_CancelError_Propagates(t *testing.T) {
 	assert.Empty(t, h.repo.insertCalls, "a new delegation must never be created when the cancel leg fails")
 }
 
+func TestDelegationService_Reassign_EmitsEndReasonReassigned(t *testing.T) {
+	h := newDelegationHarness()
+	tenantID := uuid.New()
+	d, delegatorID, delegateID := seedReassignable(h, tenantID)
+	h.activeBoth(delegatorID, delegateID)
+
+	_, err := h.svc.Reassign(context.Background(), tenantID, d.ID, d.RecordVersion, ReassignInput{})
+	require.NoError(t, err)
+
+	events := h.pub.snapshot()
+	var foundEnded bool
+	for _, e := range events {
+		if e.Type == domain.EventDelegationEnded {
+			payload, ok := e.Data.(domain.DelegationEndedPayload)
+			require.True(t, ok)
+			assert.Equal(t, domain.EndReasonReassigned, payload.EndedReason,
+				"Reassign must emit ended_reason=reassigned, not cancelled")
+			foundEnded = true
+		}
+	}
+	require.True(t, foundEnded, "Reassign must emit a DelegationEnded event")
+}
+
 // ── enqueue ──────────────────────────────────────────────────────────────
 
 func TestEnqueue_NoPublisherInContext_NoOp(t *testing.T) {

@@ -37,7 +37,7 @@
     },
     "ended_reason": {
       "type": "string",
-      "enum": ["expired", "cancelled", "delegate_removed", "review_expired", "delegate_disabled"]
+      "enum": ["expired", "cancelled", "reassigned", "delegate_removed", "review_expired", "delegate_disabled"]
     },
     "actor_id": {
       "type": "string",
