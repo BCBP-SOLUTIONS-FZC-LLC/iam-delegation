@@ -17,8 +17,16 @@ type DelegationRepository interface {
 	Insert(ctx context.Context, d *domain.Delegation) (*domain.Delegation, error)
 
 	// End flips status → 'ended'/'cancelled' with optimistic locking and
-	// returns the resulting row.
+	// returns the resulting row. Matches both 'active' and 'scheduled' rows
+	// (DLG-D25) — a not-yet-activated delegation must still be cancellable.
 	End(ctx context.Context, tenantID, id uuid.UUID, status domain.DelegationStatus, expectedVersion int64) (*domain.Delegation, error)
+
+	// Activate flips a 'scheduled' row to 'active' with optimistic locking —
+	// the delegation-activation cron's counterpart to End (DLG-D25,
+	// cross-service future-OOO bug fix). Returns (nil, nil), not an error,
+	// when the row no longer matches (already cancelled/activated) — this is
+	// a background sweep, not a user-facing call.
+	Activate(ctx context.Context, tenantID, id uuid.UUID, expectedVersion int64) (*domain.Delegation, error)
 
 	// ExtendReview pushes review_due_at forward by windowDays and resets
 	// ReviewLastWarnedBucket to nil, re-arming the 3-day daily cascade
@@ -28,6 +36,11 @@ type DelegationRepository interface {
 	// ListExpiringBefore is the delegation-expiry cron query (DLG-I1,
 	// idx_delegations_ends_at).
 	ListExpiringBefore(ctx context.Context, before time.Time, limit int) ([]domain.Delegation, error)
+
+	// ListScheduledBefore is the delegation-activation cron query (DLG-D25,
+	// idx_delegations_starts_at) — mirrors ListExpiringBefore for the
+	// forward (not-yet-started) direction.
+	ListScheduledBefore(ctx context.Context, before time.Time, limit int) ([]domain.Delegation, error)
 
 	// FindActiveDeptDelegateForUser returns the active delegation (if any)
 	// where the given user is the delegate for a scope='department' grant

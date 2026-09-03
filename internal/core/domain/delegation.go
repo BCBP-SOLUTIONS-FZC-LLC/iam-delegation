@@ -23,8 +23,19 @@ const (
 // DelegationStatus mirrors the delegation_status enum (LLD §7.1).
 type DelegationStatus string
 
-// The three delegation_status values (DEL-3): active is the only non-terminal one.
+// The four delegation_status values: scheduled and active are the two
+// non-terminal ones. scheduled is DLG-D25 (cross-service future-OOO bug
+// fix) — a delegation created with a future starts_at is created in this
+// state, not active, and never calls User Profile or emits
+// DelegationStarted until the delegation-activation reconciler job (LLD
+// §11.3a) flips it to active at starts_at. A scheduled delegation can still
+// be cancelled (End's WHERE clause and probeVersionConflict's terminal
+// check both accept scheduled alongside active) and is cascaded on
+// MembershipRevoked exactly like an active one (EndForUser), since a
+// departed member's still-scheduled delegation must not be left to activate
+// later against membership that no longer exists.
 const (
+	DelegationScheduled DelegationStatus = "scheduled"
 	DelegationActive    DelegationStatus = "active"
 	DelegationEnded     DelegationStatus = "ended"
 	DelegationCancelled DelegationStatus = "cancelled"

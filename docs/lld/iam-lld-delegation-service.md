@@ -9,8 +9,8 @@
 | Parent decision | **ADR-0008** (`02-hld-delta-delegation.md`, v2 / Option C) — the fourth O&M extraction, authorised by ADR-0007's explicit deferral of `delegations` |
 | Subsystem | Identity & Access Management |
 | Wave | 4 of 4 (the deferred hot-path table; resolved by removing delegations from I-8 entirely) |
-| Version | 2.3 |
-| Date | 2026-08-25 |
+| Version | 2.5 |
+| Date | 2026-09-03 |
 | Status | Approved for implementation |
 | Audience | IAM platform engineering (owner), Core Org & Membership engineering (drops `delegations`; membership-existence + dept-delegate callee; removal-signal producer), Workflow Service (delegation-event consumer), User Profile (availability callee), AuthZ Enrichment (drops `active_delegations[]`), SRE |
 | Owner database | RDS PostgreSQL `delegation` (Multi-AZ, PgBouncer transaction pooling) |
@@ -26,6 +26,7 @@
 | 2.2 | 2026-08-24 | **Bug-fix and notification-redesign revision.** Addresses five confirmed bugs (BUG-01…BUG-05) and fourteen LLD/design gaps (LLD-GAP-01…LLD-GAP-09, LLD-GAP-27, LLD-GAP-29) discovered during implementation review: (1) DLG-1 `ListByDelegator` must filter `status='active'` — currently returns cancelled/ended rows (BUG-02/GAP-01); (2) `EndForUser` cascade must add `AND status='active'` to prevent re-ending terminal rows and corrupting their `deleted_at` (GAP-02); (3) all time comparisons in Create use a single `now` capture (GAP-03); (4) `actor_id` in `DelegationEnded`/`DelegationReviewRequested` must reflect the actual triggering caller, not always the delegator (GAP-04); (5) DLG-4 Extend must invalidate the `del:list` Valkey cache and return `record_version` in its response (BUG-04/GAP-06); (6) `review_window_days` written on INSERT (GAP-07); (7) `DomainEvent.OccurredAt` must be set at enqueue time (GAP-08); (8) `processed_events.CleanupExpired` added to the monthly cleanup job (GAP-09); (9) deferred-counter metrics must be instrumented in reconciler jobs, not only registered (GAP-27); (10) error response `details` field must be included in HTTP responses for `delegation_window_too_long` and `optimistic_lock_conflict` (BUG-01); (11) `reason_too_long` cap is 500 Unicode characters (rune count), not 500 bytes (BUG-03); (12) compensating UP pointer-clear added to Create tx-failure path (BUG-05); (13) DLG-3 Cancel response body documented (GAP-29). **Notification redesign (DLG-Q6/DLG-D7):** the dual 7 d/3 d single-fire model is replaced by a **3-day daily cascade** — `DelegationReviewRequested` fires once per calendar-day in the 3-day window before `review_due_at` (`days_remaining ∈ {3,2,1}`), so delegators receive a notification on each of the three days leading up to auto-end rather than two single notices. `review_last_warned_bucket CHECK` updated accordingly. No code merges were blocked by this revision — all changes are spec corrections and the implementation must be updated to match. |
 | 2.3 | 2026-08-25 | **Post-implementation correction, confirmed by a direct cross-service compatibility audit against `iam-org-membership`'s actual (not just documented) code.** Two corrections to §10.1's Core-signal contract (DLG-Q4): (1) Core renamed `TenantOffboarded` to **`TenantMembershipsPurged`** (identical payload shape) to avoid colliding with Realm Provisioner's own, differently-scoped `TenantOffboarded` event, which Core only ever consumes and never re-emits; (2) both consumed event types are published on the **same** topic, `iam.membership.events` — there is no second upstream topic (`iam.tenant.events` was never actually used for this signal). §2, §10.1, §11.6, and §18.2 are updated to match; DLG-Q4's "requires Core to add the emission" cross-team-coordination note is closed — the audit confirmed Core ships `MembershipRevoked` and `TenantMembershipsPurged` today, both correctly enqueued atomically with the triggering write. Also newly documented: Core Glue-encodes both event types by default in its own committed deployment configuration, independently of this service's own outbound Glue configuration (§10.3.1) — the consumer side needs a decode-capable codec regardless of whether this service publishes with `NoopCodec` or `GlueCodec`; the as-built fix is `eventbus.GlueDecodeCodec` (`ARCHITECTURE.md`'s "Session-specific decisions" DLG-D21). No schema, API, or published-event content changed — this revision only corrects the consumed-event contract to match Core's actual production behavior. |
 | 2.4 | 2026-08-25 | **Post-implementation correction — logging/database/events pass-through audits against `iam-user-profile`'s/`iam-org-membership`'s actual code (DLG-D22/D23/D24), plus one genuine spec bug found while writing this revision.** (1) **`api/asyncapi.yaml`'s `EventEnvelope.specversion` declared `const: "1.0"`, but the actual (and both siblings') wire value is `"1"`** — `events.WithSchemaVersion("1")` was itself missing from this service's publish path until DLG-D24 fixed it (§10.3 corrected to match; DLG-EVT-2's "byte-identical to O&M" invariant now holds for `specversion` too, not just payload shape). (2) §10.4 now documents that `outbox.Runner`'s tunables are `OUTBOX_*`-env-configurable (previously hardcoded) and that a fourth `cmd/server` background goroutine calls `PrunePublished` on a retention ticker — without it `outbox_events` grew unbounded (DLG-D24). (3) §14.5 gains the `outbox_dead_letters_total` alert, previously undocumented and unalerted (DLG-D24). Logging (DLG-D22: switched to `platform-gincommon/pkg/logger.NewLogger`) and database/`pgcommon` pass-through (DLG-D23: `DSNFromEnv`/`MigrationDSNFromEnv`/`PG_STATEMENT_TIMEOUT` support) were implementation-conformance fixes with no LLD-visible design content and are documented only in `ARCHITECTURE.md`'s decision register and `CHANGELOG.md`, per this doc's existing convention (cf. 2.1's "no design change" precedent) — noted here only for revision-history completeness. No schema, API route, or published-event *payload* content changed in this revision. |
+| 2.5 | 2026-09-03 | **Cross-service bug fix (DLG-D25), confirmed against `iam-user-profile`'s actual runtime behavior.** A delegation created with a future `starts_at` immediately called User Profile's `SetAvailability` and emitted `DelegationStarted`, showing the delegator as OOO and routing Workflow work to the delegate before the leave actually began. Fixed by adding a `scheduled` value to `delegation_status` (§7.1/§7.2.1) preceding `active` in the state machine, and a new `idx_delegations_starts_at` partial index. DLG-2 Create (§11.1) now branches on `starts.After(now)`: the existing immediate-`active` path is unchanged for the default/near-now case (within `skewTolerance`, 5s), but a genuinely future `starts_at` skips the User Profile call and `DelegationStarted` entirely and inserts the row as `scheduled`. A new `delegation-activation` CronJob (§11.1a, `*/5 * * * *`, mirrors §11.3's expiry-cron structure) calls User Profile and activates the row (`Activate`, optimistic-lock-guarded) once `starts_at` is reached, emitting `DelegationStarted` then. DLG-3 Cancel (§11.2) and the `MembershipRevoked` cascade (§11.5) were both broadened to treat `scheduled` as non-terminal alongside `active`, so a scheduled delegation is cancellable before activation and is ended (not stranded) if the delegator leaves the tenant first. No public API request/response shape changed; `GET .../delegations` (DLG-1)'s `status='active'` filter is unaffected (a `scheduled` row is, correctly, not yet listed as active). Full implementation rationale in `ARCHITECTURE.md`'s "Session-specific decisions" DLG-D25; §17 test-plan prose (state-machine/coverage bullets) and §11.3/§11.4's cron-topology cross-references were not re-walked line-by-line in this pass — treat this revision as covering the schema/flow/status-machine content only, not a full document reread. |
 
 ---
 
@@ -237,7 +238,7 @@ erDiagram
         timestamptz review_due_at "open-ended only, starts_at + review window (DEL-13)"
         int review_last_warned_bucket "3, 2, 1, or NULL — last days_remaining value notified (DLG-Q6)"
         int review_window_days "per-delegation override, range 1..180 (DEL-14)"
-        delegation_status status "ENUM active-ended-cancelled (DEL-3)"
+        delegation_status status "ENUM scheduled-active-ended-cancelled (DEL-3, DLG-D25)"
         bigint record_version "optimistic lock"
         timestamptz created_at
         timestamptz updated_at
@@ -262,8 +263,10 @@ erDiagram
 
 ```sql
 CREATE TYPE delegation_scope  AS ENUM ('all', 'department', 'tender');
-CREATE TYPE delegation_status AS ENUM ('active', 'ended', 'cancelled');
+CREATE TYPE delegation_status AS ENUM ('scheduled', 'active', 'ended', 'cancelled');
 ```
+
+`scheduled` (DLG-D25) is the initial status for a delegation whose `starts_at` is genuinely in the future — it precedes `active` in the state machine (`scheduled → active → ended|cancelled`, or `scheduled → cancelled` directly). A row created with no `starts_at`, or one within `skewTolerance` (5s) of `now`, still goes straight to `active` as before; this only defers the caller-requested future case. See revision 2.5 below and ARCHITECTURE.md's "Session-specific decisions" DLG-D25 for the full rationale and reconciler flow (a dedicated `delegation-activation` CronJob promotes `scheduled` rows to `active` once `starts_at` is reached).
 
 `EndReason` is **event-payload-only** (never a column), and — per DLG-Q5 — its domain is now `expired | cancelled | delegate_removed | review_expired`. Adopting `review_expired` (the shipped code's value) as contract makes review-driven auto-ends distinguishable from `ends_at` expiry in Audit and Notification, which is strictly more useful than overloading `expired`.
 
@@ -289,7 +292,7 @@ CREATE TABLE delegations (
   review_due_at            timestamptz,           -- open-ended only (DEL-13)
   review_last_warned_bucket int CHECK (review_last_warned_bucket IS NULL OR review_last_warned_bucket BETWEEN 1 AND 3),  -- last days_remaining value notified (DLG-Q6); NULL = no notification sent this cycle; values: 3, 2, 1
   review_window_days       int CHECK (review_window_days IS NULL OR review_window_days BETWEEN 1 AND 180),  -- seeded from tenant review_window_days at INSERT time so DLG-4 per-row priority works
-  status         delegation_status NOT NULL DEFAULT 'active',
+  status         delegation_status NOT NULL DEFAULT 'active',  -- 'scheduled' when Create computes starts_at > now() (DLG-D25); Insert always passes an explicit status, this DEFAULT only guards a direct/manual insert
   record_version bigint NOT NULL DEFAULT 1 CHECK (record_version > 0),
   created_at     timestamptz NOT NULL DEFAULT now(),
   updated_at     timestamptz NOT NULL DEFAULT now(),
@@ -305,9 +308,10 @@ CREATE INDEX idx_delegations_delegator    ON delegations (tenant_id, delegator_i
 CREATE INDEX idx_delegations_delegate     ON delegations (tenant_id, delegate_id)  WHERE deleted_at IS NULL AND status = 'active';
 CREATE INDEX idx_delegations_ends_at      ON delegations (ends_at)                 WHERE deleted_at IS NULL AND status = 'active' AND ends_at IS NOT NULL;
 CREATE INDEX idx_delegations_review_due   ON delegations (review_due_at)           WHERE ends_at IS NULL AND status = 'active';
+CREATE INDEX idx_delegations_starts_at    ON delegations (starts_at)               WHERE deleted_at IS NULL AND status = 'scheduled';  -- delegation-activation cron's ListScheduledBefore query (DLG-D25)
 ```
 
-The three intra-row CHECKs survive the split unchanged. The two former FK-support indexes (`idx_delegations_*_mem`) are dropped with the FKs. `idx_delegations_delegate` now also serves DLG-I3 (Core's dept-delegate lookup) and DLG-I4.
+The three intra-row CHECKs survive the split unchanged. The two former FK-support indexes (`idx_delegations_*_mem`) are dropped with the FKs. `idx_delegations_delegate` now also serves DLG-I3 (Core's dept-delegate lookup) and DLG-I4. `idx_delegations_starts_at` was added by DLG-D25 alongside the `scheduled` status.
 
 #### 7.2.2 `delegation_tenant_settings` (relocated from Core, DLG-Q2)
 
@@ -831,12 +835,12 @@ sequenceDiagram
     else either not active
         Core-->>DLG: {active false}
         DLG-->>DR: 422 invalid_delegate
-    else both active (each returns tenant_membership_id)
+    else both active (each returns tenant_membership_id), starts_at within skewTolerance of now or omitted
         DLG->>UP: PUT /internal/users/:delegator_id/availability {status ooo, delegate_id, ooo_note, ends_at}
         alt UP 5xx/timeout
             DLG-->>DR: 503 user_profile_unavailable
         else UP 200
-            DLG->>PG: RunInTx { INSERT delegations (incl. review_window_days from tenant settings), outbox DelegationStarted }
+            DLG->>PG: RunInTx { INSERT delegations status=active (incl. review_window_days from tenant settings), outbox DelegationStarted }
             alt RunInTx fails (DB error, pool exhaustion, etc.)
                 DLG->>UP: PUT /internal/users/:delegator_id/availability {delegate_id null} (best-effort compensating clear — BUG-05)
                 DLG-->>DR: 500 / appropriate error
@@ -846,7 +850,40 @@ sequenceDiagram
                 Note over DLG,PG: DelegationStarted → iam.delegation.events; Notification Service notifies A (confirmation) and B (assigned as delegate); Workflow reroutes
             end
         end
+    else both active, starts_at genuinely in the future (DLG-D25)
+        DLG->>PG: RunInTx { INSERT delegations status=scheduled — no UP call, no outbox event yet }
+        DLG->>DLG: SET del:idem, INVALIDATE del:list cache
+        DLG-->>DR: 201 Created
+        Note over DLG,PG: no DelegationStarted yet — delegation-activation cron (§11.1a) calls UP and activates this row once starts_at is reached
     end
+```
+
+**DLG-D25 (cross-service future-OOO bug fix):** `starts.After(now)` (`starts` = `req.StartsAt` or `now` if omitted) decides which branch runs. Before this fix, every branch called UP and emitted `DelegationStarted` immediately regardless of `starts_at`, which showed the delegator as OOO and routed Workflow to the delegate before the leave began. `starts_at` within `skewTolerance` (5s) of `now` — including the default no-`starts_at` case — still takes the immediate `active` branch; only a caller-requested `starts_at` more than 5s in the future is deferred. See §11.1a and ARCHITECTURE.md's DLG-D25 for the counterpart on the `iam-user-profile` side (that service independently defers the status flip regardless of what this caller requests).
+
+### 11.1a Activation cron (delegation-activation, DLG-D25) — availability-first, self-retrying
+
+Mirrors §11.3's expiry cron structure exactly, but promotes `scheduled → active` instead of `active → ended`.
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant CR as delegation-activation CronJob (*/5 * * * *)
+    participant DLG as Delegation Service
+    participant UP as User Profile
+    participant PG as Delegation Postgres
+
+    CR->>DLG: (in-process job call, mirrors DLG-I1/I2's reconciler topology — §16.1)
+    DLG->>PG: ListScheduledBefore: SELECT ... WHERE status='scheduled' AND starts_at <= now() AND deleted_at IS NULL ORDER BY starts_at LIMIT 100
+    loop per due delegation
+        DLG->>UP: PUT /internal/users/:delegator_id/availability {status ooo, delegate_id, ooo_note, ends_at}
+        alt UP fail
+            DLG->>DLG: leave scheduled, increment iam_delegation_activation_deferred_total, retry next tick
+        else UP 200
+            DLG->>PG: RunInTx { Activate: UPDATE status=active WHERE status='scheduled' AND record_version=v, then outbox DelegationStarted }
+            Note over DLG,PG: Activate returns nil (not an error) if the row already raced to another terminal/active state — counted as neither succeeded nor failed
+        end
+    end
+    DLG-->>CR: {attempted, succeeded, deferred, failed}
 ```
 
 ### 11.2 Cancel (DLG-3) — pointer-clear, fail-open
@@ -863,7 +900,7 @@ sequenceDiagram
     DLG->>PG: FindByID (RLS-scoped)
     DLG->>UP: PUT /internal/users/:delegator_id/availability {delegate_id null} (clear pointer only, never status available)
     Note over DLG,UP: fail-open — if UP is down, log and proceed, the expiry cron re-clears later
-    DLG->>PG: RunInTx { End status=cancelled at record_version N, then outbox DelegationEnded cancelled }
+    DLG->>PG: RunInTx { End status=cancelled at record_version N (WHERE status IN (active, scheduled) — DLG-D25), then outbox DelegationEnded cancelled }
     alt version mismatch
         DLG-->>U: 409 optimistic_lock_conflict
     else terminal already
@@ -872,6 +909,8 @@ sequenceDiagram
         DLG-->>U: 200 {delegation}
     end
 ```
+
+`End`'s `WHERE` (and `probeVersionConflict`'s terminal check) accept both `active` and `scheduled` as non-terminal (DLG-D25) — a not-yet-activated delegation must still be cancellable before it ever reaches User Profile.
 
 ### 11.3 Expiry cron (DLG-I1) — availability-first, self-retrying
 
@@ -975,8 +1014,8 @@ sequenceDiagram
     Note over Core,DLG: removal applied, ASYNC row-end here
     Core->>Core: RunInTx { remove membership }, then emit MembershipRevoked
     Core-->>DLG: MembershipRevoked (SQS delegation-cascade-q)
-    DLG->>PG: UPDATE delegations SET status='ended', deleted_at=now() WHERE tenant_id=$1 AND (delegator_id=$2 OR delegate_id=$2) AND status='active' AND deleted_at IS NULL
-    Note over DLG,PG: status='active' filter is mandatory — prevents re-ending terminal rows and corrupting deleted_at on historical records (GAP-02)
+    DLG->>PG: UPDATE delegations SET status='ended', deleted_at=now() WHERE tenant_id=$1 AND (delegator_id=$2 OR delegate_id=$2) AND status IN ('active','scheduled') AND deleted_at IS NULL
+    Note over DLG,PG: status filter is mandatory — prevents re-ending terminal rows and corrupting deleted_at on historical records (GAP-02); 'scheduled' included (DLG-D25) so a not-yet-activated delegation for a departed member is ended too, rather than stranded and later failing to activate against a member who no longer exists
     loop per ended delegation
         alt d.delegator_id == removedUser (delegator-side row)
             DLG->>DLG: silent — no UP call, no event (delegator's OOO state is on their own UP record, handled by UP's user-removal flow); DLG-EVT-4 asymmetry

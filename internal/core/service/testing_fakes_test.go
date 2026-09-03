@@ -78,6 +78,12 @@ type delegationExtendCall struct {
 	expectedVersion int64
 }
 
+type delegationActivateCall struct {
+	tenantID        uuid.UUID
+	id              uuid.UUID
+	expectedVersion int64
+}
+
 type fakeDelegationRepository struct {
 	rec *callRecorder
 
@@ -93,6 +99,10 @@ type fakeDelegationRepository struct {
 	endCalls  []delegationEndCall
 	endResult *domain.Delegation
 	endErr    error
+
+	activateCalls  []delegationActivateCall
+	activateResult *domain.Delegation
+	activateErr    error
 
 	extendCalls  []delegationExtendCall
 	extendResult *domain.Delegation
@@ -204,6 +214,35 @@ func (f *fakeDelegationRepository) End(ctx context.Context, tenantID, id uuid.UU
 	return &cp, nil
 }
 
+func (f *fakeDelegationRepository) Activate(ctx context.Context, tenantID, id uuid.UUID, expectedVersion int64) (*domain.Delegation, error) {
+	f.rec.record("delegationRepo.Activate")
+	f.mu.Lock()
+	f.activateCalls = append(f.activateCalls, delegationActivateCall{tenantID: tenantID, id: id, expectedVersion: expectedVersion})
+	f.mu.Unlock()
+	if f.activateErr != nil {
+		return nil, f.activateErr
+	}
+	if f.activateResult != nil {
+		return f.activateResult, nil
+	}
+	f.mu.Lock()
+	d, ok := f.store[id]
+	if ok && d.Status == domain.DelegationScheduled {
+		d.Status = domain.DelegationActive
+		d.RecordVersion++
+		f.store[id] = d
+	} else {
+		ok = false
+	}
+	f.mu.Unlock()
+	if !ok {
+		// Matches the real repository: no error, just "nothing to activate".
+		return nil, nil
+	}
+	cp := d
+	return &cp, nil
+}
+
 func (f *fakeDelegationRepository) ExtendReview(ctx context.Context, tenantID, id uuid.UUID, windowDays int, expectedVersion int64) (*domain.Delegation, error) {
 	f.rec.record("delegationRepo.ExtendReview")
 	f.mu.Lock()
@@ -227,6 +266,11 @@ func (f *fakeDelegationRepository) ExtendReview(ctx context.Context, tenantID, i
 
 func (f *fakeDelegationRepository) ListExpiringBefore(ctx context.Context, before time.Time, limit int) ([]domain.Delegation, error) {
 	f.rec.record("delegationRepo.ListExpiringBefore")
+	return nil, nil
+}
+
+func (f *fakeDelegationRepository) ListScheduledBefore(ctx context.Context, before time.Time, limit int) ([]domain.Delegation, error) {
+	f.rec.record("delegationRepo.ListScheduledBefore")
 	return nil, nil
 }
 

@@ -187,18 +187,53 @@ func (r *DelegationRepository) Insert(ctx context.Context, d *domain.Delegation)
 }
 
 // End flips status → 'ended'/'cancelled' with optimistic locking (LLD §12.1).
+// Matches both 'active' and 'scheduled' rows in its WHERE clause — a
+// not-yet-activated (DLG-D25) delegation must still be cancellable before
+// its starts_at is ever reached.
 func (r *DelegationRepository) End(ctx context.Context, tenantID, id uuid.UUID, status domain.DelegationStatus, expectedVersion int64) (*domain.Delegation, error) {
 	var out *domain.Delegation
 	err := withPool(ctx, r.pool, func(tx pgx.Tx) error {
 		row := tx.QueryRow(ctx, `
 			UPDATE delegations SET status = $3
-			WHERE tenant_id = $1 AND id = $2 AND record_version = $4 AND deleted_at IS NULL AND status = 'active'
+			WHERE tenant_id = $1 AND id = $2 AND record_version = $4 AND deleted_at IS NULL
+			  AND status IN ('active', 'scheduled')
 			RETURNING `+delegationCols,
 			tenantID, id, string(status), expectedVersion)
 		d, err := scanDelegation(row)
 		if err != nil {
 			if errors.Is(err, pgx.ErrNoRows) {
 				return r.probeVersionConflict(ctx, tx, tenantID, id)
+			}
+			return err
+		}
+		out = d
+		return nil
+	})
+	return out, err
+}
+
+// Activate flips a 'scheduled' row to 'active' with optimistic locking —
+// the delegation-activation reconciler job's counterpart to End (DLG-D25,
+// cross-service future-OOO bug fix). Unlike End, a zero-row UPDATE is not
+// distinguished into NotFound vs. Conflict via probeVersionConflict: this is
+// a system-driven background sweep, not a user-facing call, so "the row no
+// longer matches (already cancelled, already activated by a racing tick, or
+// gone)" is uniformly reported as (nil, nil) — the caller treats that as
+// "nothing to activate here" and moves on, matching how
+// resetOneExpiredRow-style sweeps in the sibling IAM services treat a
+// pgx.ErrNoRows race.
+func (r *DelegationRepository) Activate(ctx context.Context, tenantID, id uuid.UUID, expectedVersion int64) (*domain.Delegation, error) {
+	var out *domain.Delegation
+	err := withPool(ctx, r.pool, func(tx pgx.Tx) error {
+		row := tx.QueryRow(ctx, `
+			UPDATE delegations SET status = 'active'
+			WHERE tenant_id = $1 AND id = $2 AND record_version = $3 AND deleted_at IS NULL AND status = 'scheduled'
+			RETURNING `+delegationCols,
+			tenantID, id, expectedVersion)
+		d, err := scanDelegation(row)
+		if err != nil {
+			if errors.Is(err, pgx.ErrNoRows) {
+				return nil
 			}
 			return err
 		}
@@ -272,7 +307,9 @@ func (r *DelegationRepository) probeVersionConflict(ctx context.Context, tx pgx.
 		return err
 	}
 	// Terminal state (cancelled/ended) — treat as not found per DEL-3.
-	if s != "active" {
+	// 'scheduled' is not terminal (DLG-D25) — only End calls this probe, and
+	// its own WHERE clause already accepts scheduled rows.
+	if s != "active" && s != "scheduled" {
 		return domain.NewError(domain.ErrDelegationNotFound, "delegation not found")
 	}
 	return domain.NewError(domain.ErrOptimisticLockConflict, "record version conflict").
@@ -283,6 +320,15 @@ func (r *DelegationRepository) probeVersionConflict(ctx context.Context, tx pgx.
 func (r *DelegationRepository) ListExpiringBefore(ctx context.Context, before time.Time, limit int) ([]domain.Delegation, error) {
 	return r.listWhere(ctx,
 		`WHERE ends_at IS NOT NULL AND ends_at < $1 AND status = 'active' AND deleted_at IS NULL ORDER BY ends_at LIMIT $2`,
+		before, limitOrDefault(limit))
+}
+
+// ListScheduledBefore implements port.DelegationRepository.ListScheduledBefore
+// — the delegation-activation cron query (DLG-D25, mirrors ListExpiringBefore
+// for the forward direction).
+func (r *DelegationRepository) ListScheduledBefore(ctx context.Context, before time.Time, limit int) ([]domain.Delegation, error) {
+	return r.listWhere(ctx,
+		`WHERE status = 'scheduled' AND starts_at <= $1 AND deleted_at IS NULL ORDER BY starts_at LIMIT $2`,
 		before, limitOrDefault(limit))
 }
 
@@ -332,15 +378,19 @@ func (r *DelegationRepository) MarkReviewWarned(ctx context.Context, tenantID, i
 // ── Cascade (LLD §11.5/§11.6) ───────────────────────────────────────────────
 
 // EndForUser cascades on MembershipRevoked — closes (status=ended,
-// deleted_at=now()) any active delegations where userID is delegator or
-// delegate. Deliberately not optimistic-locked (terminal bulk cascade,
-// LLD §12.1).
+// deleted_at=now()) any active OR scheduled delegations where userID is
+// delegator or delegate. Deliberately not optimistic-locked (terminal bulk
+// cascade, LLD §12.1). Scheduled rows are included (DLG-D25) so a departed
+// member's not-yet-activated delegation is cleaned up now rather than left
+// for the activation job to later try (and fail) against membership that no
+// longer exists.
 func (r *DelegationRepository) EndForUser(ctx context.Context, tenantID, userID uuid.UUID) ([]domain.Delegation, error) {
 	var out []domain.Delegation
 	err := withPool(ctx, r.pool, func(tx pgx.Tx) error {
 		rows, err := tx.Query(ctx, `
 			UPDATE delegations SET status = 'ended', deleted_at = now()
-			WHERE tenant_id = $1 AND (delegator_id = $2 OR delegate_id = $2) AND status = 'active' AND deleted_at IS NULL
+			WHERE tenant_id = $1 AND (delegator_id = $2 OR delegate_id = $2)
+			  AND status IN ('active', 'scheduled') AND deleted_at IS NULL
 			RETURNING `+delegationCols,
 			tenantID, userID)
 		if err != nil {

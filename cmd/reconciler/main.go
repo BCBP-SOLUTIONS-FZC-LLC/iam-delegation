@@ -1,8 +1,9 @@
-// Command iam-delegation-reconciler runs one of the three CronJob entry
-// points (delegation-expiry, delegation-review, delegation-cleanup, LLD
-// §16.1) selected by --job, then exits. The Helm chart's three CronJob
-// templates each invoke this binary with a fixed --job value on their own
-// schedule (*/5 * * * *, hourly, monthly — LLD §15/§21.2).
+// Command iam-delegation-reconciler runs one of the four CronJob entry
+// points (delegation-expiry, delegation-activation, delegation-review,
+// delegation-cleanup, LLD §16.1) selected by --job, then exits. The Helm
+// chart's four CronJob templates each invoke this binary with a fixed --job
+// value on their own schedule (*/5 * * * *, */5 * * * *, hourly, monthly —
+// LLD §15/§21.2).
 //
 // This binary shares cmd/reconciler/jobs' implementation with cmd/server's
 // DLG-I1/I2 HTTP entry points (DLG-D17) rather than calling them over HTTP.
@@ -41,7 +42,7 @@ func main() {
 }
 
 func run(logger Logger) error {
-	jobName := flag.String("job", "", "one of: delegation-expiry, delegation-review, delegation-cleanup")
+	jobName := flag.String("job", "", "one of: delegation-expiry, delegation-activation, delegation-review, delegation-cleanup")
 	flag.Parse()
 	if *jobName == "" {
 		return errors.New("--job is required")
@@ -156,6 +157,8 @@ func run(logger Logger) error {
 	switch *jobName {
 	case "delegation-expiry":
 		result, err = jobs.Expiry(ctx, jctx)
+	case "delegation-activation":
+		result, err = jobs.Activation(ctx, jctx)
 	case "delegation-review":
 		result, err = jobs.ReviewSweep(ctx, jctx)
 	case "delegation-cleanup":

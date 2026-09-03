@@ -13,7 +13,10 @@ CREATE EXTENSION IF NOT EXISTS pgcrypto WITH SCHEMA public;
 
 -- ── Enum types (LLD §7.1) ─────────────────────────────────────────────────
 CREATE TYPE public.delegation_scope  AS ENUM ('all', 'department', 'tender');
-CREATE TYPE public.delegation_status AS ENUM ('active', 'ended', 'cancelled');
+-- scheduled: cross-service future-OOO bug fix (DLG-D25) — a delegation
+-- created with a future starts_at sits here until the delegation-activation
+-- reconciler job flips it to active at starts_at; see domain.DelegationStatus.
+CREATE TYPE public.delegation_status AS ENUM ('scheduled', 'active', 'ended', 'cancelled');
 
 -- ── app_tenant_id() ───────────────────────────────────────────────────────
 -- Reads the tenant GUC set by the pgcommon GUC bridge. STABLE (evaluates
@@ -69,12 +72,14 @@ CREATE TABLE public.delegations (
     CONSTRAINT chk_ends_after_starts CHECK (ends_at IS NULL OR ends_at > starts_at)
 );
 
--- Five partial indexes exactly per LLD §7.2.1.
+-- Five partial indexes exactly per LLD §7.2.1, plus idx_delegations_starts_at
+-- (DLG-D25, cross-service future-OOO bug fix) for the new activation sweep.
 CREATE INDEX idx_delegations_tenant     ON public.delegations (tenant_id)               WHERE deleted_at IS NULL AND status = 'active';
 CREATE INDEX idx_delegations_delegator  ON public.delegations (tenant_id, delegator_id) WHERE deleted_at IS NULL AND status = 'active';
 CREATE INDEX idx_delegations_delegate   ON public.delegations (tenant_id, delegate_id)  WHERE deleted_at IS NULL AND status = 'active';
 CREATE INDEX idx_delegations_ends_at    ON public.delegations (ends_at)                 WHERE deleted_at IS NULL AND status = 'active' AND ends_at IS NOT NULL;
 CREATE INDEX idx_delegations_review_due ON public.delegations (review_due_at)           WHERE ends_at IS NULL AND status = 'active';
+CREATE INDEX idx_delegations_starts_at  ON public.delegations (starts_at)               WHERE deleted_at IS NULL AND status = 'scheduled';
 
 -- ── delegation_tenant_settings (LLD §7.2.2, DLG-D2) ──────────────────────
 -- Relocated from Core's tenants.delegation_max_duration_days /

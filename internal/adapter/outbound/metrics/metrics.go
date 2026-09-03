@@ -26,6 +26,7 @@ type Metrics struct {
 	endedTotal                   *prometheus.CounterVec
 	activeGauge                  *prometheus.GaugeVec
 	expiryDeferredTotal          prometheus.Counter
+	activationDeferredTotal      prometheus.Counter
 	reviewDeferredTotal          prometheus.Counter
 	reviewWarnedTotal            *prometheus.CounterVec
 	reviewExpiredTotal           prometheus.Counter
@@ -69,6 +70,12 @@ func Register(reg prometheus.Registerer) (*Metrics, error) {
 			prometheus.CounterOpts{
 				Name: "iam_delegation_expiry_deferred_total",
 				Help: "Total DEL-6 expiry auto-end cron passes deferred because iam-user-profile was unavailable.",
+			},
+		),
+		activationDeferredTotal: prometheus.NewCounter(
+			prometheus.CounterOpts{
+				Name: "iam_delegation_activation_deferred_total",
+				Help: "Total DLG-D25 activation cron passes deferred because iam-user-profile was unavailable.",
 			},
 		),
 		reviewDeferredTotal: prometheus.NewCounter(
@@ -132,7 +139,7 @@ func Register(reg prometheus.Registerer) (*Metrics, error) {
 
 	collectors := []prometheus.Collector{
 		m.createdTotal, m.endedTotal, m.activeGauge,
-		m.expiryDeferredTotal, m.reviewDeferredTotal, m.reviewWarnedTotal, m.reviewExpiredTotal,
+		m.expiryDeferredTotal, m.activationDeferredTotal, m.reviewDeferredTotal, m.reviewWarnedTotal, m.reviewExpiredTotal,
 		m.membershipCheckDuration, m.membershipCheckFailuresTotal,
 		m.upAvailabilityFailuresTotal, m.idempotencyHitsTotal,
 		m.cascadeProcessedTotal, m.cascadeDLQTotal,
@@ -178,6 +185,11 @@ func (m *Metrics) SetActiveGauge(tenant string, count float64) {
 // RecordExpiryDeferred increments iam_delegation_expiry_deferred_total.
 func (m *Metrics) RecordExpiryDeferred() {
 	m.expiryDeferredTotal.Inc()
+}
+
+// RecordActivationDeferred increments iam_delegation_activation_deferred_total.
+func (m *Metrics) RecordActivationDeferred() {
+	m.activationDeferredTotal.Inc()
 }
 
 // RecordReviewDeferred increments iam_delegation_review_deferred_total.

@@ -1,25 +1,25 @@
-{{- if .Values.cronJobs.review.enabled }}
+{{- if .Values.cronJobs.activation.enabled }}
 apiVersion: batch/v1
 kind: CronJob
 metadata:
-  name: {{ include "iam-delegation.fullname" . }}-review
+  name: {{ include "iam-delegation.fullname" . }}-activation
   labels:
     {{- include "iam-delegation.labels" . | nindent 4 }}
-    app.kubernetes.io/component: cronjob-review
+    app.kubernetes.io/component: cronjob-activation
 spec:
-  schedule: {{ .Values.cronJobs.review.schedule | quote }}
-  concurrencyPolicy: {{ .Values.cronJobs.review.concurrencyPolicy }}
-  successfulJobsHistoryLimit: {{ .Values.cronJobs.review.successfulJobsHistoryLimit }}
-  failedJobsHistoryLimit: {{ .Values.cronJobs.review.failedJobsHistoryLimit }}
+  schedule: {{ .Values.cronJobs.activation.schedule | quote }}
+  concurrencyPolicy: {{ .Values.cronJobs.activation.concurrencyPolicy }}
+  successfulJobsHistoryLimit: {{ .Values.cronJobs.activation.successfulJobsHistoryLimit }}
+  failedJobsHistoryLimit: {{ .Values.cronJobs.activation.failedJobsHistoryLimit }}
   jobTemplate:
     spec:
-      activeDeadlineSeconds: {{ .Values.cronJobs.review.activeDeadlineSeconds }}
+      activeDeadlineSeconds: {{ .Values.cronJobs.activation.activeDeadlineSeconds }}
       backoffLimit: 2
       template:
         metadata:
           labels:
             {{- include "iam-delegation.selectorLabels" . | nindent 12 }}
-            app.kubernetes.io/component: cronjob-review
+            app.kubernetes.io/component: cronjob-activation
           annotations:
             {{- if .Values.existingSecret }}
             rotationEpoch: {{ .Values.rotationEpoch | default "0" | quote }}
@@ -32,7 +32,7 @@ spec:
           securityContext:
             {{- toYaml .Values.podSecurityContext | nindent 12 }}
           containers:
-            - name: delegation-review
+            - name: delegation-activation
               image: "{{ .Values.image.repository }}:{{ include "iam-delegation.imageTag" . }}"
               imagePullPolicy: {{ .Values.image.pullPolicy }}
               # Same image as the server Deployment (single Dockerfile) —
@@ -41,21 +41,21 @@ spec:
               command: ["/iam-delegation-reconciler"]
               securityContext:
                 {{- toYaml .Values.securityContext | nindent 16 }}
-              # --job=delegation-review selects DLG-I2 (LLD §11.4 — the
-              # 3-day daily-cascade review-window warning sweep, then
-              # auto-end with ended_reason=review_expired, DLG-D6/DLG-D7) out
-              # of the single
-              # iam-delegation-reconciler binary, which also hosts the
-              # expiry and cleanup entry points (cronjob-expiry.yaml /
-              # cronjob-cleanup.yaml). cmd/reconciler/main.go MUST parse a
-              # `--job` flag accepting exactly these four values
-              # (delegation-expiry | delegation-activation |
-              #  delegation-review | delegation-cleanup)
-              # — this is this chart's own convention, kept in one place
-              # (.Values.cronJobs.*.jobName) so it can't drift between the
-              # four CronJob templates.
+              # --job=delegation-activation selects DLG-D25 (the
+              # cross-service future-OOO bug fix's forward-sweep
+              # counterpart to delegation-expiry, cronjob-expiry.yaml) out
+              # of the single iam-delegation-reconciler binary, which also
+              # hosts the review and cleanup entry points
+              # (cronjob-review.yaml / cronjob-cleanup.yaml).
+              # cmd/reconciler/main.go MUST parse a `--job` flag accepting
+              # exactly these four values (delegation-expiry |
+              # delegation-activation | delegation-review |
+              # delegation-cleanup) — this is this chart's own convention
+              # (LLD §16.1 leaves the dispatch mechanism unspecified), kept
+              # in one place (.Values.cronJobs.*.jobName) so it can't drift
+              # between the four CronJob templates.
               args:
-                - "--job={{ .Values.cronJobs.review.jobName }}"
+                - "--job={{ .Values.cronJobs.activation.jobName }}"
               env:
                 {{- range $key, $val := .Values.env }}
                 - name: {{ $key }}
@@ -75,7 +75,7 @@ spec:
                       key: {{ . }}
                 {{- end }}
               resources:
-                {{- toYaml .Values.cronJobs.review.resources | nindent 16 }}
+                {{- toYaml .Values.cronJobs.activation.resources | nindent 16 }}
               volumeMounts:
                 - name: tmp
                   mountPath: /tmp

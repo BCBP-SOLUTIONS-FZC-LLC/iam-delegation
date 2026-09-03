@@ -139,26 +139,47 @@ func (s *DelegationService) Create(ctx context.Context, tenantID, delegatorID uu
 		return nil, err
 	}
 
-	// DEL-6 availability-first: call UP BEFORE any write. Clamp oooFrom to
-	// now() when starts_at is in the past relative to UP (a past starts_at
-	// is allowed here — the delegation is immediately active).
-	oooFrom := starts
-	if oooFrom.Before(now) {
-		oooFrom = now
+	// DLG-D25 (cross-service future-OOO bug fix): a delegation whose
+	// starts_at is genuinely in the future must not call User Profile or
+	// emit DelegationStarted yet — that would show the delegator as OOO,
+	// and route work to the delegate, before the actual leave begins. Such
+	// a delegation is created 'scheduled' instead of 'active'; the
+	// delegation-activation reconciler job calls User Profile and flips it
+	// to 'active' (emitting DelegationStarted then) once starts_at is
+	// reached. starts is never before now by more than skewTolerance (see
+	// the validation above), so this only defers a caller-requested future
+	// starts_at — the default "no starts_at" (starts == now) case, and an
+	// explicit starts_at within clock-skew tolerance of now, both still
+	// activate immediately with no behavior change.
+	isScheduled := starts.After(now)
+
+	// DEL-6 availability-first: call UP BEFORE any write, unless deferred.
+	// Clamp oooFrom to now() when starts_at is in the past relative to UP (a
+	// past starts_at is allowed here — the delegation is immediately active).
+	if !isScheduled {
+		oooFrom := starts
+		if oooFrom.Before(now) {
+			oooFrom = now
+		}
+		oooStatus := "ooo"
+		if err := s.userProfile.SetAvailability(ctx, port.SetAvailabilityRequest{
+			TenantID: tenantID, UserID: delegatorID,
+			Status: &oooStatus, OOOFrom: &oooFrom, OOOUntil: req.EndsAt,
+			DelegateID: &req.DelegateID, Note: req.Reason,
+		}); err != nil {
+			if errors.Is(err, port.ErrDependencyUnavailable) {
+				return nil, domain.NewError(domain.ErrUserProfileUnavailable, "user profile unavailable")
+			}
+			if strings.Contains(err.Error(), "delegate_unavailable") {
+				return nil, domain.NewError(domain.ErrDelegateUnavailable, "delegate is currently unavailable (OOO)")
+			}
+			return nil, domain.NewError(domain.ErrInvalidDelegate, "delegate validation failed via user profile")
+		}
 	}
-	oooStatus := "ooo"
-	if err := s.userProfile.SetAvailability(ctx, port.SetAvailabilityRequest{
-		TenantID: tenantID, UserID: delegatorID,
-		Status: &oooStatus, OOOFrom: &oooFrom, OOOUntil: req.EndsAt,
-		DelegateID: &req.DelegateID, Note: req.Reason,
-	}); err != nil {
-		if errors.Is(err, port.ErrDependencyUnavailable) {
-			return nil, domain.NewError(domain.ErrUserProfileUnavailable, "user profile unavailable")
-		}
-		if strings.Contains(err.Error(), "delegate_unavailable") {
-			return nil, domain.NewError(domain.ErrDelegateUnavailable, "delegate is currently unavailable (OOO)")
-		}
-		return nil, domain.NewError(domain.ErrInvalidDelegate, "delegate validation failed via user profile")
+
+	initialStatus := domain.DelegationActive
+	if isScheduled {
+		initialStatus = domain.DelegationScheduled
 	}
 
 	scope := domain.DelegationScope(req.Scope)
@@ -181,6 +202,7 @@ func (s *DelegationService) Create(ctx context.Context, tenantID, delegatorID uu
 			Reason:                req.Reason,
 			StartsAt:              starts,
 			EndsAt:                req.EndsAt,
+			Status:                initialStatus,
 			ReviewDueAt:           reviewDueAt,
 			ReviewWindowDays:      &reviewWindowDays,
 		})
@@ -188,6 +210,11 @@ func (s *DelegationService) Create(ctx context.Context, tenantID, delegatorID uu
 			return err
 		}
 		created = out
+		if isScheduled {
+			// No event yet — delegation-activation enqueues DelegationStarted
+			// when it actually activates this row at starts_at.
+			return nil
+		}
 		return enqueue(txCtx, domain.EventDelegationStarted, tenantID, out.ID.String(), delegatorID.String(),
 			domain.DelegationStartedPayload{
 				DelegationID: out.ID, TenantID: tenantID,
@@ -198,12 +225,15 @@ func (s *DelegationService) Create(ctx context.Context, tenantID, delegatorID uu
 			})
 	})
 	if err != nil {
-		// best-effort compensating UP pointer clear — UP was already updated
-		// before this tx; if tx failed, clear the stale OOO pointer
-		//nolint:errcheck // best-effort: failure is logged by UP client; must not mask the original tx error
-		_ = s.userProfile.SetAvailability(ctx, port.SetAvailabilityRequest{
-			TenantID: tenantID, UserID: delegatorID, ClearDelegate: true,
-		})
+		if !isScheduled {
+			// best-effort compensating UP pointer clear — UP was already
+			// updated before this tx; if tx failed, clear the stale OOO
+			// pointer. Not needed when isScheduled: UP was never called.
+			//nolint:errcheck // best-effort: failure is logged by UP client; must not mask the original tx error
+			_ = s.userProfile.SetAvailability(ctx, port.SetAvailabilityRequest{
+				TenantID: tenantID, UserID: delegatorID, ClearDelegate: true,
+			})
+		}
 		return nil, err
 	}
 

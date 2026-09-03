@@ -181,6 +181,75 @@ func TestDelegationRepository_ListExpiringBefore(t *testing.T) {
 	assert.Equal(t, inScope, rows[0].ID)
 }
 
+// ── DLG-D25 (cross-service future-OOO bug fix) ───────────────────────────
+
+func TestDelegationRepository_ListScheduledBefore(t *testing.T) {
+	db := setupTestDB(t)
+	ctx := context.Background()
+	repo := NewDelegationRepository(db.App)
+	tenantID := uuid.New()
+
+	now := time.Now().UTC()
+	due := seedDelegation(t, ctx, db.Raw, seedDelegationOpts{TenantID: tenantID, Status: "scheduled", StartsAt: timePtr(now.Add(-1 * time.Minute))})
+	_ = seedDelegation(t, ctx, db.Raw, seedDelegationOpts{TenantID: tenantID, Status: "scheduled", StartsAt: timePtr(now.Add(48 * time.Hour))}) // not yet due
+	_ = seedDelegation(t, ctx, db.Raw, seedDelegationOpts{TenantID: tenantID, Status: "active"})                                                // already active, out of scope
+
+	ctxA := withTenant(ctx, tenantID)
+	rows, err := repo.ListScheduledBefore(ctxA, now, 10)
+	require.NoError(t, err)
+	require.Len(t, rows, 1)
+	assert.Equal(t, due, rows[0].ID)
+}
+
+func TestDelegationRepository_Activate(t *testing.T) {
+	db := setupTestDB(t)
+	ctx := context.Background()
+	repo := NewDelegationRepository(db.App)
+	tenantID := uuid.New()
+	ctxA := withTenant(ctx, tenantID)
+
+	id := seedDelegation(t, ctx, db.Raw, seedDelegationOpts{TenantID: tenantID, Status: "scheduled"})
+
+	// Wrong version -> nil, nil (a system-driven sweep, not a user-facing
+	// call — see Activate's own doc comment).
+	activated, err := repo.Activate(ctxA, tenantID, id, 999)
+	require.NoError(t, err)
+	assert.Nil(t, activated)
+
+	// Correct version -> success.
+	activated, err = repo.Activate(ctxA, tenantID, id, 1)
+	require.NoError(t, err)
+	require.NotNil(t, activated)
+	assert.Equal(t, domain.DelegationActive, activated.Status)
+	assert.Equal(t, int64(2), activated.RecordVersion)
+
+	// Already active -> nil, nil, not activated a second time.
+	activated, err = repo.Activate(ctxA, tenantID, id, 2)
+	require.NoError(t, err)
+	assert.Nil(t, activated)
+
+	// Absent id -> nil, nil (not an error — mirrors "nothing to activate").
+	activated, err = repo.Activate(ctxA, tenantID, uuid.New(), 1)
+	require.NoError(t, err)
+	assert.Nil(t, activated)
+}
+
+func TestDelegationRepository_End_CancelsScheduledDelegation(t *testing.T) {
+	db := setupTestDB(t)
+	ctx := context.Background()
+	repo := NewDelegationRepository(db.App)
+	tenantID := uuid.New()
+	ctxA := withTenant(ctx, tenantID)
+
+	// A not-yet-activated (scheduled) delegation must still be cancellable
+	// before its starts_at is ever reached (DLG-D25).
+	id := seedDelegation(t, ctx, db.Raw, seedDelegationOpts{TenantID: tenantID, Status: "scheduled"})
+
+	cancelled, err := repo.End(ctxA, tenantID, id, domain.DelegationCancelled, 1)
+	require.NoError(t, err)
+	assert.Equal(t, domain.DelegationCancelled, cancelled.Status)
+}
+
 func TestDelegationRepository_FindActiveDeptDelegateForUser(t *testing.T) {
 	db := setupTestDB(t)
 	ctx := context.Background()
@@ -302,6 +371,30 @@ func TestDelegationRepository_EndForUser(t *testing.T) {
 	stillActive, err := repo.FindByID(ctxA, tenantID, unrelated)
 	require.NoError(t, err)
 	assert.Equal(t, domain.DelegationActive, stillActive.Status)
+}
+
+// TestDelegationRepository_EndForUser_IncludesScheduled verifies DLG-D25:
+// a departed member's not-yet-activated delegation must be cleaned up by
+// the MembershipRevoked cascade too, not just active ones — otherwise the
+// activation job would later try to activate a delegation for membership
+// that no longer exists.
+func TestDelegationRepository_EndForUser_IncludesScheduled(t *testing.T) {
+	db := setupTestDB(t)
+	ctx := context.Background()
+	repo := NewDelegationRepository(db.App)
+	tenantID := uuid.New()
+	userID := uuid.New()
+	ctxA := withTenant(ctx, tenantID)
+
+	scheduledAsDelegator := seedDelegation(t, ctx, db.Raw, seedDelegationOpts{TenantID: tenantID, DelegatorID: userID, Status: "scheduled"})
+
+	ended, err := repo.EndForUser(ctxA, tenantID, userID)
+	require.NoError(t, err)
+	endedIDs := idsOf(ended)
+	assert.ElementsMatch(t, []uuid.UUID{scheduledAsDelegator}, endedIDs)
+	require.Len(t, ended, 1)
+	assert.Equal(t, domain.DelegationEnded, ended[0].Status)
+	assert.NotNil(t, ended[0].DeletedAt)
 }
 
 func TestDelegationRepository_SoftDeleteTenant(t *testing.T) {

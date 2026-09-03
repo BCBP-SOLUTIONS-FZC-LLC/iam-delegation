@@ -52,13 +52,17 @@ func (f *fakeTxRunner) EnqueueCtx(_ context.Context, evt *domain.DomainEvent) er
 type fakeDelegationRepo struct {
 	port.DelegationRepository
 
-	expiring  []domain.Delegation
-	dailyWarn []domain.Delegation
-	autoEnd   []domain.Delegation
-	endErr    error
-	warnErr   error
-	endCalls  []uuid.UUID
-	warnCalls []struct {
+	expiring      []domain.Delegation
+	scheduled     []domain.Delegation
+	dailyWarn     []domain.Delegation
+	autoEnd       []domain.Delegation
+	endErr        error
+	activateErr   error
+	activateNil   bool // Activate returns (nil, nil) — "raced", not an error
+	warnErr       error
+	endCalls      []uuid.UUID
+	activateCalls []uuid.UUID
+	warnCalls     []struct {
 		id     uuid.UUID
 		bucket int
 	}
@@ -69,6 +73,19 @@ type fakeDelegationRepo struct {
 
 func (f *fakeDelegationRepo) ListExpiringBefore(context.Context, time.Time, int) ([]domain.Delegation, error) {
 	return f.expiring, nil
+}
+func (f *fakeDelegationRepo) ListScheduledBefore(context.Context, time.Time, int) ([]domain.Delegation, error) {
+	return f.scheduled, nil
+}
+func (f *fakeDelegationRepo) Activate(_ context.Context, _, id uuid.UUID, _ int64) (*domain.Delegation, error) {
+	f.activateCalls = append(f.activateCalls, id)
+	if f.activateErr != nil {
+		return nil, f.activateErr
+	}
+	if f.activateNil {
+		return nil, nil
+	}
+	return &domain.Delegation{ID: id}, nil
 }
 func (f *fakeDelegationRepo) FindDueForDailyWarn(context.Context, time.Time, int) ([]domain.Delegation, error) {
 	return f.dailyWarn, nil
@@ -97,16 +114,18 @@ func (f *fakeDelegationRepo) HardPurgeSoftDeletedBefore(_ context.Context, befor
 
 func noopBind(ctx context.Context, _ uuid.UUID, _ string) context.Context { return ctx }
 
-// fakeMetrics records calls to the two deferred-counter methods so tests can
-// assert GAP-27 closure: the reconciler jobs must actually call these, not
-// just have them registered (DLG-D19).
+// fakeMetrics records calls to the three deferred-counter methods so tests
+// can assert GAP-27 closure: the reconciler jobs must actually call these,
+// not just have them registered (DLG-D19).
 type fakeMetrics struct {
-	expiryDeferred int
-	reviewDeferred int
+	expiryDeferred     int
+	activationDeferred int
+	reviewDeferred     int
 }
 
-func (f *fakeMetrics) RecordExpiryDeferred() { f.expiryDeferred++ }
-func (f *fakeMetrics) RecordReviewDeferred() { f.reviewDeferred++ }
+func (f *fakeMetrics) RecordExpiryDeferred()     { f.expiryDeferred++ }
+func (f *fakeMetrics) RecordActivationDeferred() { f.activationDeferred++ }
+func (f *fakeMetrics) RecordReviewDeferred()     { f.reviewDeferred++ }
 
 func newDelegation(delegatorID uuid.UUID) domain.Delegation {
 	return domain.Delegation{
@@ -213,6 +232,131 @@ func TestExpiry_UnexpectedRepoError_CountsAsFailed(t *testing.T) {
 	}
 	if res.Failed != 1 {
 		t.Fatalf("expected 1 failure, got %+v", res)
+	}
+}
+
+// ── Activation (DLG-D25, cross-service future-OOO bug fix) ────────────────
+
+func newScheduledDelegation(delegatorID uuid.UUID) domain.Delegation {
+	d := newDelegation(delegatorID)
+	d.Status = domain.DelegationScheduled
+	return d
+}
+
+func TestActivation_HappyPath_ActivatesAndEmits(t *testing.T) {
+	d := newScheduledDelegation(uuid.New())
+	repo := &fakeDelegationRepo{scheduled: []domain.Delegation{d}}
+	up := &fakeUserProfile{}
+	tx := &fakeTxRunner{}
+	jctx := &Context{Delegations: repo, UserProfile: up, TxRunner: tx, BindTenantGUC: noopBind, Logger: fakeLogger{}}
+
+	res, err := Activation(context.Background(), jctx)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if res.Attempted != 1 || res.Succeeded != 1 || res.Failed != 0 {
+		t.Fatalf("unexpected result: %+v", res)
+	}
+	if len(repo.activateCalls) != 1 || repo.activateCalls[0] != d.ID {
+		t.Fatalf("Activate not called with expected id: %v", repo.activateCalls)
+	}
+	if len(up.calls) != 1 || up.calls[0] != d.DelegatorID {
+		t.Fatalf("expected UP SetAvailability to be called for the delegator: %v", up.calls)
+	}
+	if len(tx.published) != 1 || tx.published[0].Type != domain.EventDelegationStarted {
+		t.Fatalf("expected one DelegationStarted event, got %+v", tx.published)
+	}
+	payload := tx.published[0].Data.(domain.DelegationStartedPayload)
+	if payload.ActorID != domain.SystemActorID {
+		t.Fatalf("expected actor_id=system for a cron-origin activation, got %q", payload.ActorID)
+	}
+}
+
+func TestActivation_UPFailure_Defers_NoActivateCall(t *testing.T) {
+	d := newScheduledDelegation(uuid.New())
+	repo := &fakeDelegationRepo{scheduled: []domain.Delegation{d}}
+	up := &fakeUserProfile{failFor: map[uuid.UUID]bool{d.DelegatorID: true}}
+	tx := &fakeTxRunner{}
+	m := &fakeMetrics{}
+	jctx := &Context{Delegations: repo, UserProfile: up, TxRunner: tx, BindTenantGUC: noopBind, Logger: fakeLogger{}, Metrics: m}
+
+	res, err := Activation(context.Background(), jctx)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if res.Deferred != 1 || res.Succeeded != 0 || res.Failed != 0 {
+		t.Fatalf("unexpected result: %+v", res)
+	}
+	if len(repo.activateCalls) != 0 {
+		t.Fatalf("Activate must not be called when UP set-availability fails (DLG-D25): %v", repo.activateCalls)
+	}
+	if len(tx.published) != 0 {
+		t.Fatalf("no event should be emitted when the row is deferred: %v", tx.published)
+	}
+	if m.activationDeferred != 1 {
+		t.Fatalf("expected iam_delegation_activation_deferred_total to be incremented once, got %d", m.activationDeferred)
+	}
+}
+
+func TestActivation_UPFailure_Defers_NilMetricsDoesNotPanic(t *testing.T) {
+	d := newScheduledDelegation(uuid.New())
+	repo := &fakeDelegationRepo{scheduled: []domain.Delegation{d}}
+	up := &fakeUserProfile{failFor: map[uuid.UUID]bool{d.DelegatorID: true}}
+	tx := &fakeTxRunner{}
+	jctx := &Context{Delegations: repo, UserProfile: up, TxRunner: tx, BindTenantGUC: noopBind, Logger: fakeLogger{}}
+
+	if _, err := Activation(context.Background(), jctx); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+}
+
+func TestActivation_Raced_NeitherSucceededNorFailed(t *testing.T) {
+	d := newScheduledDelegation(uuid.New())
+	repo := &fakeDelegationRepo{scheduled: []domain.Delegation{d}, activateNil: true}
+	up := &fakeUserProfile{}
+	tx := &fakeTxRunner{}
+	jctx := &Context{Delegations: repo, UserProfile: up, TxRunner: tx, BindTenantGUC: noopBind, Logger: fakeLogger{}}
+
+	res, err := Activation(context.Background(), jctx)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if res.Succeeded != 0 || res.Failed != 0 || res.Attempted != 1 {
+		t.Fatalf("a race should count toward neither succeeded nor failed: %+v", res)
+	}
+	if len(tx.published) != 0 {
+		t.Fatalf("no event should be emitted on a race: %v", tx.published)
+	}
+}
+
+func TestActivation_UnexpectedRepoError_CountsAsFailed(t *testing.T) {
+	d := newScheduledDelegation(uuid.New())
+	repo := &fakeDelegationRepo{scheduled: []domain.Delegation{d}, activateErr: errors.New("db exploded")}
+	up := &fakeUserProfile{}
+	tx := &fakeTxRunner{}
+	jctx := &Context{Delegations: repo, UserProfile: up, TxRunner: tx, BindTenantGUC: noopBind, Logger: fakeLogger{}}
+
+	res, err := Activation(context.Background(), jctx)
+	if err != nil {
+		t.Fatalf("unexpected top-level error: %v", err)
+	}
+	if res.Failed != 1 {
+		t.Fatalf("expected 1 failure, got %+v", res)
+	}
+}
+
+func TestActivation_NoScheduledRows_NoOp(t *testing.T) {
+	repo := &fakeDelegationRepo{}
+	up := &fakeUserProfile{}
+	tx := &fakeTxRunner{}
+	jctx := &Context{Delegations: repo, UserProfile: up, TxRunner: tx, BindTenantGUC: noopBind, Logger: fakeLogger{}}
+
+	res, err := Activation(context.Background(), jctx)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if res.Attempted != 0 || res.Succeeded != 0 {
+		t.Fatalf("expected a no-op result, got %+v", res)
 	}
 }
 

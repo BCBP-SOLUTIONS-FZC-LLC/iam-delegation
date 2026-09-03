@@ -122,6 +122,7 @@ type seedDelegationOpts struct {
 	Scope                  string
 	ScopeID                *uuid.UUID
 	Status                 string
+	StartsAt               *time.Time // DLG-D25: nil uses the column's DEFAULT now()
 	EndsAt                 *time.Time
 	ReviewDueAt            *time.Time
 	ReviewLastWarnedBucket *int
@@ -144,6 +145,18 @@ func seedDelegation(t *testing.T, ctx context.Context, raw *pgxpool.Pool, o seed
 	}
 	if o.Status == "" {
 		o.Status = "active"
+	}
+	if o.StartsAt != nil {
+		_, err := raw.Exec(ctx, `
+			INSERT INTO delegations (id, tenant_id, delegator_id, delegate_id,
+				delegator_membership_id, delegate_membership_id, scope, scope_id,
+				status, starts_at, ends_at, review_due_at, review_last_warned_bucket, deleted_at)
+			VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14)`,
+			o.ID, o.TenantID, o.DelegatorID, o.DelegateID,
+			uuid.New(), uuid.New(), o.Scope, o.ScopeID,
+			o.Status, *o.StartsAt, o.EndsAt, o.ReviewDueAt, o.ReviewLastWarnedBucket, o.DeletedAt)
+		require.NoError(t, err)
+		return o.ID
 	}
 	_, err := raw.Exec(ctx, `
 		INSERT INTO delegations (id, tenant_id, delegator_id, delegate_id,

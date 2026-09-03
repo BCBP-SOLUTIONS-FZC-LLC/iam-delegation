@@ -333,6 +333,21 @@ cronJobs:
       limits:
         cpu: 500m
         memory: 256Mi
+  activation:
+    enabled: true
+    schedule: "*/5 * * * *"      # DLG-D25 — cross-service future-OOO bug fix, mirrors expiry's cadence
+    jobName: delegation-activation
+    concurrencyPolicy: Forbid
+    successfulJobsHistoryLimit: 3
+    failedJobsHistoryLimit: 3
+    activeDeadlineSeconds: 240
+    resources:
+      requests:
+        cpu: 100m
+        memory: 128Mi
+      limits:
+        cpu: 500m
+        memory: 256Mi
   review:
     enabled: true
     schedule: "0 * * * *"        # DLG-I2 (LLD §11.4) — 3-day daily-cascade warn, then auto-end

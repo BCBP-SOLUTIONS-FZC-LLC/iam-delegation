@@ -302,6 +302,66 @@ func TestDelegationService_Create_UserProfileErrorMapping(t *testing.T) {
 	}
 }
 
+// ── Create: deferred/scheduled creation (DLG-D25) ───────────────────────
+
+func TestDelegationService_Create_FutureStartsAt_DoesNotActivateImmediately(t *testing.T) {
+	h := newDelegationHarness()
+	tenantID, delegatorID := uuid.New(), uuid.New()
+	req := validCreateInput()
+	h.activeBoth(delegatorID, req.DelegateID)
+	future := time.Now().UTC().Add(48 * time.Hour)
+	req.StartsAt = &future
+
+	got, err := h.svc.Create(context.Background(), tenantID, delegatorID, "", req)
+	require.NoError(t, err)
+	require.NotNil(t, got)
+
+	assert.Equal(t, 0, h.up.callCount(), "User Profile must not be called for a genuinely future starts_at")
+
+	require.Len(t, h.repo.insertCalls, 1)
+	assert.Equal(t, domain.DelegationScheduled, h.repo.insertCalls[0].Status)
+
+	events := h.pub.snapshot()
+	assert.Empty(t, events, "no DelegationStarted event should be enqueued until the row actually activates")
+}
+
+func TestDelegationService_Create_FutureStartsAt_TxFailure_NoCompensatingClear(t *testing.T) {
+	h := newDelegationHarness()
+	tenantID, delegatorID := uuid.New(), uuid.New()
+	req := validCreateInput()
+	h.activeBoth(delegatorID, req.DelegateID)
+	future := time.Now().UTC().Add(48 * time.Hour)
+	req.StartsAt = &future
+	h.repo.insertErr = errors.New("insert failed")
+
+	_, err := h.svc.Create(context.Background(), tenantID, delegatorID, "", req)
+	require.Error(t, err)
+
+	assert.Equal(t, 0, h.up.callCount(), "User Profile must never be called for a scheduled create, even on tx failure")
+}
+
+func TestDelegationService_Create_PastOrImmediateStartsAt_StillActivatesImmediately(t *testing.T) {
+	h := newDelegationHarness()
+	tenantID, delegatorID := uuid.New(), uuid.New()
+	req := validCreateInput()
+	h.activeBoth(delegatorID, req.DelegateID)
+	// Within skewTolerance of now — must NOT be treated as scheduled.
+	almostNow := time.Now().UTC()
+	req.StartsAt = &almostNow
+
+	got, err := h.svc.Create(context.Background(), tenantID, delegatorID, "", req)
+	require.NoError(t, err)
+	require.NotNil(t, got)
+
+	assert.Equal(t, 1, h.up.callCount())
+	require.Len(t, h.repo.insertCalls, 1)
+	assert.Equal(t, domain.DelegationActive, h.repo.insertCalls[0].Status)
+
+	events := h.pub.snapshot()
+	require.Len(t, events, 1)
+	assert.Equal(t, domain.EventDelegationStarted, events[0].Type)
+}
+
 // ── Create: happy path ───────────────────────────────────────────────────
 
 func TestDelegationService_Create_HappyPath(t *testing.T) {

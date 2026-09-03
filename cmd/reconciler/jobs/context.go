@@ -1,7 +1,9 @@
-// Package jobs implements the three CronJob entry points (LLD §6/§16.1):
-// delegation-expiry (DLG-I1, */5 * * * *), delegation-review (DLG-I2,
-// hourly, 3-day daily cascade warn then auto-end), and delegation-cleanup
-// (monthly hard-purge). Per this build's DLG-D17, these are plain functions
+// Package jobs implements the four CronJob entry points (LLD §6/§16.1):
+// delegation-expiry (DLG-I1, */5 * * * *), delegation-activation (DLG-D25,
+// */5 * * * *, cross-service future-OOO bug fix — the forward counterpart
+// to delegation-expiry), delegation-review (DLG-I2, hourly, 3-day daily
+// cascade warn then auto-end), and delegation-cleanup (monthly hard-purge).
+// Per this build's DLG-D17, these are plain functions
 // taking already-constructed dependencies so BOTH cmd/reconciler/main.go
 // (the CronJob binary, calling them directly) and cmd/server's DLG-I1/I2
 // HTTP handlers (calling them through a thin adapter) share one
@@ -52,6 +54,7 @@ type ProcessedEventsStore interface {
 // so existing callers/tests that don't wire it keep working.
 type Metrics interface {
 	RecordExpiryDeferred()
+	RecordActivationDeferred()
 	RecordReviewDeferred()
 }
 

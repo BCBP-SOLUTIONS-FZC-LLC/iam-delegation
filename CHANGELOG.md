@@ -39,6 +39,16 @@ index into those, not a duplicate of them.
 - Events/outbox/dedup audited to pass through `platform-events` only — added the missing
   `specversion` envelope field, made `outbox.Config` env-tunable, added the `PrunePublished` prune
   sweep, and fixed a stale `specversion` const in `api/asyncapi.yaml` (DLG-D24).
+- Cross-service bug: a delegation created with a future `starts_at` immediately called User
+  Profile's `SetAvailability` and emitted `DelegationStarted`, showing the delegator as OOO and
+  routing work to the delegate before the leave actually began. `Create` now defers both when
+  `starts_at` is genuinely in the future — the delegation is inserted as a new `scheduled` status
+  instead of `active`, with no User Profile call and no event yet. A new `delegation-activation`
+  CronJob (`*/5 * * * *`, mirrors `delegation-expiry`) calls User Profile and flips the row to
+  `active` (emitting `DelegationStarted` then) once `starts_at` is reached. `EndForUser` (the
+  `MembershipRevoked` cascade) and `Cancel`/`End` now also accept `scheduled` rows, so a scheduled
+  delegation for a member who leaves the tenant is cancelled rather than stranded (DLG-D25). See
+  `iam-user-profile`'s matching CHANGELOG entry for the server-side counterpart fix.
 
 ### Known gaps
 
