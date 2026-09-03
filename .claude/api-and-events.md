@@ -93,7 +93,7 @@ Unlike most O&M-extraction siblings, this is a structural highlight of the servi
 | Event | Emitted when | Consumers (LLD §10.5) |
 |---|---|---|
 | `DelegationStarted` | DLG-2 create, create-leg of DLG-5 reassign | **Workflow Service** (reroute — authoritative signal), Notification, Audit |
-| `DelegationEnded` | DLG-3 cancel, `ends_at` expiry (DLG-I1), review auto-end (DLG-I2), end-leg of DLG-5, delegate-removed cascade (§11.5), delegate-disabled cascade (§11.5a, Bug 2) — `ended_reason ∈ {expired, cancelled, delegate_removed, review_expired, delegate_disabled}` | **Workflow Service** (restore), Notification, Audit |
+| `DelegationEnded` | DLG-3 cancel, `ends_at` expiry (DLG-I1), review auto-end (DLG-I2), end-leg of DLG-5 (`ended_reason=reassigned`), delegate-removed cascade (§11.5), delegate-disabled cascade (§11.5a, Bug 2) — `ended_reason ∈ {expired, cancelled, reassigned, delegate_removed, review_expired, delegate_disabled}` | **Workflow Service** (restore), Notification, Audit |
 | `DelegationReviewRequested` | `delegation-review` sweep — once per calendar day for each of the 3 days before `review_due_at` — `days_remaining ∈ {3,2,1}` | Notification, Audit |
 | `DelegationEscalationRequested` | Immediately after `DelegationEnded`, same tx, only when `ended_reason=delegate_disabled` (§11.5b, Bug 2a) | Notification (tenant_admin/tenant_owner only), Workflow Service (hook, not yet consumed — cross-team), Audit |
 

@@ -668,7 +668,7 @@ never written back to the outbox row.
 | Event | Emitted when | Consumers (LLD §10.5) |
 |---|---|---|
 | `DelegationStarted` | DLG-2 create (immediate), create-leg of DLG-5 reassign, `delegation-activation` flip (DLG-D25) | **Workflow Service** (reroute), Notification, Audit |
-| `DelegationEnded` | DLG-3 cancel, `ends_at` expiry (DLG-I1), review auto-end (DLG-I2), end-leg of DLG-5, delegate-removed cascade, delegate-disabled cascade (DLG-D26) — `ended_reason ∈ {expired, cancelled, delegate_removed, review_expired, delegate_disabled}` | **Workflow Service** (restore), Notification, Audit |
+| `DelegationEnded` | DLG-3 cancel, `ends_at` expiry (DLG-I1), review auto-end (DLG-I2), end-leg of DLG-5 (`ended_reason=reassigned`, distinct from a plain cancel), delegate-removed cascade, delegate-disabled cascade (DLG-D26) — `ended_reason ∈ {expired, cancelled, reassigned, delegate_removed, review_expired, delegate_disabled}` | **Workflow Service** (restore), Notification, Audit |
 | `DelegationReviewRequested` | `delegation-review` sweep — once per calendar day for each of the 3 days before `review_due_at`, `days_remaining ∈ {3,2,1}` | Notification, Audit |
 | `DelegationEscalationRequested` | Immediately after `DelegationEnded`, same transaction, only when `ended_reason=delegate_disabled` (DLG-D27) | Notification (`tenant_admin`/`tenant_owner` only), Workflow Service (hook, not yet consumed), Audit |
 
