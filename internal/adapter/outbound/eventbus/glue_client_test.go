@@ -6,6 +6,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -137,9 +138,9 @@ func TestGlueCodec_Encode_FetchFailure_Propagates(t *testing.T) {
 func TestGlueCodec_StartRefresher_RefetchesOnTick(t *testing.T) {
 	staleID := uuid.New().String()
 	freshID := uuid.New().String()
-	var calls int
+	var calls atomic.Int64
 	client := newTestGlueClient(t, func(w http.ResponseWriter, r *http.Request) {
-		calls++
+		calls.Add(1)
 		w.Header().Set("Content-Type", "application/x-amz-json-1.1")
 		_ = json.NewEncoder(w).Encode(map[string]string{"SchemaVersionId": freshID})
 	})
@@ -156,7 +157,7 @@ func TestGlueCodec_StartRefresher_RefetchesOnTick(t *testing.T) {
 		defer g.mu.RUnlock()
 		return g.versionCache["DelegationStarted"] == freshID
 	}, time.Second, 5*time.Millisecond, "expected the refresher to replace the stale cached version")
-	assert.GreaterOrEqual(t, calls, 1)
+	assert.GreaterOrEqual(t, calls.Load(), int64(1))
 }
 
 func TestGlueCodec_StartRefresher_FetchFailure_KeepsStaleAndLogs(t *testing.T) {

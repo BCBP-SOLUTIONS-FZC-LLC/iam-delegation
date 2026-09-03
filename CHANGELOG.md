@@ -38,7 +38,9 @@ index into those, not a duplicate of them.
 - `make test-ci` ran `go test ./...` three times in parallel (the unit/integration/rls
   targets are the same colocated suite) and the Glue refresher tests raced on the mock
   server's request log — both failed the CI `-race` gate. The suite now runs once, and
-  the mock is synchronized.
+  the mock is synchronized. Postgres integration tests now share one Testcontainers
+  instance (truncate between tests) so the ~50-container suite fits the runner
+  timeout; the Glue refresher call counter is atomic.
 - The monthly `delegation-cleanup` CronJob never purged `processed_events` — `cmd/reconciler`
   never wired a `ProcessedEvents` store.
 - The two reconciler deferred-counter metrics were registered but never incremented (DLG-D19).

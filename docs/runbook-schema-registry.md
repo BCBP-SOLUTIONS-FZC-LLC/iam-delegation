@@ -32,7 +32,7 @@ environment. Fails loudly if any schema is missing.
 
 ```bash
 export GLUE_REGISTRY_NAME=iam-delegation-events   # or the env-specific name
-export AWS_REGION=us-east-1
+export AWS_REGION=ap-south-1
 make schema-verify
 ```
 
@@ -142,7 +142,7 @@ Set in `deploy/helm/iam-delegation/values.yaml` (per environment) or `.env`
 |---|---|---|
 | `GLUE_REGISTRY_NAME` | Glue registry name | Set to `iam-delegation-events` in production/staging. Leave empty in dev (NoopCodec). |
 | `GLUE_REGISTRY_ARN` | Full registry ARN | For IAM policy scoping; used by `schema-gov register` and `deploy/iam/policy.tf.example`. Not read by the Go runtime. |
-| `AWS_REGION` | Primary region | `us-east-1` everywhere — production, local dev, and CI (see `deploy/helm/iam-delegation/values.yaml`; local dev/CI additionally point `AWS_ENDPOINT_URL` at LocalStack). |
+| `AWS_REGION` | Primary region | `ap-south-1` everywhere — production, local dev, and CI (see `deploy/helm/iam-delegation/values.yaml`; local dev/CI additionally point `AWS_ENDPOINT_URL` at LocalStack). |
 
 ## CI governance pipeline
 

@@ -114,7 +114,7 @@ IAM permission failures, and the `schema-gov` CLI (written this session, DLG-D20
 | `SNS_TOPIC_ARN` | **Yes** | — | `loadConfig` returns an error if empty — the process never starts |
 | `CASCADE_QUEUE_URL` | **Yes** | — | Same — fail-fast, not a soft default |
 | `CASCADE_SQS_CONCURRENCY` | No | `4` | `events.WithConcurrency` on the cascade SQS consumer (iam-realm-provisioner) |
-| `AWS_REGION` | No | `us-east-1` | |
+| `AWS_REGION` | No | `ap-south-1` | |
 | `AWS_ENDPOINT_URL` | No | — | LocalStack endpoint override, dev only |
 | `GLUE_REGISTRY_NAME` | No | `""` → `NoopCodec` | Set to `iam-delegation-events` to activate `GlueCodec` (added this session, DLG-D20) |
 | `OUTBOX_POLL_INTERVAL` / `OUTBOX_BATCH_SIZE` / `OUTBOX_MAX_ATTEMPTS` / `OUTBOX_DRAIN_TIMEOUT` / `OUTBOX_PUBLISH_CONCURRENCY` / `OUTBOX_PUBLISH_TIMEOUT` / `OUTBOX_STARTUP_JITTER` / `OUTBOX_CLAIM_LEASE_DURATION` | No | `500ms`/`50`/`5`/`30s`/`4`/`10s`/`2s`/`10m` | `outbox.Config` tunables — matches `iam-org-membership`'s identical env-var surface (DLG-D24) |

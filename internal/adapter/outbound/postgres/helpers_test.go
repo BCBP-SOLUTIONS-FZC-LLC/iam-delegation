@@ -3,6 +3,8 @@ package postgres
 import (
 	"context"
 	"fmt"
+	"os"
+	"sync"
 	"testing"
 	"time"
 
@@ -73,17 +75,96 @@ func (r *seedRow) Scan(dest ...any) error {
 	})
 }
 
-// setupTestDB spins up a fresh postgres:16-alpine container, applies every
-// embedded migration (which also creates the delegation_app/delegation_migrator
-// roles) via the same Migrate entry point cmd/server calls, and returns pools
-// bound to both roles. Every test gets its own container so tests never leak
-// state into each other.
+// Shared fixture: one Postgres container for the whole package. A fresh
+// container per test (~50) is fine on a warm local daemon but blows
+// `go test -timeout` on GitHub-hosted runners (cold image pull + migrate
+// on every test, 2 vCPU). Isolation is truncate-between-tests, not a new
+// cluster — tests already use unique tenant/delegation UUIDs, and several
+// (gauges, RLS counts) assert on the whole table.
+var (
+	sharedMu        sync.Mutex
+	sharedStarted   bool
+	sharedDB        *testDB
+	sharedContainer testcontainers.Container
+	sharedStartErr  error
+)
+
+func TestMain(m *testing.M) {
+	code := m.Run()
+	shutdownSharedDB()
+	os.Exit(code)
+}
+
+func shutdownSharedDB() {
+	sharedMu.Lock()
+	defer sharedMu.Unlock()
+	if sharedDB != nil {
+		sharedDB.App.Close()
+		sharedDB.Bypass.Close()
+		sharedDB = nil
+	}
+	if sharedContainer != nil {
+		_ = sharedContainer.Terminate(context.Background())
+		sharedContainer = nil
+	}
+}
+
+// setupTestDB returns the package-shared pools after wiping tenant data so
+// each test starts from an empty schema (roles/extensions stay).
 func setupTestDB(t *testing.T) *testDB {
 	t.Helper()
 	if testing.Short() {
 		t.Skip("skipping postgres integration test in short mode")
 	}
-	ctx := context.Background()
+	db := mustSharedDB(t)
+	resetTestDB(t, db)
+	return db
+}
+
+func mustSharedDB(t *testing.T) *testDB {
+	t.Helper()
+	sharedMu.Lock()
+	defer sharedMu.Unlock()
+	if !sharedStarted {
+		sharedStarted = true
+		sharedDB, sharedStartErr = startSharedDB()
+	}
+	require.NoError(t, sharedStartErr, "shared postgres testcontainer")
+	require.NotNil(t, sharedDB)
+	return sharedDB
+}
+
+func resetTestDB(t *testing.T, db *testDB) {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	_, err := db.Raw.Exec(ctx, `
+		TRUNCATE TABLE
+			public.delegations,
+			public.delegation_tenant_settings,
+			public.processed_events,
+			public.rls_violation_log,
+			public.outbox_events
+		RESTART IDENTITY CASCADE`)
+	require.NoError(t, err)
+}
+
+func startSharedDB() (*testDB, error) {
+	var lastErr error
+	for attempt := 1; attempt <= 3; attempt++ {
+		db, err := startSharedDBOnce()
+		if err == nil {
+			return db, nil
+		}
+		lastErr = err
+		time.Sleep(time.Duration(attempt) * time.Second)
+	}
+	return nil, lastErr
+}
+
+func startSharedDBOnce() (*testDB, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+	defer cancel()
 
 	req := testcontainers.ContainerRequest{
 		Image:        "postgres:16-alpine",
@@ -95,45 +176,61 @@ func setupTestDB(t *testing.T) *testDB {
 		},
 		WaitingFor: wait.ForLog("database system is ready to accept connections").
 			WithOccurrence(2).
-			WithStartupTimeout(60 * time.Second),
+			WithStartupTimeout(120 * time.Second),
 	}
 	container, err := testcontainers.GenericContainer(ctx, testcontainers.GenericContainerRequest{
 		ContainerRequest: req,
 		Started:          true,
 	})
-	require.NoError(t, err)
-	t.Cleanup(func() { _ = container.Terminate(context.Background()) })
+	if err != nil {
+		return nil, err
+	}
 
 	host, err := container.Host(ctx)
-	require.NoError(t, err)
+	if err != nil {
+		_ = container.Terminate(context.Background())
+		return nil, err
+	}
 	port, err := container.MappedPort(ctx, "5432")
-	require.NoError(t, err)
+	if err != nil {
+		_ = container.Terminate(context.Background())
+		return nil, err
+	}
 
 	superDSN := fmt.Sprintf("postgres://postgres:postgres@%s:%s/delegation?sslmode=disable", host, port.Port())
 
 	// Applies the platform-events outbox schema and then 000001_schema
 	// (enums, tables, indexes, RLS, roles) — the same entry point cmd/server
 	// calls, so the test fixture can never drift from what actually ships.
-	require.NoError(t, Migrate(ctx, superDSN))
+	if err := Migrate(ctx, superDSN); err != nil {
+		_ = container.Terminate(context.Background())
+		return nil, err
+	}
 
 	bypassPool, err := pgcommon.NewPool(ctx, pgcommon.Config{DSN: superDSN})
-	require.NoError(t, err)
-	t.Cleanup(bypassPool.Close)
+	if err != nil {
+		_ = container.Terminate(context.Background())
+		return nil, err
+	}
 
 	appDSN := fmt.Sprintf("postgres://delegation_app:%s@%s:%s/delegation?sslmode=disable", testAppPassword, host, port.Port())
 	appPool, err := pgcommon.NewPool(ctx, pgcommon.Config{
 		DSN:         appDSN,
 		GUCProvider: pgcommon.GUCSetFromContext,
 	})
-	require.NoError(t, err)
-	t.Cleanup(appPool.Close)
+	if err != nil {
+		bypassPool.Close()
+		_ = container.Terminate(context.Background())
+		return nil, err
+	}
 
+	sharedContainer = container
 	return &testDB{
 		App:    appPool,
 		Raw:    &seedPool{inner: bypassPool},
 		AppDSN: appDSN,
 		Bypass: bypassPool,
-	}
+	}, nil
 }
 
 // withTenant returns a context carrying a pgcommon GUCSet so the app pool's

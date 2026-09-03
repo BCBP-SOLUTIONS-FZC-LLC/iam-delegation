@@ -745,7 +745,7 @@ return pgcommon.RunInTx(ctx, pool, pgx.TxOptions{}, func(ctx context.Context, tx
 publisher := events.NewSNSPublisher(snsConfig, events.WithCodec(glueCodec)) // registry "iam-delegation-events"
 ```
 
-AWS Glue Schema Registry is free in all regions including this service's own, `us-east-1`.
+AWS Glue Schema Registry is free in all regions including this service's own, `ap-south-1`.
 
 ### 10.4 Outbound — `iam.delegation.events` via the outbox
 

@@ -317,10 +317,11 @@ _merge-coverage:
 # This repo has no build-tag split: unit/integration/rls all select ./...
 # (see TEST_*_PKGS). Running that suite three times in parallel with
 # -race + Testcontainers blew the 300s per-suite timeout on GitHub-hosted
-# runners (Makefile:317) after the coverage expansion. One pass writes
-# coverage.out directly for the coverage-gate.sh step.
+# runners after the coverage expansion. One pass writes coverage.out
+# directly for the coverage-gate.sh step. 15m is the per-binary budget
+# (postgres used to spawn ~50 containers; it now reuses one).
 test-ci: | .coverage
-	$(GO) test $(TEST_UNIT_PKGS) -race -count=1 -timeout 600s \
+	$(GO) test $(TEST_UNIT_PKGS) -race -count=1 -timeout 15m \
 	  -coverpkg=$(COVER_PKG_LIST) -coverprofile=coverage.out
 
 cover: test-ci

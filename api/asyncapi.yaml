@@ -16,7 +16,7 @@ info:
       byte 1     : compression    (0x00 = none)
       bytes 2-17 : schema version UUID (big-endian)
 
-    Glue registry : iam-delegation-events (us-east-1, JSON data format).
+    Glue registry : iam-delegation-events (ap-south-1, JSON data format).
     Schemas       : one per PUBLISHED event type, named identically to the
                     event `type` (PascalCase) — DelegationStarted,
                     DelegationEnded, DelegationReviewRequested,
@@ -131,10 +131,10 @@ tags:
 
 servers:
   production:
-    host: sns.us-east-1.amazonaws.com
+    host: sns.ap-south-1.amazonaws.com
     protocol: sns
     description: |
-      AWS SNS in us-east-1. Topic ARN configured via the SNS_TOPIC_ARN env
+      AWS SNS in ap-south-1. Topic ARN configured via the SNS_TOPIC_ARN env
       var. Pod IAM role requires, scoped to the iam-delegation-events Glue
       registry: glue:GetRegistry, glue:GetSchema, glue:GetSchemaVersion,
       glue:QuerySchemaVersionMetadata. Schema registration
@@ -143,7 +143,7 @@ servers:
       - $ref: '#/components/securitySchemes/iamRole'
 
   sqsDelegationCascade:
-    host: sqs.us-east-1.amazonaws.com
+    host: sqs.ap-south-1.amazonaws.com
     protocol: sqs
     description: |
       SQS queue owned and managed by this service — delegation-cascade-q

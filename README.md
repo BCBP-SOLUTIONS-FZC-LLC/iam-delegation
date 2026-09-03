@@ -364,7 +364,7 @@ table covers only the ones most likely to trip someone up.
 | `SYSTEM_DATABASE_URL` | Required when `ENVIRONMENT=production` (both binaries fail fast otherwise); required in Helm always | falls back with a startup warning outside production | BYPASSRLS pool for cross-tenant reconciler sweeps, cascade `processed_events`, and the active-gauge exporter — unset outside production means cross-tenant queries silently return zero rows |
 | `USER_PROFILE_BASE_URL` / `ORG_MEMBERSHIP_BASE_URL` | Yes | — | Client constructors fail fast at startup if empty; neither service is part of this repo's compose stack |
 | `SNS_TOPIC_ARN` / `CASCADE_QUEUE_URL` | **Yes** | — | `loadConfig` returns an error and the process never starts if either is empty |
-| `AWS_REGION` | No | `us-east-1` | |
+| `AWS_REGION` | No | `ap-south-1` | |
 | `GLUE_REGISTRY_NAME` | No | `""` → `NoopCodec` | Set to `iam-delegation-events` to activate the real Glue codec |
 | `LOCALSTACK_AUTH_TOKEN` | No | `""` | LocalStack Pro only (`docker-compose.pro.yml`) — never commit a real value |
 | `IDEMPOTENCY_TTL_SECONDS` / `LIST_CACHE_TTL_SECONDS` | No | `86400` / `60` | |
