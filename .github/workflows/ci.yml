@@ -194,7 +194,7 @@ jobs:
           cache-dir: /tmp/trivy-cache
 
       - name: Upload SARIF to GitHub Security tab
-        uses: github/codeql-action/upload-sarif@v4.37.4
+        uses: github/codeql-action/upload-sarif@v4.37.9
         continue-on-error: true
         with:
           sarif_file: trivy-results.sarif

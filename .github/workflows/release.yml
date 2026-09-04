@@ -184,7 +184,7 @@ jobs:
           cache-dir: /tmp/trivy-cache
 
       - name: Upload Trivy results to GitHub Security
-        uses: github/codeql-action/upload-sarif@v4.37.4
+        uses: github/codeql-action/upload-sarif@v4.37.9
         if: always()
         continue-on-error: true
         with:
