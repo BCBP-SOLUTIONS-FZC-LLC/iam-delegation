@@ -7,7 +7,13 @@ bin/
 coverage.out
 coverage.html
 *.md
-docs/
+# cmd/server blank-imports docs/swagger (swaggo). A blanket `docs/` ignore
+# made `go build ./cmd/server` fail in buildx with
+# "no required module provides package .../docs/swagger".
+docs/lld
+docs/architecture
+!docs/swagger/
+!docs/swagger/**
 deploy/
 test/
 .env

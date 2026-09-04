@@ -56,6 +56,10 @@ RUN --mount=type=secret,id=go_private_token \
 # Now copy the remainder of the source tree.
 COPY . .
 
+# Fail fast if .dockerignore dropped the generated swagger package
+# (cmd/server blank-imports it).
+RUN test -f docs/swagger/docs.go
+
 RUN CGO_ENABLED=0 GOOS=linux \
     GOPRIVATE="github.com/BCBP-SOLUTIONS-FZC-LLC/*" \
     go build \
