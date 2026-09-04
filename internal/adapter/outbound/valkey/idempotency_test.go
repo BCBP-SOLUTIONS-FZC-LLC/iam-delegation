@@ -86,3 +86,91 @@ func TestIdempotencyStore_Get_DecodeFailure(t *testing.T) {
 	require.Error(t, err)
 	require.False(t, found)
 }
+
+// TestIdempotencyStore_Reserve_SecondCallerBlocked verifies the SET NX
+// claim: a second Reserve for the same key fails while the first still
+// holds it, closing the race a plain Get-then-Save pattern leaves open.
+func TestIdempotencyStore_Reserve_SecondCallerBlocked(t *testing.T) {
+	s := newTestIdempotencyStore(t)
+	ctx := context.Background()
+	tenantID := uuid.New()
+
+	first, err := s.Reserve(ctx, tenantID, "key-1")
+	require.NoError(t, err)
+	require.True(t, first)
+
+	second, err := s.Reserve(ctx, tenantID, "key-1")
+	require.NoError(t, err)
+	require.False(t, second, "a key already reserved must not be reservable again")
+}
+
+// TestIdempotencyStore_Reserve_ThenSaveOverwrites verifies a completed
+// Save replaces the "pending" placeholder Reserve wrote under the same key.
+func TestIdempotencyStore_Reserve_ThenSaveOverwrites(t *testing.T) {
+	s := newTestIdempotencyStore(t)
+	ctx := context.Background()
+	tenantID := uuid.New()
+
+	reserved, err := s.Reserve(ctx, tenantID, "key-1")
+	require.NoError(t, err)
+	require.True(t, reserved)
+
+	rec, found, err := s.Get(ctx, tenantID, "key-1")
+	require.NoError(t, err)
+	require.True(t, found)
+	require.Equal(t, "pending", rec.Status)
+
+	final := port.IdempotencyRecord{DelegationID: uuid.New(), Status: "created"}
+	require.NoError(t, s.Save(ctx, tenantID, "key-1", final))
+
+	rec, found, err = s.Get(ctx, tenantID, "key-1")
+	require.NoError(t, err)
+	require.True(t, found)
+	require.Equal(t, final, rec)
+}
+
+// TestIdempotencyStore_Release_FreesKeyForRetry verifies Release removes
+// the reservation so a subsequent Reserve for the same key succeeds again.
+func TestIdempotencyStore_Release_FreesKeyForRetry(t *testing.T) {
+	s := newTestIdempotencyStore(t)
+	ctx := context.Background()
+	tenantID := uuid.New()
+
+	reserved, err := s.Reserve(ctx, tenantID, "key-1")
+	require.NoError(t, err)
+	require.True(t, reserved)
+
+	require.NoError(t, s.Release(ctx, tenantID, "key-1"))
+
+	_, found, err := s.Get(ctx, tenantID, "key-1")
+	require.NoError(t, err)
+	require.False(t, found, "Release must remove the reservation")
+
+	reserved, err = s.Reserve(ctx, tenantID, "key-1")
+	require.NoError(t, err)
+	require.True(t, reserved, "the key must be reservable again after Release")
+}
+
+// TestIdempotencyStore_Reserve_DownValkey / Release_DownValkey mirror
+// TestIdempotencyStore_DownValkey for the two new methods: a transport
+// failure returns a non-nil error (Reserve additionally reports
+// reserved=false), consistent with Get/Save's contract.
+func TestIdempotencyStore_Reserve_DownValkey(t *testing.T) {
+	mr := miniredis.RunT(t)
+	addr := mr.Addr()
+	mr.Close()
+
+	s := NewIdempotencyStore(NewClient("redis://"+addr), &fakeLogger{})
+	reserved, err := s.Reserve(context.Background(), uuid.New(), "key-1")
+	require.Error(t, err)
+	require.False(t, reserved)
+}
+
+func TestIdempotencyStore_Release_DownValkey(t *testing.T) {
+	mr := miniredis.RunT(t)
+	addr := mr.Addr()
+	mr.Close()
+
+	s := NewIdempotencyStore(NewClient("redis://"+addr), &fakeLogger{})
+	require.Error(t, s.Release(context.Background(), uuid.New(), "key-1"))
+}

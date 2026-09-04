@@ -76,7 +76,7 @@ go test -tags=rls ./internal/adapter/outbound/postgres/... -run TestRLS -v
 
 **Test layout note:** unlike some sibling services, every test in this repo is colocated white-box (`*_test.go` next to the source it covers, package-internal) — there is no separate `test/` tree. `go test ./...` alone runs the complete suite (unit + Postgres/testcontainer integration + the full RLS matrix all together); `-tags=integration|rls|e2e` currently select no additional files (no test declares those build tags yet) and are no-ops kept for future extensibility — the `test-*` Makefile targets differ only in which `-tags` flag they pass, not in which packages they run.
 
-**Coverage note:** measure with `-coverpkg=$(go list ./internal/... ./pkg/... | tr '\n' ',')` — `make cover`/`make cover-func` already do this. CI enforces a single global statement-coverage gate of ≥95% on the merged `coverage.out` (`.github/scripts/coverage-gate.sh`, bumped from 70% during the DLG-D34 production-readiness sweep — global coverage sits at 95.2% as of that pass) — see `CONTRIBUTING.md` § Coverage gate for current per-package numbers.
+**Coverage note:** measure with `-coverpkg=$(go list ./internal/... ./pkg/... | tr '\n' ',')` — `make cover`/`make cover-func` already do this. CI enforces a single global statement-coverage gate of ≥95% on the merged `coverage.out` (`.github/scripts/coverage-gate.sh`, bumped from 70% during the DLG-D34 production-readiness sweep — global coverage sat at 95.2% as of that pass, 95.4% as of the DLG-D35 follow-up sweep) — see `CONTRIBUTING.md` § Coverage gate for current per-package numbers.
 
 **Testcontainers note:** Postgres/Valkey/SQS-compatible integration and RLS tests spin up real containers via `testcontainers-go`. Docker must be running.
 
@@ -95,7 +95,7 @@ iam-delegation/
 │   ├── server/
 │   │   ├── main.go                    # composition root — errgroup runs six real background workers (see "Key Files to Know")
 │   │   ├── adapters.go                # gucBoundReader (DLG-I3/I4 GUC binding) + reconcilerRunner (DLG-D17 dual entry point) + redisPinger
-│   │   ├── config.go                  # loadConfig() — env var parsing, SNS_TOPIC_ARN/CASCADE_QUEUE_URL fail-fast checks; SYSTEM_DATABASE_URL required when ENVIRONMENT=production (DLG-D34)
+│   │   ├── config.go                  # loadConfig() — env var parsing, SNS_TOPIC_ARN/CASCADE_QUEUE_URL fail-fast checks; SYSTEM_DATABASE_URL required outside local/dev ENVIRONMENT (DLG-D34, widened beyond a literal "production" check in DLG-D35's isDevLikeEnvironment)
 │   │   ├── exporters.go               # runActiveGaugeExporter — 5-min BYPASSRLS sysPool snapshot of iam_delegation_active_gauge
 │   │   ├── observability.go
 │   │   └── swagger_info.go            # swaggo metadata

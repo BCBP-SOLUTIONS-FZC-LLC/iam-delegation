@@ -85,3 +85,40 @@ func (s *IdempotencyStore) Save(ctx context.Context, tenantID uuid.UUID, key str
 	}
 	return nil
 }
+
+// Reserve atomically claims key via SET NX, storing a Status:"pending"
+// placeholder under the same key/TTL a completed Save would use — closing
+// the race a plain Get-then-Save pattern leaves open between two
+// concurrent calls that both miss Get before either Saves (the bug this
+// method was added to fix: two requests sharing one Idempotency-Key could
+// otherwise both pass the Get check and both create a delegation). A
+// successful Save later simply overwrites this placeholder; a failed
+// caller must call Release so a retry with the same key isn't stuck
+// waiting out the TTL.
+func (s *IdempotencyStore) Reserve(ctx context.Context, tenantID uuid.UUID, key string) (bool, error) {
+	k := idempotencyKey(tenantID, key)
+	val, err := json.Marshal(port.IdempotencyRecord{Status: "pending"})
+	if err != nil {
+		return false, fmt.Errorf("valkey: encode idempotency reservation: %w", err)
+	}
+	ok, err := s.client.SetNX(ctx, k, val, idempotencyTTL).Result()
+	if err != nil {
+		if s.logger != nil {
+			s.logger.Warn("idempotency reserve failed", map[string]interface{}{"key": k, "error": err.Error()})
+		}
+		return false, err
+	}
+	return ok, nil
+}
+
+// Release removes a reservation this process made via Reserve.
+func (s *IdempotencyStore) Release(ctx context.Context, tenantID uuid.UUID, key string) error {
+	k := idempotencyKey(tenantID, key)
+	if err := s.client.Del(ctx, k).Err(); err != nil {
+		if s.logger != nil {
+			s.logger.Warn("idempotency release failed", map[string]interface{}{"key": k, "error": err.Error()})
+		}
+		return err
+	}
+	return nil
+}

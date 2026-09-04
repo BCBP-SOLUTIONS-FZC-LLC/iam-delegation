@@ -24,6 +24,9 @@ var errorStatusByCode = map[string]int{
 	domain.ErrInsufficientRole.Error():       http.StatusForbidden,
 	domain.ErrOptimisticLockConflict.Error(): http.StatusConflict,
 
+	// 409
+	domain.ErrIdempotencyKeyInFlight.Error(): http.StatusConflict,
+
 	// 400 — malformed input
 	domain.ErrInvalidDelegationScope.Error():           http.StatusBadRequest,
 	domain.ErrInvalidDelegationMaxDurationDays.Error(): http.StatusBadRequest,

@@ -154,7 +154,7 @@ servers:
       second, distinct topic (Bug 2/DLG-D26):
         iam.membership.events -> MembershipRevoked        (filter: EventType IN [MembershipRevoked])
         iam.membership.events -> TenantMembershipsPurged  (filter: EventType IN [TenantMembershipsPurged])
-        iam.user.events       -> UserUpdated               (filter: EventType IN [user.updated])
+        iam.user.events       -> UserUpdated               (filter: EventType IN [UserUpdated])
       TenantMembershipsPurged was renamed from TenantOffboarded by Core
       specifically to avoid colliding with Realm Provisioner's own,
       differently-scoped TenantOffboarded event on iam.tenant.events, which
@@ -534,10 +534,12 @@ components:
         Consumed by this service (not published). Produced by User Profile
         (iam-user-profile) on iam.user.events — a distinct topic from
         Core's iam.membership.events above. This queue's filter policy can
-        only match on EventType ("user.updated", dot-notation — User
-        Profile's own convention), not payload content, so most
-        deliveries are unrelated field changes this service acks without
-        dispatching. Only a decoded payload with status="disabled" drives
+        only match on EventType ("UserUpdated", PascalCase — User
+        Profile's own convention, migrated from dot-notation while that
+        service was still undeployed; see its CHANGELOG.md/LLD rev 0.46),
+        not payload content, so most deliveries are unrelated field
+        changes this service acks without dispatching. Only a decoded
+        payload with status="disabled" drives
         CascadeService.EndForDisabledDelegate (§11.5a). Only the fields
         this service actually reads are documented below — User Profile's
         own contract carries more (email, other changed_fields).
@@ -551,8 +553,8 @@ components:
           messageAttributes:
             EventType:
               dataType: String
-              value: user.updated
-              description: Set by the producer (dot-notation). Matches this queue's SNS filter policy.
+              value: UserUpdated
+              description: Set by the producer (PascalCase). Matches this queue's SNS filter policy.
             TenantID:
               dataType: String
               description: Dynamic — envelope.tenant_id. UserUpdatedPayload itself carries no tenant_id field.

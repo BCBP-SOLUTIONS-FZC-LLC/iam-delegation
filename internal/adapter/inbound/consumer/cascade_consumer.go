@@ -1,6 +1,6 @@
 // Package consumer implements the delegation-cascade-q SQS consumer —
 // Core's MembershipRevoked/TenantMembershipsPurged and User Profile's
-// user.updated (delegate-disabled) events — plus its idempotency dedup
+// UserUpdated (delegate-disabled) events — plus its idempotency dedup
 // (processed_events, backed by internal/adapter/outbound/postgres) and
 // the wiring that assembles the consumer from cmd/server.
 package consumer
@@ -90,7 +90,7 @@ type GUCBinder func(ctx context.Context, tenantID uuid.UUID, userID string) cont
 // carries TWO SNS subscriptions: Core's iam.membership.events
 // (MembershipRevoked, TenantMembershipsPurged — the original LLD §10.1
 // "one inbound subscription") and, additionally, User Profile's
-// iam.user.events filtered to EventType = "user.updated" — provisioned
+// iam.user.events filtered to EventType = "UserUpdated" — provisioned
 // externally (this repo does not own SNS/SQS infrastructure, only the
 // consumer code and CASCADE_QUEUE_URL wiring, matching every other queue
 // in this service). Its Handle method matches platform-events'

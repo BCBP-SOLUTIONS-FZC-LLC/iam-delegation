@@ -472,11 +472,14 @@ var _ port.UserProfileClient = (*fakeUserProfileClient)(nil)
 type fakeIdempotencyStore struct {
 	mu sync.Mutex
 
-	store     map[string]port.IdempotencyRecord
-	getCalls  int
-	saveCalls int
-	getErr    error
-	saveErr   error
+	store        map[string]port.IdempotencyRecord
+	getCalls     int
+	saveCalls    int
+	reserveCalls int
+	releaseCalls int
+	getErr       error
+	saveErr      error
+	reserveErr   error
 }
 
 func idemKey(tenantID uuid.UUID, key string) string {
@@ -505,6 +508,32 @@ func (f *fakeIdempotencyStore) Save(ctx context.Context, tenantID uuid.UUID, key
 		f.store = map[string]port.IdempotencyRecord{}
 	}
 	f.store[idemKey(tenantID, key)] = rec
+	return nil
+}
+
+func (f *fakeIdempotencyStore) Reserve(ctx context.Context, tenantID uuid.UUID, key string) (bool, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.reserveCalls++
+	if f.reserveErr != nil {
+		return false, f.reserveErr
+	}
+	k := idemKey(tenantID, key)
+	if _, exists := f.store[k]; exists {
+		return false, nil
+	}
+	if f.store == nil {
+		f.store = map[string]port.IdempotencyRecord{}
+	}
+	f.store[k] = port.IdempotencyRecord{Status: "pending"}
+	return true, nil
+}
+
+func (f *fakeIdempotencyStore) Release(ctx context.Context, tenantID uuid.UUID, key string) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.releaseCalls++
+	delete(f.store, idemKey(tenantID, key))
 	return nil
 }
 

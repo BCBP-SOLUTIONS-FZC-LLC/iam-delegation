@@ -7,9 +7,16 @@ grounded in the actual code (`internal/core/service/*.go`, `cmd/reconciler/jobs/
 
 ## Create (DLG-2) — `DelegationService.Create`
 
-1. **Idempotency check first** — `idempotency.Get(tenantID, key)`; a hit returns the original
-   delegation via `FindByID` without re-running any validation or side effect below. Only checked
-   when a key is present.
+1. **Idempotency check first** — `idempotency.Get(tenantID, key)`; a hit whose record is already
+   `"created"` returns the original delegation via `FindByID` without re-running any validation or
+   side effect below. A hit whose record is still `"pending"` (another call holds it) instead
+   returns `409 idempotency_key_in_flight` immediately. On any miss (or no key present), the key is
+   atomically claimed via `Reserve` (`SETNX`, DLG-D35) before step 2 runs — a losing `Reserve` also
+   returns `409 idempotency_key_in_flight`. A reservation is released (`Release`) if any later step
+   fails, so a retry with the same key isn't stuck for the 24h TTL; a Valkey-down `Reserve` error
+   degrades to best-effort (proceed unreserved), not a failure. This closes a real race the original
+   `Get`-then-`Save` implementation left open: two concurrent same-key creates could both miss the
+   `Get` and both reach step 6 below.
 2. **Pre-flight validation** — self-delegation, scope/`scope_id` consistency, `reason` ≤500 chars,
    `starts_at` skew tolerance (±5s) and 1-year future bound, `ends_at > starts_at`.
 3. **Tenant bounds** — `delegation_tenant_settings.Get` read in-process (DLG-D2, no cross-service
@@ -26,7 +33,7 @@ grounded in the actual code (`internal/core/service/*.go`, `cmd/reconciler/jobs/
    the LAST step, after every external dependency has already succeeded. If the tx fails, User
    Profile has already been told the user is OOO — this is a known, accepted small inconsistency
    window (LLD's availability-first tradeoff), not a two-phase-commit.
-7. Idempotency record save and cache invalidation happen **after** the tx commits, best-effort
+7. Idempotency record save (overwriting step 1's `"pending"` reservation with the final `{delegation_id, "created"}` record, same key/TTL) and cache invalidation happen **after** the tx commits, best-effort
    (`//nolint:errcheck` — a failed idempotency-save must never fail an already-committed create).
 
 ## Activation cron (`delegation-activation`, DLG-D25) — `jobs.Activation`

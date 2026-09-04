@@ -483,6 +483,66 @@ func TestDelegationService_Create_IdempotencyReplay(t *testing.T) {
 	assert.Equal(t, insertCallsBefore, len(h.repo.insertCalls), "replay must not write again")
 }
 
+// TestDelegationService_Create_ConcurrentSameKey_RejectsSecondAsInFlight
+// closes the race a plain Get-then-Save pattern leaves open: two concurrent
+// Create calls sharing one Idempotency-Key must not both pass the dedup
+// check and both insert a delegation. Simulated deterministically by
+// reserving the key out-of-band (as a concurrent in-flight call would)
+// before invoking Create.
+func TestDelegationService_Create_ConcurrentSameKey_RejectsSecondAsInFlight(t *testing.T) {
+	h := newDelegationHarness()
+	tenantID, delegatorID := uuid.New(), uuid.New()
+	req := validCreateInput()
+	h.activeBoth(delegatorID, req.DelegateID)
+
+	const key = "idem-key-concurrent"
+	reserved, err := h.idem.Reserve(context.Background(), tenantID, key)
+	require.NoError(t, err)
+	require.True(t, reserved, "test setup: simulated in-flight reservation must succeed")
+
+	_, err = h.svc.Create(context.Background(), tenantID, delegatorID, key, req)
+	requireDomainCode(t, err, domain.ErrIdempotencyKeyInFlight.Error())
+	assert.Equal(t, 0, h.membership.callCount(), "an in-flight conflict must fail before any membership check")
+	assert.Empty(t, h.repo.insertCalls, "an in-flight conflict must not insert a delegation")
+}
+
+// TestDelegationService_Create_ReleasesReservationOnFailure verifies a
+// failed Create (after successfully reserving the key) releases the
+// reservation, so a client retry with the same key is not stuck waiting out
+// the 24h TTL.
+func TestDelegationService_Create_ReleasesReservationOnFailure(t *testing.T) {
+	h := newDelegationHarness()
+	tenantID, delegatorID := uuid.New(), uuid.New()
+	req := validCreateInput()
+	// No membership results configured -> checkBothMemberships fails closed.
+
+	const key = "idem-key-fails"
+	_, err := h.svc.Create(context.Background(), tenantID, delegatorID, key, req)
+	require.Error(t, err)
+	assert.Equal(t, 1, h.idem.releaseCalls, "a failed create must release its reservation")
+
+	_, found, gerr := h.idem.Get(context.Background(), tenantID, key)
+	require.NoError(t, gerr)
+	assert.False(t, found, "the reservation must be gone after release")
+}
+
+// TestDelegationService_Create_ReserveUnavailable_DegradesToBestEffort
+// verifies a Valkey-down Reserve (returning an error) does not fail the
+// request — create-idempotency degrades to best-effort, matching the
+// existing Get/Save error handling (§9.2/§9.3).
+func TestDelegationService_Create_ReserveUnavailable_DegradesToBestEffort(t *testing.T) {
+	h := newDelegationHarness()
+	tenantID, delegatorID := uuid.New(), uuid.New()
+	req := validCreateInput()
+	h.activeBoth(delegatorID, req.DelegateID)
+	h.idem.reserveErr = errors.New("valkey down")
+
+	got, err := h.svc.Create(context.Background(), tenantID, delegatorID, "idem-key-degraded", req)
+	require.NoError(t, err)
+	require.NotNil(t, got)
+	assert.Equal(t, 0, h.idem.releaseCalls, "no reservation was made, so nothing should be released")
+}
+
 // ── List / WithMetrics ───────────────────────────────────────────────────
 
 func TestDelegationService_WithMetrics_ReturnsSameInstance(t *testing.T) {
