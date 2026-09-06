@@ -127,6 +127,20 @@ func run(logger Logger) error {
 	// points directly at Postgres; falls back to dsn when unset (LLD §7.4).
 	migratorDSN := pgadapter.MigrationDSNFromEnv()
 
+	// Migrations run before any pool is opened. Migration order is critical
+	// (postgres.Migrate / iam-realm-provisioner): outbox.ApplySchema creates
+	// outbox_events BEFORE the domain migration, which GRANTs delegation_app
+	// on that table. Domain-then-outbox (the iam-user-profile order) fails
+	// every fresh-database bring-up. Crucially, migrations must also precede
+	// pool construction — the domain migration creates the delegation_app role,
+	// so opening the app pool before it runs fails on a fresh database.
+	if err := outbox.ApplySchema(baseCtx, &pgmigrate.Runner{DSN: migratorDSN}); err != nil {
+		return fmt.Errorf("apply outbox schema: %w", err)
+	}
+	if err := pgadapter.RunMigrations(baseCtx, migratorDSN, pgadapter.NewLoggerAdapter(logger)); err != nil {
+		return fmt.Errorf("run migrations: %w", err)
+	}
+
 	// The RLS-scoped delegation_app pool — every public-route write and
 	// read goes through this pool, with app.tenant_id bound per-request by
 	// tenantGUCMiddleware (router.go) or per-call by gucBoundReader.
@@ -175,17 +189,6 @@ func run(logger Logger) error {
 			logger.Error("sysPool drain error", map[string]interface{}{"error": err.Error()})
 		}
 	}()
-
-	// Migration order is critical (postgres.Migrate / iam-realm-provisioner):
-	// outbox.ApplySchema creates outbox_events BEFORE the domain migration,
-	// which GRANTs delegation_app on that table. Domain-then-outbox (the
-	// iam-user-profile order) fails every fresh-database bring-up.
-	if err := outbox.ApplySchema(baseCtx, &pgmigrate.Runner{DSN: migratorDSN}); err != nil {
-		return fmt.Errorf("apply outbox schema: %w", err)
-	}
-	if err := pgadapter.RunMigrations(baseCtx, migratorDSN, pgadapter.NewLoggerAdapter(logger)); err != nil {
-		return fmt.Errorf("run migrations: %w", err)
-	}
 
 	// Event enqueue (ValidatingCodec + Publisher) + SNS publisher w/ optional
 	// Glue codec (publish-time) — the enqueue-vs-publish split, LLD §10.3.1,

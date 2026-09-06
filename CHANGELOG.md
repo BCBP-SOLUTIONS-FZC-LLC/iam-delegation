@@ -32,6 +32,15 @@ index into those, not a duplicate of them.
 
 ### Fixed
 
+- **`cmd/server` ran the outbox/domain migrations *after* opening the RLS-scoped `delegation_app`
+  pool**, not just in the wrong order relative to each other (that ordering was already fixed —
+  see the migration-startup-order entry below). On a genuinely fresh database the domain migration
+  is what *creates* the `delegation_app` role, so opening that pool before migrations ran failed
+  bring-up outright rather than merely risking a `GRANT`-ordering race. Migrations now run before
+  any pool is constructed. Also: `make test-ci`'s `sed -i ''` (BSD-only) is replaced with a
+  portable temp-file redirect, since GNU sed on Linux CI runners treated the empty string argument
+  as a filename and failed; and test coverage was broadened across the adapter and service layers
+  (including a new `errortx_test.go`) as part of the same pass.
 - **Cross-service (LLD rev 2.11):** `iam-user-profile` migrated its published event type names
   from dot-notation to PascalCase while still undeployed — `domain.EventUserUpdated` here changed
   from `"user.updated"` to `"UserUpdated"` to match. `CascadeConsumer.Handle`'s dispatch already

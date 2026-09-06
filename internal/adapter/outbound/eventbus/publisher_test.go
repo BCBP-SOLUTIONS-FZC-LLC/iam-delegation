@@ -50,6 +50,23 @@ func (f *fakePublisherLogger) Info(string, map[string]interface{})  {}
 func (f *fakePublisherLogger) Warn(string, map[string]interface{})  {}
 func (f *fakePublisherLogger) Error(string, map[string]interface{}) { f.errorCount++ }
 
+// TestPublisher_EnqueueCtx_WithLogger_DebugPath covers lines 90–92: the
+// p.log.Debug call is reached when p.log != nil and outbox.Enqueue succeeds.
+func TestPublisher_EnqueueCtx_WithLogger_DebugPath(t *testing.T) {
+	log := &fakePublisherLogger{}
+	p := New(domain.Source, NoopCodec{}).WithLogger(log)
+	tx := &fakeTx{}
+
+	require.NoError(t, p.EnqueueCtx(pgadapter.WithTx(context.Background(), tx), &domain.DomainEvent{
+		Type:     domain.EventDelegationStarted,
+		TenantID: uuid.New(),
+		Data:     map[string]string{"k": "v"},
+	}))
+	require.Len(t, tx.execCalls, 1, "outbox.Enqueue must have been called")
+	// The debug log path was exercised — no error should have been logged.
+	assert.Equal(t, 0, log.errorCount)
+}
+
 func TestPublisher_EnqueueCtx_HappyPath_InsertsIntoOutbox(t *testing.T) {
 	p := New(domain.Source, NoopCodec{})
 	tx := &fakeTx{}

@@ -124,3 +124,13 @@ func TestWriteErrorWithDetails_WithDetails(t *testing.T) {
 		t.Fatalf("expected status %d, got %d", http.StatusConflict, w.Code)
 	}
 }
+
+// TestHandleError_UnmappedDomainErrorCode covers lines 104–106: a *domain.Error
+// whose code has no entry in errorStatusByCode falls back to 500.
+func TestHandleError_UnmappedDomainErrorCode_Returns500(t *testing.T) {
+	c, w := newTestGinContext()
+	HandleError(c, &domain.Error{Code: "no_such_code_xyz_for_testing"})
+	if w.Code != http.StatusInternalServerError {
+		t.Fatalf("expected 500 for unmapped code, got %d", w.Code)
+	}
+}

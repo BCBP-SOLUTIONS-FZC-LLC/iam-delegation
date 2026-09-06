@@ -1,6 +1,7 @@
 package metrics
 
 import (
+	"errors"
 	"os"
 	"testing"
 
@@ -179,4 +180,22 @@ func TestReplaceActiveGauges_ResetDropsAbsentTenants(t *testing.T) {
 		}
 	}
 	assert.ElementsMatch(t, []string{"tenant-b"}, tenants, "a tenant that dropped to zero active rows must disappear, not linger")
+}
+
+// TestRegister_PanicsOnError covers lines 79–80: Register panics when
+// registerErr is non-nil after registerOnce.Do has already fired.
+// We bypass Do by setting registerErr directly (same-package access).
+func TestRegister_PanicsOnError(t *testing.T) {
+	// Ensure Do has already fired so our manual set takes effect.
+	Register()
+
+	orig := registerErr
+	origLive := Live
+	t.Cleanup(func() { registerErr = orig; Live = origLive })
+
+	registerErr = errors.New("forced registration error")
+	assert.Panics(t, func() { Register() }, "Register must panic when registerErr is set")
+
+	registerErr = orig
+	Live = origLive
 }

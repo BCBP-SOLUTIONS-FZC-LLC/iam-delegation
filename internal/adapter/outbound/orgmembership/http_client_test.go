@@ -203,3 +203,13 @@ func TestHTTPChecker_Exists_ActiveNoMembershipID(t *testing.T) {
 	assert.True(t, active)
 	assert.Equal(t, uuid.Nil, membershipID, "missing tenant_membership_id must yield uuid.Nil")
 }
+
+// TestHTTPChecker_Exists_InvalidURL covers lines 88–90: http.NewRequestWithContext
+// fails when the constructed URL is invalid (null byte in baseURL).
+func TestHTTPChecker_Exists_InvalidURL_Errors(t *testing.T) {
+	// A null byte in the URL causes http.NewRequestWithContext to fail.
+	checker := &HTTPChecker{baseURL: "http://host\x00", httpClient: &http.Client{}}
+	_, _, err := checker.Exists(t.Context(), uuid.New(), uuid.New())
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "build request")
+}
