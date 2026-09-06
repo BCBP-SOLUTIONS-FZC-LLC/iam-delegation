@@ -108,6 +108,8 @@ type fakeDelegationRepository struct {
 	extendResult *domain.Delegation
 	extendErr    error
 
+	listByDelegatorErr error
+
 	endForUserResult []domain.Delegation
 	endForUserErr    error
 
@@ -145,6 +147,9 @@ func (f *fakeDelegationRepository) List(ctx context.Context, tenantID uuid.UUID)
 
 func (f *fakeDelegationRepository) ListByDelegator(ctx context.Context, tenantID, delegatorID uuid.UUID) ([]domain.Delegation, error) {
 	f.rec.record("delegationRepo.ListByDelegator")
+	if f.listByDelegatorErr != nil {
+		return nil, f.listByDelegatorErr
+	}
 	return nil, nil
 }
 

@@ -3,6 +3,7 @@ package service
 import (
 	"context"
 	"errors"
+	"sync"
 	"testing"
 
 	"github.com/BCBP-SOLUTIONS-FZC-LLC/iam-delegation/internal/core/domain"
@@ -257,4 +258,78 @@ func TestCascadeService_ScrubTenant_OrderAndShortCircuit(t *testing.T) {
 		assert.Equal(t, 1, repo.softDeleteTenantCalls)
 		assert.Equal(t, 1, settings.softDeleteTenantCalls)
 	})
+}
+
+// countingPublisher succeeds for the first (failAt-1) EnqueueCtx calls then
+// returns err on the failAt-th call and beyond.
+type countingPublisher struct {
+	mu     sync.Mutex
+	count  int
+	failAt int
+	err    error
+}
+
+func (p *countingPublisher) EnqueueCtx(_ context.Context, _ *domain.DomainEvent) error {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.count++
+	if p.count >= p.failAt {
+		return p.err
+	}
+	return nil
+}
+
+func TestCascadeService_EndForUser_RepoError_PropagatesFromTx(t *testing.T) {
+	repo, _, _, _, svc := newCascadeHarness()
+	wantErr := errors.New("db down")
+	repo.endForUserErr = wantErr
+
+	err := svc.EndForUser(context.Background(), uuid.New(), uuid.New())
+	require.ErrorIs(t, err, wantErr)
+}
+
+func TestCascadeService_EndForUser_EnqueueError_PropagatesFromTx(t *testing.T) {
+	repo, _, _, pub, svc := newCascadeHarness()
+	tenantID := uuid.New()
+	delegateID := uuid.New()
+	repo.endForUserResult = []domain.Delegation{
+		{ID: uuid.New(), TenantID: tenantID, DelegatorID: uuid.New(), DelegateID: delegateID, Scope: domain.ScopeAll},
+	}
+	pub.err = errors.New("enqueue fail")
+
+	err := svc.EndForUser(context.Background(), tenantID, delegateID)
+	require.ErrorIs(t, err, pub.err)
+}
+
+func TestCascadeService_EndForDisabledDelegate_EnqueueEndedError_Propagates(t *testing.T) {
+	repo, _, _, pub, svc := newCascadeHarness()
+	tenantID := uuid.New()
+	delegateID := uuid.New()
+	repo.endForDisabledDelegateResult = []domain.Delegation{
+		{ID: uuid.New(), TenantID: tenantID, DelegatorID: uuid.New(), DelegateID: delegateID, Scope: domain.ScopeAll},
+	}
+	pub.err = errors.New("enqueue failed")
+
+	err := svc.EndForDisabledDelegate(context.Background(), tenantID, delegateID)
+	require.ErrorIs(t, err, pub.err)
+}
+
+func TestCascadeService_EndForDisabledDelegate_EnqueueEscalationError_Propagates(t *testing.T) {
+	rec := &callRecorder{}
+	repo := newFakeDelegationRepository(rec)
+	settings := &fakeSettingsRepository{rec: rec}
+	up := &fakeUserProfileClient{rec: rec}
+	wantErr := errors.New("escalation enqueue fail")
+	cpub := &countingPublisher{failAt: 2, err: wantErr}
+	tx := &fakeTxRunner{rec: rec, publisher: cpub}
+	svc := NewCascadeService(repo, settings, up, tx)
+
+	tenantID := uuid.New()
+	delegateID := uuid.New()
+	repo.endForDisabledDelegateResult = []domain.Delegation{
+		{ID: uuid.New(), TenantID: tenantID, DelegatorID: uuid.New(), DelegateID: delegateID, Scope: domain.ScopeAll},
+	}
+
+	err := svc.EndForDisabledDelegate(context.Background(), tenantID, delegateID)
+	require.ErrorIs(t, err, wantErr)
 }

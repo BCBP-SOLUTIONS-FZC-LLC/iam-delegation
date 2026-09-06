@@ -61,6 +61,27 @@ func TestGlueDecodeCodec_Decode_WrongHeaderVersion(t *testing.T) {
 
 // TestGlueDecodeCodec_Encode_AlwaysErrors confirms this codec cannot be
 // mistakenly wired as a publish-time codec — only GlueCodec may publish.
+// TestPrependGlueHeader_InvalidUUID covers lines 275–277: uuid.Parse fails
+// when schemaVersionID is not a valid UUID.
+func TestPrependGlueHeader_InvalidUUID_Errors(t *testing.T) {
+	_, err := prependGlueHeader("not-a-valid-uuid", []byte(`{}`))
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "parse schema version UUID")
+}
+
+// TestGlueCodec_Encode_BadCachedVersionID covers lines 131–133: GlueCodec.Encode
+// returns an error when the cached version ID is not a valid UUID (prependGlueHeader fails).
+func TestGlueCodec_Encode_BadCachedVersionID_Errors(t *testing.T) {
+	g := &GlueCodec{
+		versionCache: map[string]string{
+			"DelegationStarted": "not-a-valid-uuid",
+		},
+	}
+	_, _, err := g.Encode(context.Background(), "DelegationStarted", json.RawMessage(`{}`))
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "parse schema version UUID")
+}
+
 func TestGlueDecodeCodec_Encode_AlwaysErrors(t *testing.T) {
 	_, _, err := GlueDecodeCodec{}.Encode(context.Background(), "MembershipRevoked", json.RawMessage(`{}`))
 	require.Error(t, err)

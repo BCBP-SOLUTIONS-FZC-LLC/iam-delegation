@@ -49,3 +49,29 @@ func TestProcessedEventsRepository_Prune_BoundedDelete(t *testing.T) {
 	require.NoError(t, err)
 	assert.False(t, ok, "ttlDays=0 must delete rows with processed_at < now()")
 }
+
+// TestProcessedEventsRepository_IsProcessed_CancelledContext covers lines
+// 40–42: a pre-cancelled context causes the query to fail.
+func TestProcessedEventsRepository_IsProcessed_CancelledContext(t *testing.T) {
+	db := setupTestDB(t)
+	repo := NewProcessedEventsRepository(db.Bypass)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	_, err := repo.IsProcessed(ctx, "cascade", "evt-x")
+	require.Error(t, err)
+}
+
+// TestProcessedEventsRepository_Prune_CancelledContext covers lines
+// 87–89: a pre-cancelled context causes the DELETE to fail.
+func TestProcessedEventsRepository_Prune_CancelledContext(t *testing.T) {
+	db := setupTestDB(t)
+	repo := NewProcessedEventsRepository(db.Bypass)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	_, err := repo.Prune(ctx, 0, 10)
+	require.Error(t, err)
+}

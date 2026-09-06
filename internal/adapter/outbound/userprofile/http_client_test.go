@@ -171,6 +171,17 @@ func TestHTTPClient_SetAvailability_4xx_NonJSONBody(t *testing.T) {
 	assert.Contains(t, err.Error(), "400")
 }
 
+// TestHTTPClient_SetAvailability_InvalidURL covers lines 116–118:
+// http.NewRequestWithContext fails when the URL is invalid (null byte).
+func TestHTTPClient_SetAvailability_InvalidURL_Errors(t *testing.T) {
+	c := &HTTPClient{baseURL: "http://host\x00", httpClient: &http.Client{}}
+	err := c.SetAvailability(t.Context(), port.SetAvailabilityRequest{
+		TenantID: uuid.New(), UserID: uuid.New(),
+	})
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "build request")
+}
+
 // TestBuildBody_WithOOOUntil covers the req.OOOUntil != nil branch.
 func TestBuildBody_WithOOOUntil(t *testing.T) {
 	var oooTime = time.Date(2026, 9, 1, 12, 0, 0, 0, time.UTC)

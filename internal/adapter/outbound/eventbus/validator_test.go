@@ -210,6 +210,19 @@ func TestNewSchemaValidatorFromEntries_InvalidSchema_Errors(t *testing.T) {
 	}
 }
 
+// TestNewSchemaValidatorFromEntries_AddResourceError covers lines 64–65:
+// AddResource returns "resource already exists" when two entries share the
+// same name (same compiled URL).
+func TestNewSchemaValidatorFromEntries_AddResourceError_DuplicateName(t *testing.T) {
+	_, err := newSchemaValidatorFromEntries([]schemaEntry{
+		{name: "Dup", src: []byte(`{"type": "string"}`)},
+		{name: "Dup", src: []byte(`{"type": "integer"}`)}, // duplicate URL → AddResource fails
+	})
+	if err == nil {
+		t.Fatal("expected an AddResource error for duplicate schema name")
+	}
+}
+
 func TestSchemaValidator_Validate_MalformedPayload_Errors(t *testing.T) {
 	v := mustValidator(t)
 	err := v.Validate(context.Background(), domain.EventDelegationStarted, []byte("{not json"))

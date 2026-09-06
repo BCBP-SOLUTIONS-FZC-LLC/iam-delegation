@@ -505,6 +505,60 @@ func TestHandle_TenantMembershipsPurgedMalformedPayload_ReturnsErrorForDLQ(t *te
 // TestHandle_UserUpdatedInvalidTenantID_ReturnsErrorForDLQ covers
 // handleUserDisabled's own uuid.Parse(env.TenantID) branch — a status:
 // "disabled" delivery whose envelope carries a malformed tenant_id.
+// TestHandle_UnknownEventType_AckError covers lines 170–172: ackUnknown
+// propagates an error when MarkProcessed fails (e.g. idempotency store is down).
+func TestHandle_UnknownEventType_AckError_PropagatesError(t *testing.T) {
+	cascade := &fakeCascadeService{}
+	idem := newFakeIdempotencyStore()
+	idem.markProcessedErr = errors.New("db down")
+	c := newTestConsumer(cascade, idem, fakeGUCBinder(&[]gucBindCall{}))
+
+	env := mustEnvelope(t, uuid.New().String(), "SomeUnregisteredEventType", struct{}{})
+
+	err := c.Handle(context.Background(), env)
+	require.Error(t, err, "Handle must propagate ackUnknown's error")
+	require.Empty(t, cascade.endForUserCalls)
+	require.Empty(t, cascade.scrubTenantCalls)
+}
+
+// TestHandle_IdempotencyCheckError covers lines 177–179: skipDuplicate
+// returns an error when IsProcessed fails (e.g. Valkey is down).
+func TestHandle_IdempotencyCheckError_PropagatesError(t *testing.T) {
+	cascade := &fakeCascadeService{}
+	idem := newFakeIdempotencyStore()
+	idem.isProcessedErr = errors.New("valkey down")
+	c := newTestConsumer(cascade, idem, fakeGUCBinder(&[]gucBindCall{}))
+
+	env := mustEnvelope(t, uuid.New().String(), domain.EventMembershipRevoked, domain.MembershipRevokedPayload{
+		TenantID: uuid.New(), UserID: uuid.New(), ActorID: uuid.New(),
+	})
+
+	err := c.Handle(context.Background(), env)
+	require.Error(t, err, "Handle must propagate the idempotency-check error")
+	require.Empty(t, cascade.endForUserCalls)
+}
+
+// TestHandleUserDisabled_MalformedPayload covers lines 278–280: handleUserDisabled
+// returns a decode error when user_id is not a UUID string. This path is exercised
+// directly (white-box) because Handle's isUserUpdatedDisabled gate would also reject
+// the same payload before dispatching, making the line unreachable via Handle.
+func TestHandleUserDisabled_MalformedPayload_ReturnsError(t *testing.T) {
+	cascade := &fakeCascadeService{}
+	idem := newFakeIdempotencyStore()
+	c := newTestConsumer(cascade, idem, fakeGUCBinder(&[]gucBindCall{}))
+
+	env := events.Envelope[json.RawMessage]{
+		ID:       uuid.New().String(),
+		Type:     domain.EventUserUpdated,
+		TenantID: uuid.New().String(),
+		Payload:  json.RawMessage(`{"user_id": 99999}`), // int instead of UUID string
+	}
+
+	err := c.handleUserDisabled(context.Background(), env)
+	require.Error(t, err, "handleUserDisabled must return a decode error for a malformed user_id")
+	require.Empty(t, cascade.endForDisabledDelegateCalls)
+}
+
 func TestHandle_UserUpdatedInvalidTenantID_ReturnsErrorForDLQ(t *testing.T) {
 	cascade := &fakeCascadeService{}
 	idem := newFakeIdempotencyStore()

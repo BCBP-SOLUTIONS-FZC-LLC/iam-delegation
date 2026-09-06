@@ -685,3 +685,82 @@ func TestDelegationRepository_ExtendReview_EndedStatus_ReturnsNotFound(t *testin
 		require.Equal(t, domain.ErrDelegationNotFound.Error(), de.Code)
 	}
 }
+
+// ── context-cancellation gap tests ───────────────────────────────────────
+// These cover the query-error return branches that are unreachable with
+// valid inputs but reliably triggered when the context is cancelled first.
+
+func TestDelegationRepository_List_CancelledContext(t *testing.T) {
+	db := setupTestDB(t)
+	repo := NewDelegationRepository(db.App)
+	tenantID := uuid.New()
+	ctx, cancel := context.WithCancel(withTenant(context.Background(), tenantID))
+	cancel()
+	_, err := repo.List(ctx, tenantID)
+	require.Error(t, err)
+}
+
+func TestDelegationRepository_Insert_CancelledContext(t *testing.T) {
+	db := setupTestDB(t)
+	repo := NewDelegationRepository(db.App)
+	tenantID := uuid.New()
+	ctx, cancel := context.WithCancel(withTenant(context.Background(), tenantID))
+	cancel()
+	_, err := repo.Insert(ctx, &domain.Delegation{
+		TenantID:    tenantID,
+		DelegatorID: uuid.New(),
+		DelegateID:  uuid.New(),
+		Scope:       domain.ScopeAll,
+	})
+	require.Error(t, err)
+}
+
+func TestDelegationRepository_End_CancelledContext(t *testing.T) {
+	db := setupTestDB(t)
+	repo := NewDelegationRepository(db.App)
+	tenantID := uuid.New()
+	ctx, cancel := context.WithCancel(withTenant(context.Background(), tenantID))
+	cancel()
+	_, err := repo.End(ctx, tenantID, uuid.New(), domain.DelegationCancelled, 1)
+	require.Error(t, err)
+}
+
+func TestDelegationRepository_MarkReviewWarned_CancelledContext(t *testing.T) {
+	db := setupTestDB(t)
+	repo := NewDelegationRepository(db.App)
+	tenantID := uuid.New()
+	ctx, cancel := context.WithCancel(withTenant(context.Background(), tenantID))
+	cancel()
+	err := repo.MarkReviewWarned(ctx, tenantID, uuid.New(), 3, 1)
+	require.Error(t, err)
+}
+
+func TestDelegationRepository_EndForUser_CancelledContext(t *testing.T) {
+	db := setupTestDB(t)
+	repo := NewDelegationRepository(db.App)
+	tenantID := uuid.New()
+	ctx, cancel := context.WithCancel(withTenant(context.Background(), tenantID))
+	cancel()
+	_, err := repo.EndForUser(ctx, tenantID, uuid.New())
+	require.Error(t, err)
+}
+
+func TestDelegationRepository_EndForDisabledDelegate_CancelledContext(t *testing.T) {
+	db := setupTestDB(t)
+	repo := NewDelegationRepository(db.App)
+	tenantID := uuid.New()
+	ctx, cancel := context.WithCancel(withTenant(context.Background(), tenantID))
+	cancel()
+	_, err := repo.EndForDisabledDelegate(ctx, tenantID, uuid.New())
+	require.Error(t, err)
+}
+
+func TestDelegationRepository_HardPurgeSoftDeletedBefore_CancelledContext(t *testing.T) {
+	db := setupTestDB(t)
+	repo := NewDelegationRepository(db.App)
+	tenantID := uuid.New()
+	ctx, cancel := context.WithCancel(withTenant(context.Background(), tenantID))
+	cancel()
+	_, err := repo.HardPurgeSoftDeletedBefore(ctx, time.Now(), 10)
+	require.Error(t, err)
+}

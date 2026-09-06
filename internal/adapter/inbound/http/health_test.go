@@ -125,6 +125,19 @@ func TestReadyz(t *testing.T) {
 		require.Equal(t, "degraded", checks["valkey"])
 	})
 
+	t.Run("sys postgres healthy -> 200 with ok check", func(t *testing.T) {
+		hc := &healthHandlers{
+			sysPostgres: fakePostgresHealth{status: pgcommon.HealthStatus{Healthy: true}},
+		}
+		c, w := newRequestWithIdentity(http.MethodGet, "/readyz", nil, nil)
+		hc.readyz(c)
+		require.Equal(t, http.StatusOK, w.Code)
+		var body map[string]any
+		require.NoError(t, json.Unmarshal(w.Body.Bytes(), &body))
+		checks := body["checks"].(map[string]any)
+		require.Equal(t, "ok", checks["sys_postgres"])
+	})
+
 	t.Run("sys postgres unhealthy -> 503 overall error", func(t *testing.T) {
 		hc := &healthHandlers{
 			postgres:    fakePostgresHealth{status: pgcommon.HealthStatus{Healthy: true}},

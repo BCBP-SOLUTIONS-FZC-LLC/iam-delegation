@@ -894,6 +894,186 @@ func TestDelegationService_Reassign_EmitsEndReasonReassigned(t *testing.T) {
 
 // ── enqueue ──────────────────────────────────────────────────────────────
 
+// ── new gap-coverage tests ────────────────────────────────────────────────
+
+func TestDelegationService_List_RepositoryError(t *testing.T) {
+	h := newDelegationHarness()
+	wantErr := errors.New("db down")
+	h.repo.listByDelegatorErr = wantErr
+
+	_, err := h.svc.List(context.Background(), uuid.New(), uuid.New())
+	require.ErrorIs(t, err, wantErr)
+}
+
+func TestDelegationService_Create_SettingsGetError(t *testing.T) {
+	h := newDelegationHarness()
+	tenantID, delegatorID := uuid.New(), uuid.New()
+	req := validCreateInput()
+	h.activeBoth(delegatorID, req.DelegateID)
+	wantErr := errors.New("settings unavailable")
+	h.settings.getErr = wantErr
+
+	_, err := h.svc.Create(context.Background(), tenantID, delegatorID, "", req)
+	require.ErrorIs(t, err, wantErr)
+}
+
+func TestDelegationService_Create_PastStartsAtClampsOOOFrom(t *testing.T) {
+	h := newDelegationHarness()
+	tenantID, delegatorID := uuid.New(), uuid.New()
+	req := validCreateInput()
+	h.activeBoth(delegatorID, req.DelegateID)
+	// 3s in the past is within the 5s skewTolerance so it passes validation
+	// yet is deterministically before service-internal now, exercising the clamp.
+	slightlyPast := time.Now().UTC().Add(-3 * time.Second)
+	req.StartsAt = &slightlyPast
+
+	got, err := h.svc.Create(context.Background(), tenantID, delegatorID, "", req)
+	require.NoError(t, err)
+	require.NotNil(t, got)
+	require.Equal(t, 1, h.up.callCount())
+	// OOOFrom must be clamped to >= now (not starts_at which is 3s in the past)
+	upReq := h.up.calls[0]
+	require.NotNil(t, upReq.OOOFrom)
+	assert.False(t, upReq.OOOFrom.Before(slightlyPast),
+		"OOOFrom must never be before starts_at")
+}
+
+func TestDelegationService_Create_UPFailureRecordsMetric(t *testing.T) {
+	h := newDelegationHarness()
+	tenantID, delegatorID := uuid.New(), uuid.New()
+	req := validCreateInput()
+	h.activeBoth(delegatorID, req.DelegateID)
+	fm := &fakeMetrics{}
+	h.svc.WithMetrics(fm)
+	upErr := errors.New("user profile unavailable")
+	h.up.fn = func(_ context.Context, _ port.SetAvailabilityRequest) error { return upErr }
+
+	_, err := h.svc.Create(context.Background(), tenantID, delegatorID, "", req)
+	require.Error(t, err)
+	assert.Contains(t, fm.upAvailabilityFailures, "create")
+}
+
+func TestDelegationService_Create_TxFailure_CompensatesUserProfile(t *testing.T) {
+	h := newDelegationHarness()
+	tenantID, delegatorID := uuid.New(), uuid.New()
+	req := validCreateInput()
+	h.activeBoth(delegatorID, req.DelegateID)
+	h.repo.insertErr = errors.New("insert failed")
+
+	_, err := h.svc.Create(context.Background(), tenantID, delegatorID, "", req)
+	require.Error(t, err)
+	// UP called twice: once for OOO set, once for compensating clear
+	require.Equal(t, 2, h.up.callCount())
+	assert.True(t, h.up.calls[1].ClearDelegate, "second UP call must be a compensating clear")
+}
+
+func TestDelegationService_CancelInternal_FindByIDError(t *testing.T) {
+	h := newDelegationHarness()
+	wantErr := errors.New("not found")
+	h.repo.findByIDFn = func(_ context.Context, _, _ uuid.UUID) (*domain.Delegation, error) {
+		return nil, wantErr
+	}
+
+	_, err := h.svc.Cancel(context.Background(), uuid.New(), uuid.New(), 1)
+	require.ErrorIs(t, err, wantErr)
+}
+
+func TestDelegationService_CancelInternal_ActorFromRequestContext(t *testing.T) {
+	h := newDelegationHarness()
+	tenantID := uuid.New()
+	actorID := uuid.New()
+	d := h.repo.seed(domain.Delegation{
+		TenantID: tenantID, DelegatorID: uuid.New(), DelegateID: uuid.New(),
+		Scope: domain.ScopeAll, Status: domain.DelegationActive, RecordVersion: 1,
+	})
+	h.repo.endResult = &d
+
+	ctx := requestctx.WithContext(context.Background(), &requestctx.Context{
+		UserID: actorID.String(), TenantID: tenantID.String(),
+	})
+	got, err := h.svc.Cancel(ctx, tenantID, d.ID, 1)
+	require.NoError(t, err)
+	require.NotNil(t, got)
+
+	events := h.pub.snapshot()
+	require.Len(t, events, 1)
+	// requestctx actor flows into the payload's ActorID (not the envelope Actor field)
+	payload, ok := events[0].Data.(domain.DelegationEndedPayload)
+	require.True(t, ok)
+	assert.Equal(t, actorID, payload.ActorID)
+}
+
+func TestDelegationService_Extend_FindByIDError(t *testing.T) {
+	h := newDelegationHarness()
+	wantErr := errors.New("db error")
+	h.repo.findByIDFn = func(_ context.Context, _, _ uuid.UUID) (*domain.Delegation, error) {
+		return nil, wantErr
+	}
+
+	_, err := h.svc.Extend(context.Background(), uuid.New(), uuid.New(), nil, 1)
+	require.ErrorIs(t, err, wantErr)
+}
+
+func TestDelegationService_Extend_SettingsGetError(t *testing.T) {
+	h := newDelegationHarness()
+	tenantID := uuid.New()
+	d := h.repo.seed(domain.Delegation{
+		TenantID: tenantID, DelegatorID: uuid.New(), DelegateID: uuid.New(),
+		Scope: domain.ScopeAll, Status: domain.DelegationActive, RecordVersion: 1,
+	})
+	wantErr := errors.New("settings unavailable")
+	h.settings.getErr = wantErr
+
+	_, err := h.svc.Extend(context.Background(), tenantID, d.ID, nil, 1)
+	require.ErrorIs(t, err, wantErr)
+}
+
+func TestDelegationService_Extend_ExtendReviewError(t *testing.T) {
+	h := newDelegationHarness()
+	tenantID := uuid.New()
+	d := h.repo.seed(domain.Delegation{
+		TenantID: tenantID, DelegatorID: uuid.New(), DelegateID: uuid.New(),
+		Scope: domain.ScopeAll, Status: domain.DelegationActive, RecordVersion: 1,
+	})
+	wantErr := errors.New("extend failed")
+	h.repo.extendErr = wantErr
+
+	_, err := h.svc.Extend(context.Background(), tenantID, d.ID, nil, 1)
+	require.ErrorIs(t, err, wantErr)
+}
+
+func ptrStr(s string) *string { return &s }
+
+func TestDelegationService_Reassign_FieldOverrides(t *testing.T) {
+	h := newDelegationHarness()
+	tenantID := uuid.New()
+	newDelegate := uuid.New()
+	newScopeID := uuid.New()
+	existing := h.repo.seed(domain.Delegation{
+		TenantID: tenantID, DelegatorID: uuid.New(), DelegateID: uuid.New(),
+		Scope: domain.ScopeAll, Status: domain.DelegationActive, RecordVersion: 1,
+		Reason: "old reason",
+	})
+	h.activeBoth(existing.DelegatorID, newDelegate)
+	h.repo.endResult = &existing
+
+	endsAt := time.Now().UTC().Add(7 * 24 * time.Hour)
+	req := ReassignInput{
+		NewDelegateID:  &newDelegate,
+		Scope:          ptrStr(string(domain.ScopeAll)), // covers: scope = *req.Scope
+		ScopeIDSet:     true,                            // covers: scopeID = req.ScopeID (nil is valid for scope=all)
+		ScopeID:        nil,
+		Reason:         ptrStr("new reason"), // covers: reason = *req.Reason
+		EndsAtProvided: true,
+		EndsAt:         &endsAt,
+	}
+	_ = newScopeID // declared above but not used with nil ScopeID
+
+	got, err := h.svc.Reassign(context.Background(), tenantID, existing.ID, 1, req)
+	require.NoError(t, err)
+	require.NotNil(t, got)
+}
+
 func TestEnqueue_NoPublisherInContext_NoOp(t *testing.T) {
 	err := enqueue(context.Background(), domain.EventDelegationStarted, uuid.New(), "subj", "actor", map[string]string{"k": "v"})
 	require.NoError(t, err)

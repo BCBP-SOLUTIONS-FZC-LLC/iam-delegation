@@ -323,6 +323,7 @@ _merge-coverage:
 test-ci: | .coverage
 	$(GO) test $(TEST_UNIT_PKGS) -race -count=1 -timeout 15m \
 	  -coverpkg=$(COVER_PKG_LIST) -coverprofile=coverage.out
+	@sed -i '' '/^$$/d' coverage.out
 
 cover: test-ci
 	$(GO) tool cover -html=coverage.out

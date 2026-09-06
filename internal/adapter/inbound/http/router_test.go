@@ -261,3 +261,35 @@ func TestRouter_Docs_ProductionEnabledWithToken(t *testing.T) {
 		require.Equal(t, http.StatusUnauthorized, w.Code)
 	})
 }
+
+// TestNewRouter_EmptyServiceName covers lines 98–100: when ginCfg.ServiceName
+// is empty, NewRouter defaults it to "iam-delegation" before passing it on.
+func TestNewRouter_EmptyServiceName(t *testing.T) {
+	svc := &fakeDelegationService{}
+	reader := &fakeDelegationReader{}
+	settingsSvc := &fakeSettingsService{}
+	delegationHandler := NewDelegationHandler(svc, reader)
+	settingsHandler := NewSettingsHandler(settingsSvc)
+	internalHandler := NewInternalHandler(&fakeExpiryRunner{}, &fakeReviewRunner{}, reader)
+
+	// Pass an empty ServiceName — the router must fill it in and not panic.
+	r := NewRouter(delegationHandler, settingsHandler, internalHandler,
+		fakePostgresHealth{status: pgcommon.HealthStatus{Healthy: true}}, nil, fakePinger{}, fakePinger{},
+		gincommon.Config{Logger: testLogger()}, DocsConfig{}, nil)
+
+	req := httptest.NewRequest(http.MethodGet, "/healthz", nil)
+	w := httptest.NewRecorder()
+	r.Handler().ServeHTTP(w, req)
+	require.Equal(t, http.StatusOK, w.Code)
+}
+
+// TestRouter_Swagger_DefaultRoute covers lines 172–173: the wildcard swagger
+// handler's default branch, reached by any path that isn't .css or
+// swagger-initializer.js (e.g. /swagger/index.html).
+func TestRouter_Swagger_DefaultRoute(t *testing.T) {
+	r, _, _, _ := newTestRouter(DocsConfig{})
+	req := httptest.NewRequest(http.MethodGet, "/swagger/index.html", nil)
+	w := httptest.NewRecorder()
+	r.Handler().ServeHTTP(w, req)
+	require.Equal(t, http.StatusOK, w.Code)
+}

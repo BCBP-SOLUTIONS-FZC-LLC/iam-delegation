@@ -4,6 +4,8 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
+	"io"
 	"net/http"
 	"testing"
 	"time"
@@ -15,6 +17,14 @@ import (
 	"github.com/BCBP-SOLUTIONS-FZC-LLC/iam-delegation/internal/core/service"
 	"github.com/BCBP-SOLUTIONS-FZC-LLC/iam-delegation/pkg/requestctx"
 )
+
+// errReader is an io.ReadCloser whose Read always returns an error.
+type errReader struct{}
+
+func (e errReader) Read(_ []byte) (int, error) { return 0, errors.New("read error") }
+func (e errReader) Close() error               { return nil }
+
+var _ io.ReadCloser = errReader{}
 
 func selfRC(userID, tenantID uuid.UUID) *requestctx.Context {
 	return &requestctx.Context{UserID: userID.String(), TenantID: tenantID.String()}
@@ -794,4 +804,24 @@ func TestDelegationHandler_Reassign_InvalidTenantID_Returns401(t *testing.T) {
 	setPathParam(c, "id", delegationID.String())
 	h.Reassign(c)
 	require.Equal(t, http.StatusUnauthorized, w.Code)
+}
+
+// TestDelegationHandler_Reassign_BodyReadError covers lines 292–295: io.ReadAll
+// fails when the request body reader returns an error.
+func TestDelegationHandler_Reassign_BodyReadError(t *testing.T) {
+	tenantID, delegatorID := uuid.New(), uuid.New()
+	delegationID := uuid.New()
+	reader := &fakeDelegationReader{
+		findByIDFn: func(_ context.Context, _, _ uuid.UUID) (*domain.Delegation, error) {
+			return &domain.Delegation{ID: delegationID, TenantID: tenantID, DelegatorID: delegatorID}, nil
+		},
+	}
+	h := NewDelegationHandler(&fakeDelegationService{}, reader)
+
+	// Use a gin context whose Body is an errReader — auth checks pass (self)
+	// but io.ReadAll then fails.
+	c, w := newRequestWithIdentity(http.MethodPost, "/api/v1/delegations/"+delegationID.String()+"/reassign", errReader{}, selfRC(delegatorID, tenantID))
+	setPathParam(c, "id", delegationID.String())
+	h.Reassign(c)
+	require.Equal(t, http.StatusBadRequest, w.Code)
 }
