@@ -105,7 +105,7 @@ func (c *HTTPChecker) exists(ctx context.Context, tenantID, userID uuid.UUID) (b
 	}
 
 	var out existsResponse
-	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
+	if err := json.NewDecoder(httpx.LimitBody(resp.Body)).Decode(&out); err != nil {
 		return false, uuid.UUID{}, fmt.Errorf("orgmembership: decode response: %w", err)
 	}
 	if !out.Active {

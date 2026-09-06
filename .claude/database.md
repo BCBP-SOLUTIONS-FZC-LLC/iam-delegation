@@ -70,7 +70,7 @@ sysCfg := pgadapter.SystemPoolConfig(sysDSN, logger) // forces PGBouncerMode, no
 sysCfg.Tracer = queryTracer
 sysPool, err := pgcommon.NewPool(ctx, sysCfg)
 ```
-Falls back to `DSNFromEnv()` in dev with a startup warning — cross-tenant reads then return zero rows under RLS (fail-quiet, not fail-loud).
+Falls back to `DSNFromEnv()` in dev with a startup warning — cross-tenant reads then return zero rows under RLS (fail-quiet, not fail-loud). `cmd/server/config.go`'s `loadConfig()` fails fast instead of falling through to this warning whenever `ENVIRONMENT` isn't one of `isDevLikeEnvironment`'s recognized local/dev aliases (`development`/`dev`/`local`) — originally gated on a literal `"production"` compare (DLG-D34), widened to every other environment name in DLG-D35.
 
 **What actually uses `sysPool` in this repo:**
 - `cmd/server/main.go`: `delegationRepoSys := pgadapter.NewDelegationRepository(sysPool)` — backs the mesh-only DLG-I3/I4 internal reads (`gucBoundReader`, cross-tenant lookups by design).

@@ -25,6 +25,7 @@ var (
 
 	// 409
 	// (ErrOptimisticLockConflict above)
+	ErrIdempotencyKeyInFlight = errors.New("idempotency_key_in_flight")
 
 	// 422 — domain-rule validation
 	ErrScopeIDRequired             = errors.New("scope_id_required")

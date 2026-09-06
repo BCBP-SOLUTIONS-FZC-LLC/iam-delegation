@@ -15,16 +15,29 @@ Enforced by middleware, not the service layer — `requireIdempotencyKey()` (`in
 
 Mechanism (`internal/adapter/outbound/valkey/idempotency.go`, `internal/core/service/delegation_service.go`'s `Create`):
 ```go
-// Plain check-then-act — NOT a SetNX-based lock (unlike iam-user-profile's
-// provision:lock:{key} race-serialization). A near-simultaneous duplicate
-// request within the same few milliseconds can still race past the Get.
+// Get fast path: a repeated key whose record is already "created" returns
+// the original delegation without touching Reserve/membership checks/UP.
 if rec, found, err := s.idempotency.Get(ctx, tenantID, idempotencyKey); err == nil && found {
-    if existing, ferr := s.delegations.FindByID(ctx, tenantID, rec.DelegationID); ferr == nil {
-        return existing, nil   // return the ORIGINAL delegation, not a new one
+    if rec.Status == "created" {
+        if existing, ferr := s.delegations.FindByID(ctx, tenantID, rec.DelegationID); ferr == nil {
+            return existing, nil   // return the ORIGINAL delegation, not a new one
+        }
+    } else {
+        return nil, domain.NewError(domain.ErrIdempotencyKeyInFlight, "...") // "pending": another call holds it
     }
 }
+// SetNX-based claim (DLG-D35, replacing a plain check-then-act that could
+// race — the pre-fix version of this doc called that gap out explicitly).
+// A losing concurrent Reserve also returns ErrIdempotencyKeyInFlight (409).
+if reserved, rerr := s.idempotency.Reserve(ctx, tenantID, idempotencyKey); rerr == nil {
+    if !reserved {
+        return nil, domain.NewError(domain.ErrIdempotencyKeyInFlight, "...")
+    }
+    defer func() { if err != nil { _ = s.idempotency.Release(ctx, tenantID, idempotencyKey) } }()
+}
+// rerr != nil (Valkey down): proceed unreserved, same best-effort philosophy as Get/Save.
 ```
-Key: `del:idem:{tenantID}:{key}`, TTL 24h (`idempotencyTTL` constant). `Get`/`Save` both treat any Valkey error as "no hit / best-effort" — a Valkey outage degrades idempotency protection, it does not block create (LLD §9.3).
+Key: `del:idem:{tenantID}:{key}`, TTL 24h (`idempotencyTTL` constant, shared by the `"pending"` reservation placeholder and the final `"created"` record — a successful `Save` simply overwrites the reservation under the same key). `Get`/`Save`/`Reserve`/`Release` all treat any Valkey error as "no hit / best-effort, proceed unreserved" — a Valkey outage degrades idempotency protection, it does not block create (LLD §9.3). A losing concurrent caller — whether it lost to `Reserve` or found a `"pending"` record on `Get` — gets `409 idempotency_key_in_flight` (`domain.ErrIdempotencyKeyInFlight`), not a duplicate delegation. A failed create after a successful `Reserve` calls `Release` so a client retry with the same key isn't stuck waiting out the 24h TTL.
 
 ## `record_version` — query param vs body field (verify per-endpoint, they differ)
 

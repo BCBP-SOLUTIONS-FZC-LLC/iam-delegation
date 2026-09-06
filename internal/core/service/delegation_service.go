@@ -94,18 +94,50 @@ type CreateInput struct {
 // Create is DLG-2. Ordering (LLD §7.6.4/§11.1): idempotency check ->
 // pre-flight -> two concurrent Core membership checks -> UP
 // SetAvailability (wait for 200) -> RunInTx{Insert; outbox DelegationStarted}.
-func (s *DelegationService) Create(ctx context.Context, tenantID, delegatorID uuid.UUID, idempotencyKey string, req CreateInput) (*domain.Delegation, error) {
+func (s *DelegationService) Create(ctx context.Context, tenantID, delegatorID uuid.UUID, idempotencyKey string, req CreateInput) (result *domain.Delegation, err error) {
 	// DLG-D8/§9.2: a repeated Idempotency-Key within 24h returns the
 	// original delegation rather than creating a second one.
+	//
+	// A plain Get-then-Save (the original implementation) leaves a race: two
+	// concurrent requests sharing one key can both miss Get before either
+	// Saves, and both go on to create a delegation. Reserve below closes
+	// that gap with an atomic SET NX claim — only one concurrent caller can
+	// hold the key at a time — while the Get fast-path still lets a
+	// sequential replay (the common case: a client retrying after seeing
+	// the first response) skip straight to the existing record without
+	// paying for a reservation round-trip.
 	if idempotencyKey != "" && s.idempotency != nil {
-		if rec, found, err := s.idempotency.Get(ctx, tenantID, idempotencyKey); err == nil && found {
-			if existing, ferr := s.delegations.FindByID(ctx, tenantID, rec.DelegationID); ferr == nil {
-				if s.metrics != nil {
-					s.metrics.RecordIdempotencyHit()
+		if rec, found, gerr := s.idempotency.Get(ctx, tenantID, idempotencyKey); gerr == nil && found {
+			if rec.Status == "created" {
+				if existing, ferr := s.delegations.FindByID(ctx, tenantID, rec.DelegationID); ferr == nil {
+					if s.metrics != nil {
+						s.metrics.RecordIdempotencyHit()
+					}
+					return existing, nil
 				}
-				return existing, nil
+				// rec says "created" but the delegation is gone — fall through
+				// to Reserve rather than silently creating a second row.
+			} else {
+				// "pending": another call currently holds this key.
+				return nil, domain.NewError(domain.ErrIdempotencyKeyInFlight, "a request with this idempotency key is already in progress")
 			}
 		}
+		reserved, rerr := s.idempotency.Reserve(ctx, tenantID, idempotencyKey)
+		if rerr == nil {
+			if !reserved {
+				return nil, domain.NewError(domain.ErrIdempotencyKeyInFlight, "a request with this idempotency key is already in progress")
+			}
+			defer func() {
+				if err != nil {
+					//nolint:errcheck // best-effort release: a failure just means the
+					// reservation sits until its TTL expires, delaying (not
+					// corrupting) a client retry with the same key.
+					_ = s.idempotency.Release(ctx, tenantID, idempotencyKey)
+				}
+			}()
+		}
+		// rerr != nil: Valkey unavailable — degrade to best-effort and proceed
+		// unreserved, same philosophy as the existing Get/Save error handling.
 	}
 
 	if err := validateCreateInput(delegatorID, req); err != nil {

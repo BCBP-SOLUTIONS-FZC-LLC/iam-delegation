@@ -140,7 +140,7 @@ func (c *HTTPClient) SetAvailability(ctx context.Context, req port.SetAvailabili
 	// platform-gincommon.ErrorResponse) and surface the code in the
 	// returned error's message.
 	var errResp gincommon.ErrorResponse
-	if decErr := json.NewDecoder(resp.Body).Decode(&errResp); decErr == nil && errResp.Error != "" {
+	if decErr := json.NewDecoder(httpx.LimitBody(resp.Body)).Decode(&errResp); decErr == nil && errResp.Error != "" {
 		return fmt.Errorf("userprofile: %s", errResp.Error)
 	}
 	return fmt.Errorf("userprofile: unexpected status %d", resp.StatusCode)

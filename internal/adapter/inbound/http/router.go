@@ -2,6 +2,7 @@ package http
 
 import (
 	"context"
+	"crypto/subtle"
 	"net/http"
 	"strings"
 	"time"
@@ -185,9 +186,15 @@ func registerDocsRoutes(engine *gin.Engine, docs DocsConfig) {
 
 // docsAuthMiddleware requires an exact `Authorization: Bearer <token>` match
 // before letting a request through to the Swagger UI / AsyncAPI viewer.
+// Compared in constant time (crypto/subtle) rather than with `!=` — a plain
+// string compare short-circuits on the first differing byte, which is a
+// timing side-channel an attacker could use to recover the token one byte
+// at a time.
 func docsAuthMiddleware(token string) gin.HandlerFunc {
+	want := []byte("Bearer " + token)
 	return func(c *gin.Context) {
-		if c.GetHeader("Authorization") != "Bearer "+token {
+		got := []byte(c.GetHeader("Authorization"))
+		if len(got) != len(want) || subtle.ConstantTimeCompare(got, want) != 1 {
 			c.AbortWithStatus(http.StatusUnauthorized)
 			return
 		}

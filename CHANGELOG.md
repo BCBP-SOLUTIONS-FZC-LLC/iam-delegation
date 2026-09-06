@@ -32,6 +32,13 @@ index into those, not a duplicate of them.
 
 ### Fixed
 
+- **Cross-service (LLD rev 2.11):** `iam-user-profile` migrated its published event type names
+  from dot-notation to PascalCase while still undeployed — `domain.EventUserUpdated` here changed
+  from `"user.updated"` to `"UserUpdated"` to match. `CascadeConsumer.Handle`'s dispatch already
+  compared against the symbolic constant, not a literal, so only the constant's value and doc/spec
+  references to the literal SNS filter value needed updating (§10.5, §11.5a, `api/asyncapi.yaml`,
+  `ARCHITECTURE.md`'s DLG-D26 entry). Caught before the still-unprovisioned `delegation-cascade-q`
+  subscription (DLG-D26) went live with the wrong filter value.
 - DLG-5 Reassign didn't preserve the old delegation's `ends_at` when omitted.
 - `Idempotency-Key` accepted whitespace-only keys and unbounded values; blank/whitespace keys
   and keys over 1 KiB are now rejected as `ErrValidation`.
@@ -100,7 +107,7 @@ index into those, not a duplicate of them.
   service only ever cascaded on `MembershipRevoked` (full tenant removal), and "disabled" is not
   "removed". A delegate's disabled account kept receiving routed work indefinitely. `delegation-
   cascade-q` now carries a second SNS subscription onto User Profile's `iam.user.events`, filtered
-  to `EventType = "user.updated"`; on a decoded payload with `status: "disabled"`,
+  to `EventType = "UserUpdated"`; on a decoded payload with `status: "disabled"`,
   `CascadeService.EndForDisabledDelegate` ends every active/scheduled delegation where the
   disabled user is the delegate, emitting `DelegationEnded{ended_reason: delegate_disabled}` — a
   new value distinct from `delegate_removed`, and (unlike the `MembershipRevoked` cascade)
@@ -181,6 +188,24 @@ index into those, not a duplicate of them.
   fixed along the way: a test-only `fakeLogger` field was read/written from two goroutines with no
   synchronization, caught by `-race` (which `make test-ci` always runs) as a genuine data race, not
   merely flaky timing.
+- **Production-readiness sweep (DLG-D35):** `DelegationService.Create`'s idempotency-key dedup was
+  a plain Valkey `GET`-then-`SET` — LLD §9.2 always specified `SETNX` as the guard, so this was an
+  implementation gap, not a design change: two concurrent `POST /delegations` calls sharing one
+  `Idempotency-Key` could both miss the `GET` and both insert a delegation. `port.IdempotencyStore`
+  gained `Reserve`/`Release` (atomic `SET NX`, `internal/adapter/outbound/valkey/idempotency.go`);
+  `Create` now reserves the key before any membership check/User Profile call/insert, releases it
+  on any failure (so a retry isn't stuck for the 24 h TTL), and a losing concurrent caller gets a
+  new `409 idempotency_key_in_flight` (`domain.ErrIdempotencyKeyInFlight`) instead of racing to a
+  duplicate row. Also widened DLG-D34's `SYSTEM_DATABASE_URL` fail-fast from a literal
+  `ENVIRONMENT=="production"` compare to a new `isDevLikeEnvironment` helper (`development`/`dev`/
+  `local` exempt, everything else fails fast) — staging/uat previously fell through to the same
+  silent zero-rows-no-alert failure mode DLG-D34 was written to close. Two additional hardening
+  fixes with no LLD-visible design content: the Swagger/AsyncAPI docs bearer-token compare now uses
+  `crypto/subtle.ConstantTimeCompare` instead of `!=` (closes a timing side-channel on the docs
+  gate, not the API itself); the User Profile and Org Membership HTTP clients now cap
+  response-body decoding at 1 MiB via a shared `httpx.LimitBody`, bounding worst-case memory use
+  against a misbehaving mesh peer. See `ARCHITECTURE.md`'s DLG-D35 entry and
+  `docs/lld/iam-lld-delegation-service.md` rev 2.12 for the full account.
 
 ### Known gaps
 
@@ -192,7 +217,7 @@ index into those, not a duplicate of them.
   `UserAvailabilityChanged` (DLG-D26) together give that team everything needed to build one;
   closing it is a cross-team dependency this repo cannot resolve on its own.
 - **Pre-deploy action item (DLG-D26):** `delegation-cascade-q`'s second SNS subscription — User
-  Profile's `iam.user.events` topic, filtered to `EventType = "user.updated"` — is documented
+  Profile's `iam.user.events` topic, filtered to `EventType = "UserUpdated"` — is documented
   (LLD §10.1/§11.5a, `api/asyncapi.yaml`) but not yet provisioned anywhere; this repo owns no
   Terraform/CDK for SNS subscriptions (see `deploy/iam/policy.tf.example`'s own "illustrative,
   not applied" disclaimer). Without it, `EndForDisabledDelegate`/`DelegationEscalationRequested`

@@ -160,7 +160,7 @@ func loadConfig() (config, error) {
 		return cfg, fmt.Errorf("CASCADE_QUEUE_URL is required")
 	}
 
-	// Fail fast in production rather than let pgadapter.SystemDSNFromEnv's
+	// Fail fast outside local/dev rather than let pgadapter.SystemDSNFromEnv's
 	// dev-safe fallback (SYSTEM_DATABASE_URL unset -> reuse the RLS-scoped
 	// app DSN) degrade silently: the reconciler's cross-tenant sweeps
 	// (ListExpiringBefore/FindDueForDailyWarn/FindDueForAutoEnd/
@@ -168,10 +168,27 @@ func loadConfig() (config, error) {
 	// run under RLS with no tenant GUC bound, so every query returns zero
 	// rows instead of erroring — no alert fires, since that's a different
 	// failure mode than the existing "deferred" counters/alerts cover.
-	if cfg.Environment == "production" && os.Getenv("SYSTEM_DATABASE_URL") == "" {
-		return cfg, fmt.Errorf("SYSTEM_DATABASE_URL is required when ENVIRONMENT=production (must be the BYPASSRLS delegation_migrator role, see .claude/database.md)")
+	//
+	// Originally gated on a literal ENVIRONMENT=="production" (DLG-D34);
+	// widened to isDevLikeEnvironment after a production-readiness review
+	// found any other environment name (staging, uat, ...) would silently
+	// skip this check and hit the same degrade-with-no-alert failure mode.
+	if !isDevLikeEnvironment(cfg.Environment) && os.Getenv("SYSTEM_DATABASE_URL") == "" {
+		return cfg, fmt.Errorf("SYSTEM_DATABASE_URL is required outside local/dev environments (ENVIRONMENT=%q; must be the BYPASSRLS delegation_migrator role, see .claude/database.md)", cfg.Environment)
 	}
 	return cfg, nil
+}
+
+// isDevLikeEnvironment reports whether env is one of this service's
+// recognized local/dev aliases (matching resolveAppEnv's switch below) — the
+// only environments exempt from the SYSTEM_DATABASE_URL fail-fast above.
+func isDevLikeEnvironment(env string) bool {
+	switch env {
+	case "development", "dev", "local", "":
+		return true
+	default:
+		return false
+	}
 }
 
 func getEnv(key, fallback string) string {
@@ -188,12 +205,10 @@ func resolveAppEnv() string {
 	if v := os.Getenv("APP_ENV"); v != "" {
 		return v
 	}
-	switch getEnv("ENVIRONMENT", "development") {
-	case "development", "dev", "local":
+	if isDevLikeEnvironment(getEnv("ENVIRONMENT", "development")) {
 		return "dev"
-	default:
-		return getEnv("ENVIRONMENT", "production")
 	}
+	return getEnv("ENVIRONMENT", "production")
 }
 
 // ensureGincommonEnv fills the env vars InitTracingFromEnv / NewLogger

@@ -10,11 +10,27 @@
 package httpx
 
 import (
+	"io"
 	"net/http"
 	"time"
 
 	"go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp"
 )
+
+// MaxResponseBodyBytes bounds how much of an outbound response body this
+// service will ever decode. Every peer here (User Profile, Org Membership)
+// returns a small JSON object, so 1 MiB is generous headroom, not a tuned
+// limit — its purpose is only to cap worst-case memory use if a mesh peer
+// misbehaves or is compromised, not to accommodate any expected payload
+// size.
+const MaxResponseBodyBytes = 1 << 20
+
+// LimitBody wraps body in an io.LimitReader capped at MaxResponseBodyBytes,
+// so json.NewDecoder(...).Decode can never be made to buffer an unbounded
+// amount of memory from a single response.
+func LimitBody(body io.Reader) io.Reader {
+	return io.LimitReader(body, MaxResponseBodyBytes)
+}
 
 // NewTransport wraps base — nil meaning http.DefaultTransport — with the
 // OpenTelemetry round-tripper, which injects the traceparent header carried

@@ -23,6 +23,22 @@ Full field-level rules and error-code table live in `README.md` § Input validat
 session directly from `internal/core/domain/errors.go` and the service-layer validation functions) —
 cross-reference rather than duplicate here.
 
+## Idempotency, docs auth, and outbound response bounds (DLG-D35 hardening pass)
+
+- **Create idempotency is an atomic `SETNX` reservation, not check-then-act.**
+  `port.IdempotencyStore.Reserve`/`Release` (`internal/adapter/outbound/valkey/idempotency.go`)
+  close a real race the original `Get`-then-`Save` implementation left open — two concurrent
+  same-key `POST /delegations` could both miss the `Get` and both insert. A losing concurrent
+  caller now gets `409 idempotency_key_in_flight`, not a duplicate delegation.
+- **Swagger/AsyncAPI docs bearer-token check is constant-time.** `router.go`'s
+  `docsAuthMiddleware` compares via `crypto/subtle.ConstantTimeCompare`, not `!=` — closes a
+  timing side-channel that could otherwise leak the token byte-by-byte. Gates the docs routes
+  only, not the API itself.
+- **Outbound response bodies are capped at 1 MiB.** `internal/adapter/outbound/httpx.LimitBody`
+  wraps `resp.Body` before `json.NewDecoder(...).Decode` in both the User Profile and Org
+  Membership HTTP clients, bounding worst-case memory use if a mesh peer returns an oversized or
+  malformed body.
+
 # Observability
 
 ## Metrics — `internal/adapter/outbound/metrics/metrics.go`
@@ -101,7 +117,7 @@ IAM permission failures, and the `schema-gov` CLI (written this session, DLG-D20
 | `PORT` | No | `8080` | HTTP listen port — **not** `HTTP_PORT` (no dead config remains as of this pass, see below) |
 | `DATABASE_URL` | Yes (via pgcommon) | — | App role (`delegation_app`, RLS-enforced, no BYPASSRLS) — or set `PG_HOST`/`PG_PORT`/`PG_USER`/`PG_PASSWORD`/`PG_DBNAME`/`PG_SSLMODE` individually; both forms go through `pgcommon.ConfigFromEnv` via `postgres.DSNFromEnv` |
 | `MIGRATION_DATABASE_URL` | No | falls back to `postgres.DSNFromEnv()` | BYPASSRLS role for the server's self-migration at startup; must bypass PgBouncer |
-| `SYSTEM_DATABASE_URL` | Helm: required. Go: required when `ENVIRONMENT=production` (both binaries fail fast at startup otherwise, DLG-D34); optional elsewhere | falls back to `postgres.DSNFromEnv()` with a startup warning outside production | BYPASSRLS pool for cross-tenant reconciler/cron sweeps, cascade `processed_events`, and the active-gauge exporter (`postgres.SystemDSNFromEnv`). Unset outside production → RLS-filtered zero rows, no alert |
+| `SYSTEM_DATABASE_URL` | Helm: required. Go: required outside `isDevLikeEnvironment` (`development`/`dev`/`local` — both binaries fail fast at startup otherwise, DLG-D34, widened from a literal `production` check in DLG-D35); optional in local/dev | falls back to `postgres.DSNFromEnv()` with a startup warning in local/dev | BYPASSRLS pool for cross-tenant reconciler/cron sweeps, cascade `processed_events`, and the active-gauge exporter (`postgres.SystemDSNFromEnv`). Unset outside local/dev → RLS-filtered zero rows, no alert |
 | `PG_STATEMENT_TIMEOUT` | No | Helm `5s` | Applied to migration + sysPool DSNs (`postgres.ApplyStatementTimeout`); ignored on the app pool when `DATABASE_URL` is set verbatim |
 | `PG_MAX_CONNS` / `PG_MIN_CONNS` / `PG_SLOW_QUERY_THRESHOLD` / `PG_BOUNCER_MODE` / `PG_SSLMODE` | No | Helm: `10` / `0` / `200ms` / `true` | Standard `pgcommon.ConfigFromEnv` vars. `PG_MIN_CONNS=0` with `PG_BOUNCER_MODE=true` is pgcommon's transaction-pooling recommendation |
 | `VALKEY_ADDR` | No | `localhost:6379` | |
@@ -121,7 +137,7 @@ IAM permission failures, and the `schema-gov` CLI (written this session, DLG-D20
 | `OUTBOX_PRUNE_INTERVAL` / `OUTBOX_PRUNE_RETENTION` / `OUTBOX_PRUNE_LIMIT` | No | `24h` / `168h` (7d) / `1000` | Daily sweep calling `outbox.Runner.PrunePublished` — matches `iam-user-profile`'s `runMaintenanceSweep`; without it `outbox_events` grows unbounded (DLG-D24) |
 | `OTEL_EXPORTER_OTLP_ENDPOINT` | No | — | |
 | `DOCS_ENABLED` | No | `true` outside `production` | Gates `/swagger`, `/asyncapi` |
-| `DOCS_AUTH_TOKEN` | No | — | Bearer-gates docs routes when `DOCS_ENABLED=true` in production |
+| `DOCS_AUTH_TOKEN` | No | — | Bearer-gates docs routes when `DOCS_ENABLED=true` in production — compared via `crypto/subtle.ConstantTimeCompare`, not `!=` (DLG-D35) |
 | `POLICY_DEFAULT_MAX_DURATION_DAYS` / `POLICY_DEFAULT_REVIEW_WINDOW_DAYS` | No | `90` / `90` | Fallback tenant policy (DLG-D2) when no `delegation_tenant_settings` row exists |
 | `SCHEMA_GOV_IMAGE` | CI-only | pinned per workflow | `platform-schemagov` CLI image — see Schema Governance below |
 
@@ -140,9 +156,9 @@ GitHub Actions (`.github/workflows/`), all names/steps verified against current 
 1. **`validate-test.yml`** (`Validate / Test`) — on push/PR: unit+integration+rls tests with `-race`
    and merged coverage → coverage-threshold gate (`.github/scripts/coverage-gate.sh`, **95%
    single global floor**, not a per-package gate — bumped from the original 70% during the
-   DLG-D34 production-readiness sweep, global coverage sits at 95.2% as of that pass) → upload
-   coverage artifact → architecture lint (`go-arch-lint`) → Swagger staleness check → end-to-end
-   tests.
+   DLG-D34 production-readiness sweep, global coverage sat at 95.2% as of that pass, 95.4% as of
+   the DLG-D35 follow-up sweep) → upload coverage artifact → architecture lint (`go-arch-lint`) →
+   Swagger staleness check → end-to-end tests.
 2. **`validate-quality.yml`** (`Validate / Quality`) — on push/PR: a repo-specific check rejecting
    HTML-escaped operators in workflow files, a repo-specific check rejecting non-transaction-local
    `SET app.tenant_id` (RLS-6 enforcement, `.github/scripts/check-forbidden-set-guc.sh`), gofmt

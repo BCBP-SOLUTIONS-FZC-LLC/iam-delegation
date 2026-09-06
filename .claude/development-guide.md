@@ -1,6 +1,6 @@
 # Key Design Decisions
 
-Pulled from `ARCHITECTURE.md`'s DLG-D1..D34 decision register — the ones most load-bearing for anyone touching this code:
+Pulled from `ARCHITECTURE.md`'s DLG-D1..D35 decision register — the ones most load-bearing for anyone touching this code:
 
 1. **Availability-first ordering on create (DLG-D10/DEL-6)** — the User Profile availability call happens BEFORE the `RunInTx{INSERT delegations}` on create, and pointer-clear happens before the row-end on cancel/expiry/review. This guarantees no `DelegationStarted` without a matching `user_availability` pointer, at the cost of an extra synchronous hop most services wouldn't need.
 2. **Idempotency key is mandatory on create, not optional (DLG-D8)** — `requireIdempotencyKey()` middleware rejects `POST /delegations` with 400 before the handler even runs. Closes the duplicate-on-retry gap left by there being no `UNIQUE(tenant_id, delegator_id)` constraint (a user can legitimately hold multiple concurrent delegations of different scopes).
@@ -13,8 +13,9 @@ Pulled from `ARCHITECTURE.md`'s DLG-D1..D34 decision register — the ones most 
 9. **`platform-schemagov` is a CI tool, not a validator replacement (DLG-D15/DLG-D20)** — the in-house `jsonschema/v6` `SchemaValidator` and CI-time `platform-schemagov` Docker image are not alternatives to each other; this service (like `iam-user-profile`) uses both. DLG-D15's original "instead of" framing was based on a misunderstanding, corrected by DLG-D20.
 10. **Metrics are fully instrumented (DLG-D19 closed)** — `internal/adapter/outbound/metrics.Metrics` is registered with the Prometheus registerer at startup. `cmd/reconciler/jobs.Context.Metrics` calls `RecordExpiryDeferred`/`RecordReviewDeferred`/`RecordActivationDeferred` on every UP-failure defer (GAP-27/DLG-D25, the three counters the production alerts watch), wired from `cmd/server/main.go`. The service-layer counters (`RecordCreated`/`RecordEnded`/`RecordIdempotencyHit`/`RecordUPAvailabilityFailure`) go through `internal/core/service/metrics.go`'s injected `Metrics` port. `iam_delegation_active_gauge` — a count of current table state no request/reconciler path could otherwise maintain — is kept current by `cmd/server/exporters.go`'s 5-minute BYPASSRLS snapshot exporter. See Troubleshooting below.
 11. **Future-dated `starts_at` is now a first-class `scheduled` status, not out of scope (DLG-D25)** — `Create` branches on `starts.After(now)`: a genuinely future `starts_at` skips the User Profile call and `DelegationStarted` entirely, inserting the row as `scheduled` instead of `active`. The `delegation-activation` CronJob (mirrors `delegation-expiry`'s shape exactly) promotes it to `active` once `starts_at` is reached. `End`/`EndForUser` treat `scheduled` as non-terminal alongside `active` — a scheduled delegation is cancellable and is ended (not stranded) if the delegator leaves the tenant first.
-12. **"Disabled" is not "removed" — a second, independent cascade path (Bug 2, DLG-D26)** — `MembershipRevoked` (tenant departure) was the only inbound cascade signal before this; a disabled delegate (still a tenant member) kept receiving routed work indefinitely. `delegation-cascade-q` now also carries a second SNS subscription onto User Profile's `iam.user.events`, filtered to `EventType = "user.updated"`; `CascadeService.EndForDisabledDelegate` ends every active/scheduled delegation where the disabled user is the delegate, **without** setting `deleted_at` (the user is still a member — this is a normal historical record, not a scrub) and without a User Profile pointer-clear call back (User Profile already cleared it atomically before publishing the event this consumer reacts to). **Pre-deploy gap:** the SNS subscription itself is not yet provisioned in any environment this repo owns Terraform for.
+12. **"Disabled" is not "removed" — a second, independent cascade path (Bug 2, DLG-D26)** — `MembershipRevoked` (tenant departure) was the only inbound cascade signal before this; a disabled delegate (still a tenant member) kept receiving routed work indefinitely. `delegation-cascade-q` now also carries a second SNS subscription onto User Profile's `iam.user.events`, filtered to `EventType = "UserUpdated"`; `CascadeService.EndForDisabledDelegate` ends every active/scheduled delegation where the disabled user is the delegate, **without** setting `deleted_at` (the user is still a member — this is a normal historical record, not a scrub) and without a User Profile pointer-clear call back (User Profile already cleared it atomically before publishing the event this consumer reacts to). **Pre-deploy gap:** the SNS subscription itself is not yet provisioned in any environment this repo owns Terraform for.
 13. **Escalation is a fourth, notify-only event — never auto-remediation (Bug 2a, DLG-D27)** — `EndForDisabledDelegate` also enqueues `DelegationEscalationRequested` immediately after `DelegationEnded`, same transaction, escalating to `tenant_admin`/`tenant_owner` specifically (the only role this service already recognizes as escalation-capable, and the only one that can call DLG-5 Reassign). It never auto-creates a replacement delegation — building that fallback is explicitly Workflow Service's cross-team responsibility, not this repo's.
+14. **Idempotency create-guard is a `SETNX` reservation, not a plain check-then-act (DLG-D35)** — `port.IdempotencyStore.Reserve`/`Release` close a real race the original `Get`-then-`Save` implementation left open (two concurrent same-key `POST /delegations` could both miss the `Get` and both insert). `Create` reserves the key before any side effect and releases it on failure; a losing concurrent caller gets `409 idempotency_key_in_flight`, not a duplicate row. Also: `SYSTEM_DATABASE_URL`'s fail-fast (DLG-D34) now triggers outside any `isDevLikeEnvironment` name, not only a literal `"production"` — don't reintroduce a bare `== "production"` check when touching `cmd/server/config.go`.
 
 # Extending the Service
 
@@ -45,7 +46,7 @@ Pulled from `ARCHITECTURE.md`'s DLG-D1..D34 decision register — the ones most 
 
 **`iam_delegation_*` metrics reading zero:** DLG-D19 is closed — every instrument has a real call site (service-layer counters via `internal/core/service/metrics.go`'s injected `Metrics` port, the three reconciler deferred counters via `cmd/reconciler/jobs.Context.Metrics` — GAP-27/DLG-D25 — and `active_gauge` via `cmd/server/exporters.go`'s 5-minute sysPool snapshot). A metric reading zero when its triggering condition is known to have occurred (e.g. deferred counters not moving on a sustained User Profile outage) is now a real bug, not a documented gap — check the wiring at the call site named above before assuming it's expected.
 
-**Idempotency-Key replay:** a repeated key within 24h on `POST /delegations` returns the original `201` without creating a second row (`del:idem:{tenant}:{key}` in Valkey). Missing the header entirely is a 400 from `requireIdempotencyKey()` middleware, before the handler runs — not a 422 from the service layer.
+**Idempotency-Key replay:** a repeated key within 24h on `POST /delegations` returns the original `201` without creating a second row (`del:idem:{tenant}:{key}` in Valkey). Missing the header entirely is a 400 from `requireIdempotencyKey()` middleware, before the handler runs — not a 422 from the service layer. A second request that arrives *while the first is still in flight* (same key) gets `409 idempotency_key_in_flight` (DLG-D35), not a replay and not a duplicate row — the `Reserve`/`Release` pair in `internal/adapter/outbound/valkey/idempotency.go` is what makes this atomic; don't reintroduce a plain `Get`-then-`Save` on this path.
 
 **Reassign "resurrecting" the old delegation:** it doesn't, deliberately (design decision 3, DLG-D11). If a reassign's new-delegation create fails after the old one ended, the old delegation stays ended — this is documented behavior, not a bug.
 
@@ -69,6 +70,7 @@ Full taxonomy from `internal/core/domain/errors.go`'s sentinels and `internal/ad
 | `missing_identity_headers` | 401 | Gateway identity headers (`x-user-id`/`x-tenant-id`/`x-tenant-roles`) missing or invalid |
 | `insufficient_role` | 403 | Caller lacks the role required for this route (DLG-3/4/5/7) |
 | `optimistic_lock_conflict` | 409 | `record_version` mismatch on cancel/extend/reassign |
+| `idempotency_key_in_flight` | 409 | `Idempotency-Key` already claimed by another in-flight (or, rarely, stale-`FindByID`) create (DLG-D35) |
 | `invalid_delegation_scope` | 400 | `scope` not one of `all`/`department`/`tender` |
 | `invalid_delegation_max_duration_days` | 400 | Tenant policy `max_duration_days` outside `[1,180]` |
 | `invalid_delegation_review_window_days` | 400 | Tenant policy `review_window_days` outside `[1,180]` |
@@ -90,8 +92,8 @@ Full taxonomy from `internal/core/domain/errors.go`'s sentinels and `internal/ad
 
 ---
 
-**Document version:** 1.1 (updated for DLG-D25..D34 — scheduled activation, delegate-disabled cascade, escalation event, 95% coverage gate)
+**Document version:** 1.2 (updated for DLG-D35 — idempotency SETNX-reservation fix, widened `SYSTEM_DATABASE_URL` guard)
 
-**Date:** 2026-09-04
+**Date:** 2026-09-05
 
 **Audience:** Platform engineering, SRE, developers contributing to this service

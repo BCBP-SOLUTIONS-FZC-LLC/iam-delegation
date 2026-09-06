@@ -90,6 +90,7 @@ not at the HTTP layer:
 | Delegate availability | Delegate must not itself be OOO (`iam-user-profile`) | `delegate_unavailable` | 422 |
 | `extend_days` (DLG-4) | 1–180 | `extend_days_out_of_range` | 422 |
 | `Idempotency-Key` header (DLG-2 only) | Required, enforced by middleware before the handler runs | `validation_error` | 400 |
+| `Idempotency-Key` (DLG-2 only) | Must not already be claimed by another in-flight create for the same key | `idempotency_key_in_flight` | 409 |
 | `record_version` | Must match the current row (optimistic lock) | `optimistic_lock_conflict` | 409 |
 | `max_duration_days` / `review_window_days` (DLG-7) | 1–180 | `invalid_delegation_max_duration_days` / `invalid_delegation_review_window_days` | 400 |
 
@@ -246,6 +247,9 @@ consumer buckets (`cascade`, `offboarding`, `delegate_disable`). DLQ:
 
 Every 4xx/5xx response uses the flat envelope above. Treat `409 optimistic_lock_conflict` as
 "re-fetch and retry with the new `record_version`" — never blind-retry with the stale value.
+Treat `409 idempotency_key_in_flight` (DLG-2 only) as "another request with this exact
+`Idempotency-Key` is still being processed" — retry with backoff using the *same* key, not a new
+one; retrying with a new key would create a second delegation.
 `503` responses (`org_membership_unavailable`, `user_profile_unavailable`, `db_unavailable`) are
 safe to retry with backoff.
 
@@ -361,7 +365,7 @@ table covers only the ones most likely to trip someone up.
 |---|---|---|---|
 | `DATABASE_URL` | Yes | — | App role (`delegation_app`), `NOBYPASSRLS` — RLS is enforced even locally |
 | `MIGRATION_DATABASE_URL` | No | falls back to `DATABASE_URL`'s DSN shape | BYPASSRLS role; the server self-migrates at startup, no separate migrate step |
-| `SYSTEM_DATABASE_URL` | Required when `ENVIRONMENT=production` (both binaries fail fast otherwise); required in Helm always | falls back with a startup warning outside production | BYPASSRLS pool for cross-tenant reconciler sweeps, cascade `processed_events`, and the active-gauge exporter — unset outside production means cross-tenant queries silently return zero rows |
+| `SYSTEM_DATABASE_URL` | Required outside `development`/`dev`/`local` `ENVIRONMENT` (both binaries fail fast otherwise); required in Helm always | falls back with a startup warning in local/dev | BYPASSRLS pool for cross-tenant reconciler sweeps, cascade `processed_events`, and the active-gauge exporter — unset outside local/dev means cross-tenant queries silently return zero rows |
 | `USER_PROFILE_BASE_URL` / `ORG_MEMBERSHIP_BASE_URL` | Yes | — | Client constructors fail fast at startup if empty; neither service is part of this repo's compose stack |
 | `SNS_TOPIC_ARN` / `CASCADE_QUEUE_URL` | **Yes** | — | `loadConfig` returns an error and the process never starts if either is empty |
 | `AWS_REGION` | No | `ap-south-1` | |
@@ -378,7 +382,9 @@ table covers only the ones most likely to trip someone up.
 | Tenant isolation | Postgres RLS (`FORCE`, fail-closed), `SET LOCAL app.tenant_id` per transaction — never session-scoped |
 | Identity | Gateway-injected `x-user-id`/`x-tenant-id`/`x-tenant-roles` headers — never a parsed JWT, never body-derived |
 | Network | Public routes behind Envoy; `/internal/*` is mesh-only mTLS with no RBAC/JWT check at the application layer |
-| Cross-service calls | Intra-mesh mTLS to `iam-org-membership` / `iam-user-profile` |
+| Cross-service calls | Intra-mesh mTLS to `iam-org-membership` / `iam-user-profile`; response bodies capped at 1 MiB (`httpx.LimitBody`) against a misbehaving peer |
+| Create idempotency | Atomic `SETNX` reservation (`IdempotencyStore.Reserve`/`Release`), not check-then-act — closes a duplicate-insert race on concurrent same-key creates |
+| Docs auth | Swagger/AsyncAPI bearer-token check via `crypto/subtle.ConstantTimeCompare`, not `!=` |
 
 Three distinct GUC-binding paths converge on the same RLS: the public-route middleware, the
 mesh-only internal reads' per-call binder, and the reconciler jobs/cascade consumer's injected
