@@ -29,6 +29,7 @@ index into those, not a duplicate of them.
 
 - Default AWS region is now `ap-south-1` (`cmd/server` fallback, Helm `values.yaml`,
   docker-compose, LocalStack, `.env.example`).
+- Dependabot disabled — `.github/dependabot.yml` renamed to `.github/dependabot.yml.disabled`.
 
 ### Fixed
 

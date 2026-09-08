@@ -39,3 +39,11 @@ updates:
       interval: weekly
     open-pull-requests-limit: 5
     labels: [dependencies, github-actions]
+
+# ─────────────────────────────────────────────────────────────────────────
+# DISABLED (temporarily) — renamed from dependabot.yml so GitHub stops
+# reading it: no scheduled checks, no new PRs. To re-enable, restore the
+# original filename:
+#   git mv .github/dependabot.yml.disabled .github/dependabot.yml
+# Nothing else needs to change — the config above is untouched.
+# ─────────────────────────────────────────────────────────────────────────
