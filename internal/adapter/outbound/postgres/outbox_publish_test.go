@@ -67,7 +67,7 @@ func TestTxRunner_EnqueueCtx_EnvelopeHasSchemaVersion(t *testing.T) {
 
 	var specVersion, eventType string
 	err = db.Raw.QueryRow(ctx,
-		`SELECT payload->>'specversion', payload->>'type' FROM outbox_events WHERE event_type = $1`,
+		`SELECT payload::jsonb->>'specversion', payload::jsonb->>'type' FROM outbox_events WHERE event_type = $1`,
 		domain.EventDelegationStarted,
 	).Scan(&specVersion, &eventType)
 	require.NoError(t, err)

@@ -24,6 +24,12 @@ index into those, not a duplicate of them.
 - `ended_reason=reassigned` (`EndReasonReassigned`) — DLG-5 Reassign now ends the replaced
   delegation with this reason instead of `cancelled`, so consumers can tell a reassignment from
   a user cancel.
+- SLO burn-rate alerting (DLG-D39, LLD §14.5): four multi-window multi-burn-rate SLOs (write-path
+  error rate, DLG-D3 membership-check dependency success, reconciler-defer convergence, cascade
+  convergence) as recording rules + fast-burn/slow-burn alert pairs, in `deploy/monitoring/slo-rules.yml`
+  and `templates/prometheusrule.yaml`'s new `iam_delegation_slo_records`/`iam_delegation_slo_burn`
+  groups — a formalization of targets §14.1/§14.5 already stated, complementing (not replacing)
+  the existing threshold alerts in `app-alerts.yml`.
 
 ### Changed
 
@@ -33,6 +39,28 @@ index into those, not a duplicate of them.
 
 ### Fixed
 
+- Database connection/configuration/operations re-checked against
+  `iam-realm-provisioner` / `iam-org-membership` (DLG-D37): `wrapConnErr` now maps
+  Go-level network/IO failures (`io.EOF`, `*net.OpError`, ECONNRESET) to
+  `db_unavailable` 503; `loadConfig` requires `DATABASE_URL` (or `PG_HOST`+
+  `PG_USER`+`PG_PASSWORD`) and `MIGRATION_DATABASE_URL` whenever
+  `PG_BOUNCER_MODE=true`; the reconciler uses the same `isDevLikeEnvironment`
+  `SYSTEM_DATABASE_URL` fail-fast as `cmd/server`; both pools `defer Close()`
+  after `DrainAndClose`; startup migrations go through a single
+  `postgres.Migrate` entry point that logs via pgcommon's `migrate.Runner`.
+  Both binaries now key the `SYSTEM_DATABASE_URL` fail-fast off `resolveAppEnv()`
+  (`APP_ENV`, then `ENVIRONMENT`) and treat `test` as a local/dev alias, matching
+  `iam-org-membership`'s `isDevLikeEnv`.
+- Events/outbox/dedup re-checked against `iam-realm-provisioner` /
+  `iam-org-membership` (DLG-D38): `outbox_events.payload` is `TEXT` with an
+  `outbox_normalize_payload` trigger (PgBouncer SimpleProtocol); cascade
+  PG writes and `processed_events` commit in one `TxRunner.RunInTx`; filtered
+  `UserUpdated` acks record a dedup row; `idx_processed_events_processed_at`
+  backs prune; `PROCESSED_EVENTS_TTL_DAYS` (default 30) drives monthly cleanup.
+- Logs/metrics/traces re-checked against `iam-realm-provisioner` / `iam-org-membership`
+  (DLG-D36): both binaries now flush the TracerProvider *then* `gincommon.Shutdown` (Zap
+  Sync) after pool drain, matching the siblings; unhandled HTTP 500s log through the
+  gincommon logger `NewRouter` installs instead of staying silent.
 - **`cmd/server` ran the outbox/domain migrations *after* opening the RLS-scoped `delegation_app`
   pool**, not just in the wrong order relative to each other (that ordering was already fixed —
   see the migration-startup-order entry below). On a genuinely fresh database the domain migration

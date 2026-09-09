@@ -69,15 +69,16 @@ type Metrics interface {
 // be backed by the RLS-scoped app pool so BindTenantGUC's per-row binding is
 // actually enforced on the write (LLD §7.3 roles table).
 type Context struct {
-	Delegations     port.DelegationRepository
-	UserProfile     port.UserProfileClient
-	TxRunner        port.TxRunner
-	BindTenantGUC   BindTenantGUC
-	Logger          Logger
-	BatchLimit      int
-	RetentionDays   int                  // delegation-cleanup only (LLD §18.4, default 90)
-	ProcessedEvents ProcessedEventsStore // delegation-cleanup only — purges the idempotency ledger (LLD §18.4, GAP-09); nil means skip
-	Metrics         Metrics              // expiry/review deferred counters (LLD §11.4, GAP-27); nil means skip
+	Delegations            port.DelegationRepository
+	UserProfile            port.UserProfileClient
+	TxRunner               port.TxRunner
+	BindTenantGUC          BindTenantGUC
+	Logger                 Logger
+	BatchLimit             int
+	RetentionDays          int                  // delegation-cleanup only (LLD §18.4, default 90)
+	ProcessedEvents        ProcessedEventsStore // delegation-cleanup only — purges the idempotency ledger (LLD §18.4, GAP-09); nil means skip
+	ProcessedEventsTTLDays int                  // delegation-cleanup only (LLD §18.4, default 30; PROCESSED_EVENTS_TTL_DAYS)
+	Metrics                Metrics              // expiry/review deferred counters (LLD §11.4, GAP-27); nil means skip
 }
 
 // Result aggregates every job's outcome counters. Unused fields stay zero —

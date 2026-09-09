@@ -1,0 +1,215 @@
+# SLO recording + burn-rate alerts for iam-delegation (LLD §14.1/§14.5).
+#
+# Four SLOs are declared, each keyed to metrics that actually exist in
+# internal/adapter/outbound/metrics/metrics.go or platform-gincommon's
+# passthrough http_* series — do not add an SLO against a metric that isn't
+# registered there. This is a burn-rate complement to
+# deploy/monitoring/app-alerts.yml's threshold alerts — it does not replace
+# them.
+#
+# This file is a standalone reference copy of the same iam_delegation_slo_*
+# groups the chart's own templates/prometheusrule.yaml renders as a
+# PrometheusRule CRD (enabled via serviceMonitor.enabled in values.yaml) —
+# use this file directly (e.g. a Prometheus --rule-files directory) in
+# environments not installing this service via the Helm chart; keep both in
+# sync when a metric name changes. The only difference is the job label:
+# this copy hardcodes job="iam-delegation" where the chart template renders
+# {{ include "iam-delegation.fullname" . }}.
+#
+#  SLO-1  Public API write-path error rate
+#         Target: 99.9% of mutating requests (DLG-2 create / DLG-3 cancel /
+#         DLG-4 extend / DLG-5 reassign / DLG-7 settings-write) return a
+#         non-5xx status — LLD §14.1's 99.9% availability target for the
+#         public API. 4xx (e.g. 404 delegation_not_found, 409 optimistic
+#         lock) are intentional and excluded.
+#
+#  SLO-2  Grant-time membership-check dependency success rate
+#         Target: 99% of DLG-2/DLG-5's synchronous membership-existence
+#         checks against iam-org-membership (DLG-D3, LLD §7.6.2) succeed.
+#         app-alerts.yml's IAMDelegationMembershipCheckHighFailureRate warns
+#         at a coarser 5%-sustained-5m threshold ("definitely broken"); this
+#         SLO's 1% budget is the tighter, earlier-warning target underneath
+#         it, in the SRE-book multi-burn-rate style.
+#
+#  SLO-3  Reconciler convergence (availability-first defer, DEL-6)
+#         Target: the three availability-first CronJobs — delegation-
+#         activation (DLG-D25, */5 * * * *), delegation-expiry (DLG-I1,
+#         */5 * * * *), delegation-review (DLG-I2, 0 * * * *) — do not
+#         accumulate iam-user-profile-unavailable deferrals for more than a
+#         couple of cron cycles. Each counter only ever increases, so the
+#         SLI is increase()-over-a-window, not the raw counter value (the
+#         same reasoning app-alerts.yml's per-cron deferred alerts already
+#         use).
+#
+#  SLO-4  delegation-cascade-q cascade convergence
+#         Target: every MembershipRevoked/TenantMembershipsPurged cascade
+#         delivery (LLD §11.5/§11.6) is processed without landing on the
+#         DLQ. A delayed cascade is an operational-hygiene issue, not a live
+#         authorization risk (delegate-side end only emits a notify-only
+#         event, DLG-EVT-4) — this SLO is ticket-severity, not page-severity.
+#
+# Recording rules pre-compute the SLI numerator/denominator so alert rules
+# can key off a scalar. Alerts follow the multi-window multi-burn-rate
+# pattern (SRE book Ch. 5): a slow burn signals an ongoing degradation, a
+# fast burn signals an outage worth paging on.
+
+groups:
+  # ── SLI recording ─────────────────────────────────────────────────────────
+  - name: iam-delegation.slo.records
+    interval: 30s
+    rules:
+      # Write-path error rate (5xx only — 4xx are intentional, e.g. 404
+      # delegation_not_found, 409 optimistic-lock version conflict).
+      - record: iam:delegation_write_error_rate:ratio_rate_5m
+        expr: |
+          sum(rate(http_requests_total{
+            job="iam-delegation",
+            method=~"POST|PUT|PATCH|DELETE",
+            status_class="5xx"
+          }[5m]))
+          /
+          clamp_min(sum(rate(http_requests_total{
+            job="iam-delegation",
+            method=~"POST|PUT|PATCH|DELETE"
+          }[5m])), 0.001)
+
+      # Grant-time membership-check success ratio (DLG-D3). Every attempted
+      # check observes a duration regardless of outcome, so
+      # membership_check_duration_seconds_count is the natural "total calls"
+      # denominator (same pairing app-alerts.yml's existing alert uses).
+      - record: iam:delegation_membership_check_success_ratio:rate_5m
+        expr: |
+          1 - (
+            sum(rate(iam_delegation_membership_check_failures_total{job="iam-delegation"}[5m]))
+            /
+            clamp_min(sum(rate(iam_delegation_membership_check_duration_seconds_count{job="iam-delegation"}[5m])), 0.001)
+          )
+
+      - record: iam:delegation_membership_check_success_ratio:rate_1h
+        expr: |
+          1 - (
+            sum(rate(iam_delegation_membership_check_failures_total{job="iam-delegation"}[1h]))
+            /
+            clamp_min(sum(rate(iam_delegation_membership_check_duration_seconds_count{job="iam-delegation"}[1h])), 0.001)
+          )
+
+      # Reconciler convergence — durable defer-counter accumulation across
+      # the three availability-first CronJobs (DLG-D25 activation, DLG-I1
+      # expiry, DLG-I2 review). Each counter only ever increases (one
+      # increment per deferred row per cron tick), so this sums the 1h
+      # increase of all three rather than a raw gauge value.
+      - record: iam:delegation_reconciler_deferrals:sum_increase_1h
+        expr: |
+          sum(increase(iam_delegation_activation_deferred_total{job="iam-delegation"}[1h]))
+          + sum(increase(iam_delegation_expiry_deferred_total{job="iam-delegation"}[1h]))
+          + sum(increase(iam_delegation_review_deferred_total{job="iam-delegation"}[1h]))
+
+      # delegation-cascade-q cascade error rate — DLQ deliveries over total
+      # attempted (processed + DLQ'd).
+      - record: iam:delegation_cascade_error_rate:ratio_rate_5m
+        expr: |
+          sum(rate(iam_delegation_cascade_dlq_total{job="iam-delegation"}[5m]))
+          /
+          clamp_min(sum(rate(iam_delegation_cascade_processed_total{job="iam-delegation"}[5m]))
+            + sum(rate(iam_delegation_cascade_dlq_total{job="iam-delegation"}[5m])), 0.001)
+
+  # ── SLO burn-rate alerts (multi-window) ───────────────────────────────────
+  - name: iam-delegation.slo.burn
+    interval: 1m
+    rules:
+      # SLO-1: fast burn (2% of a 0.1% budget in 1h → page).
+      - alert: IAMSLO1_DelegationWriteErrorFastBurn
+        expr: |
+          iam:delegation_write_error_rate:ratio_rate_5m > (14.4 * 0.001)
+        for: 2m
+        labels:
+          severity: page
+          slo: SLO-1
+          service: iam-delegation
+        annotations:
+          summary: "SLO-1 fast-burn: iam-delegation write-path 5xx rate above target"
+          description: |
+            {{ $value | humanizePercentage }} of mutating requests
+            (DLG-2/3/4/5/7) are returning 5xx over the last 5m. Check
+            Postgres, iam-user-profile
+            (iam:delegation_membership_check_success_ratio:rate_5m covers
+            iam-org-membership only — cross-check /readyz for the
+            User Profile pointer dependency too), and application logs.
+
+      # SLO-1: slow burn (6x budget sustained over 1h → ticket).
+      - alert: IAMSLO1_DelegationWriteErrorSlowBurn
+        expr: |
+          iam:delegation_write_error_rate:ratio_rate_5m > (6 * 0.001)
+        for: 15m
+        labels:
+          severity: ticket
+          slo: SLO-1
+          service: iam-delegation
+        annotations:
+          summary: "SLO-1 slow-burn: iam-delegation write-path error rate elevated for 15m+"
+
+      # SLO-2: membership-check failures — fast burn.
+      - alert: IAMSLO2_DelegationMembershipCheckFastBurn
+        expr: |
+          (1 - iam:delegation_membership_check_success_ratio:rate_5m) > (14.4 * (1 - 0.99))
+          and
+          (1 - iam:delegation_membership_check_success_ratio:rate_1h) > (14.4 * (1 - 0.99))
+        for: 2m
+        labels:
+          severity: page
+          slo: SLO-2
+          service: iam-delegation
+        annotations:
+          summary: "SLO-2 fast-burn: iam-org-membership grant-time check success ratio degraded"
+          description: |
+            Grant-time membership-existence check (DLG-D3) success ratio is
+            {{ $value | humanizePercentage }} below target over the 5m + 1h
+            windows. New delegation creates/reassigns are being rejected
+            with 422/503 — check iam-org-membership's health.
+
+      # SLO-2: slow burn.
+      - alert: IAMSLO2_DelegationMembershipCheckSlowBurn
+        expr: |
+          (1 - iam:delegation_membership_check_success_ratio:rate_1h) > (6 * (1 - 0.99))
+        for: 15m
+        labels:
+          severity: ticket
+          slo: SLO-2
+          service: iam-delegation
+        annotations:
+          summary: "SLO-2 slow-burn: iam-org-membership grant-time check success ratio below target for 15m+"
+
+      # SLO-3: reconciler deferrals accumulating across cron cycles.
+      - alert: IAMSLO3_DelegationReconcilerDeferralsElevated
+        expr: iam:delegation_reconciler_deferrals:sum_increase_1h > 3
+        for: 20m
+        labels:
+          severity: ticket
+          slo: SLO-3
+          service: iam-delegation
+        annotations:
+          summary: "SLO-3: iam-delegation availability-first crons accumulating deferrals"
+          description: |
+            Combined 1h defer-increase across delegation-activation,
+            delegation-expiry, and delegation-review = {{ $value }} for
+            20m+. Each cron self-retries and no data is lost (DEL-6
+            fail-open), but this is a real freshness gap. Check
+            iam-user-profile's health.
+
+      # SLO-4: cascade DLQ errors not self-healing.
+      - alert: IAMSLO4_DelegationCascadeErrorRateElevated
+        expr: iam:delegation_cascade_error_rate:ratio_rate_5m > 0
+        for: 20m
+        labels:
+          severity: ticket
+          slo: SLO-4
+          service: iam-delegation
+        annotations:
+          summary: "SLO-4: iam-delegation cascade convergence not self-healing"
+          description: |
+            iam:delegation_cascade_error_rate:ratio_rate_5m has been
+            non-zero for 20m+. delegation-cascade-q deliveries should
+            converge on redelivery — a sustained non-zero rate means a
+            persistent handler error or schema-decode failure, not
+            transient contention. Inspect delegation-cascade-q-dlq payloads
+            and consumer logs (LLD §11.5/§11.6).

@@ -2,6 +2,7 @@ package http
 
 import (
 	"errors"
+	"fmt"
 	"net/http"
 	"strings"
 
@@ -55,6 +56,12 @@ var errorStatusByCode = map[string]int{
 	domain.ErrDBUnavailable.Error():            http.StatusServiceUnavailable,
 }
 
+// errorLogger is the shared gincommon-backed Logger, set once by NewRouter
+// from ginCfg.Logger — the same Zap sink ObservabilityMiddlewares uses.
+// Unhandled 500s log through it so they never bypass platform-gincommon
+// (iam-realm-provisioner HandleError).
+var errorLogger Logger
+
 // errorResponseWithDetails extends gincommon.ErrorResponse with a free-form
 // details map. Used instead of gincommon.ErrorResponse when domain.Error
 // carries non-nil Details (e.g. record_version on ErrOptimisticLockConflict).
@@ -99,7 +106,8 @@ func writeErrorWithDetails(c *gin.Context, status int, code string, details map[
 // HandleError maps err onto the HTTP status from LLD §20 and writes it via
 // writeErrorWithDetails. Any error that isn't a *domain.Error — or is one
 // with a code this adapter doesn't recognize — becomes a generic 500, never
-// leaking implementation detail.
+// leaking implementation detail. Unclassified 500s are logged through
+// errorLogger (the gincommon Zap sink NewRouter installs).
 func HandleError(c *gin.Context, err error) {
 	var derr *domain.Error
 	if errors.As(err, &derr) {
@@ -116,6 +124,12 @@ func HandleError(c *gin.Context, err error) {
 	if pgcommon.IsConnectionException(err) || pgcommon.IsInsufficientResources(err) || isOperatorOrSystemErrorSQLState(err) {
 		writeError(c, http.StatusServiceUnavailable, domain.ErrDBUnavailable.Error())
 		return
+	}
+	if errorLogger != nil {
+		errorLogger.Error("unhandled 500 error", map[string]interface{}{
+			"error_type": fmt.Sprintf("%T", err),
+			"error":      err.Error(),
+		})
 	}
 	writeError(c, http.StatusInternalServerError, "internal_server_error")
 }

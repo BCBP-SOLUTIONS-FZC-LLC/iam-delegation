@@ -148,6 +148,22 @@ func loadConfig() (config, error) {
 		return cfg, err
 	}
 
+	// DATABASE_URL (or the split PG_HOST/PG_USER/PG_PASSWORD form
+	// pgcommon.ConfigFromEnv also accepts) is required — matching
+	// iam-realm-provisioner's / iam-org-membership's validateRequiredEnv.
+	if os.Getenv("DATABASE_URL") == "" &&
+		(os.Getenv("PG_HOST") == "" || os.Getenv("PG_USER") == "" || os.Getenv("PG_PASSWORD") == "") {
+		return cfg, fmt.Errorf("DATABASE_URL (or PG_HOST + PG_USER + PG_PASSWORD) is required")
+	}
+	// Migrations acquire a session-scoped pg_advisory_lock; under
+	// transaction pooling they must bypass PgBouncer via
+	// MIGRATION_DATABASE_URL. Sibling validateRequiredEnv only fires when
+	// DATABASE_URL is also empty, which never happens in Helm — require
+	// the override whenever PG_BOUNCER_MODE=true.
+	if os.Getenv("PG_BOUNCER_MODE") == "true" && os.Getenv("MIGRATION_DATABASE_URL") == "" {
+		return cfg, fmt.Errorf("MIGRATION_DATABASE_URL is required when PG_BOUNCER_MODE=true — migrations must bypass PgBouncer")
+	}
+
 	// Fail-fast on empty base URLs for the two data-bearing outbound clients
 	// (LLD §15 "base URLs required, fail-fast on empty") — deferred to the
 	// client constructors themselves (userprofile.NewHTTPClient /
@@ -173,18 +189,24 @@ func loadConfig() (config, error) {
 	// widened to isDevLikeEnvironment after a production-readiness review
 	// found any other environment name (staging, uat, ...) would silently
 	// skip this check and hit the same degrade-with-no-alert failure mode.
-	if !isDevLikeEnvironment(cfg.Environment) && os.Getenv("SYSTEM_DATABASE_URL") == "" {
-		return cfg, fmt.Errorf("SYSTEM_DATABASE_URL is required outside local/dev environments (ENVIRONMENT=%q; must be the BYPASSRLS delegation_migrator role, see .claude/database.md)", cfg.Environment)
+	// Keyed off resolveAppEnv() (APP_ENV, then ENVIRONMENT) so a deploy
+	// that only sets APP_ENV=production cannot skip this the way a bare
+	// ENVIRONMENT default of "development" would — matching
+	// iam-org-membership's validateRequiredEnv / reconciler isDevLikeEnv.
+	appEnv := resolveAppEnv()
+	if !isDevLikeEnvironment(appEnv) && os.Getenv("SYSTEM_DATABASE_URL") == "" {
+		return cfg, fmt.Errorf("SYSTEM_DATABASE_URL is required outside local/dev environments (APP_ENV=%q; must be the BYPASSRLS delegation_migrator role, see .claude/database.md)", appEnv)
 	}
 	return cfg, nil
 }
 
 // isDevLikeEnvironment reports whether env is one of this service's
-// recognized local/dev aliases (matching resolveAppEnv's switch below) — the
-// only environments exempt from the SYSTEM_DATABASE_URL fail-fast above.
+// recognized local/dev aliases — the only environments exempt from the
+// SYSTEM_DATABASE_URL fail-fast above. Includes "test" so CI (APP_ENV=test)
+// matches iam-org-membership's isDevLikeEnv.
 func isDevLikeEnvironment(env string) bool {
 	switch env {
-	case "development", "dev", "local", "":
+	case "development", "dev", "local", "test", "":
 		return true
 	default:
 		return false

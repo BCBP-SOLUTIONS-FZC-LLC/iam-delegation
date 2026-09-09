@@ -108,18 +108,23 @@ type CascadeConsumer struct {
 // NewCascadeConsumer builds a CascadeConsumer.
 //
 // cascade and idempotency are declared against small local interfaces
-// rather than the concrete types. tx is used to MarkProcessed inside
-// RunInTx after a successful handler (and for unknown-type ack) —
-// matching iam-realm-provisioner IDEMP-2. Nil tx marks directly (tests).
+// rather than the concrete types. tx is the IDEMP-2 seam: cascade PG
+// writes + MarkProcessed run inside one RunInTx (CascadeService joins
+// that ambient tx), matching iam-realm-provisioner's TenantConsumer and
+// iam-org-membership's MembershipEventConsumer. Unknown-type and
+// filtered-UserUpdated acks also mark inside RunInTx. Nil tx marks
+// directly (tests).
 func NewCascadeConsumer(cascade cascadeService, idempotency idempotencyStore, bindGUC GUCBinder, tx port.TxRunner, logger Logger) *CascadeConsumer {
 	return &CascadeConsumer{cascade: cascade, idempotency: idempotency, bindGUC: bindGUC, tx: tx, logger: logger}
 }
 
 // Handle implements the events.Handler function signature.
 //
-// Idempotency is checked before doing any work and recorded only after the
-// dispatched cascade fully succeeds, so a crash mid-cascade simply leaves
-// the event unmarked and redelivery reruns the (idempotent)
+// Idempotency is checked before doing any work. Cascade PG writes (and
+// outbox enqueue) plus the processed_events insert commit in one
+// TxRunner.RunInTx (IDEMP-2, matching iam-realm-provisioner TenantConsumer
+// / iam-org-membership MembershipEventConsumer). A crash mid-cascade
+// rolls both back and redelivery reruns the (idempotent)
 // EndForUser/ScrubTenant/EndForDisabledDelegate call to completion.
 //
 // A malformed/unparseable envelope id is logged and acked (returns nil,
@@ -131,12 +136,13 @@ func NewCascadeConsumer(cascade cascadeService, idempotency idempotencyStore, bi
 // unknown type. A UserUpdated event whose payload.status isn't "disabled"
 // — the filter policy matches on EventType only, not payload content, so
 // most UserUpdated deliveries are for unrelated field changes — is also
-// acked without dispatching; only "disabled" ever reaches CascadeService. A
-// payload that fails to JSON-decode returns an error instead: LLD §10.1
-// routes a schema-decode failure to the DLQ rather than retrying
-// indefinitely, which happens automatically via the queue's redrive policy
-// (maxReceiveCount=5) once this handler keeps returning an error — no
-// explicit DLQ-routing code belongs here.
+// acked without dispatching and recorded in processed_events so SQS
+// redelivery does not re-decode the same no-op; only "disabled" ever
+// reaches CascadeService. A payload that fails to JSON-decode returns an
+// error instead: LLD §10.1 routes a schema-decode failure to the DLQ
+// rather than retrying indefinitely, which happens automatically via the
+// queue's redrive policy (maxReceiveCount=5) once this handler keeps
+// returning an error — no explicit DLQ-routing code belongs here.
 func (c *CascadeConsumer) Handle(ctx context.Context, env events.Envelope[json.RawMessage]) error {
 	eventID, err := uuid.Parse(env.ID)
 	if err != nil || eventID == uuid.Nil {
@@ -161,8 +167,20 @@ func (c *CascadeConsumer) Handle(ctx context.Context, env events.Envelope[json.R
 		if !disabled {
 			// Most UserUpdated deliveries are unrelated field changes
 			// (display_name, timezone, ...) — the filter policy can only
-			// match on EventType, not payload.status. Nothing to dedup or
-			// cascade; ack and move on.
+			// match on EventType, not payload.status. Record the ack in
+			// processed_events (same bucket as the disabled path) so
+			// redelivery does not re-decode the same no-op.
+			consumerName = consumerDelegateDisable
+			skip, err := skipDuplicate(ctx, c.idempotency, consumerName, eventID.String())
+			if err != nil {
+				return fmt.Errorf("cascadeconsumer: check idempotency for event %s: %w", eventID, err)
+			}
+			if skip {
+				return nil
+			}
+			if err := markProcessedInTx(ctx, c.tx, c.idempotency, consumerName, eventID.String()); err != nil {
+				return fmt.Errorf("cascadeconsumer: mark event %s processed: %w", eventID, err)
+			}
 			return nil
 		}
 		consumerName = consumerDelegateDisable
@@ -189,24 +207,17 @@ func (c *CascadeConsumer) Handle(ctx context.Context, env events.Envelope[json.R
 	var handleErr error
 	switch env.Type {
 	case domain.EventMembershipRevoked:
-		handleErr = c.handleMembershipRevoked(ctx, env)
+		handleErr = c.handleMembershipRevoked(ctx, env, consumerName, eventID.String())
 	case domain.EventTenantMembershipsPurged:
-		handleErr = c.handleTenantMembershipsPurged(ctx, env)
+		handleErr = c.handleTenantMembershipsPurged(ctx, env, consumerName, eventID.String())
 	case domain.EventUserUpdated:
-		handleErr = c.handleUserDisabled(ctx, env)
+		handleErr = c.handleUserDisabled(ctx, env, consumerName, eventID.String())
 	}
 	if handleErr != nil {
 		if metrics.Live != nil {
 			metrics.Live.RecordCascadeDLQ()
 		}
 		return handleErr
-	}
-
-	if err := markProcessedInTx(ctx, c.tx, c.idempotency, consumerName, eventID.String()); err != nil {
-		if metrics.Live != nil {
-			metrics.Live.RecordCascadeDLQ()
-		}
-		return fmt.Errorf("cascadeconsumer: mark event %s processed: %w", eventID, err)
 	}
 
 	if metrics.Live != nil {
@@ -222,17 +233,19 @@ func (c *CascadeConsumer) Handle(ctx context.Context, env events.Envelope[json.R
 
 // handleMembershipRevoked decodes a MembershipRevoked payload and dispatches
 // to CascadeService.EndForUser (LLD §11.5).
-func (c *CascadeConsumer) handleMembershipRevoked(ctx context.Context, env events.Envelope[json.RawMessage]) error {
+func (c *CascadeConsumer) handleMembershipRevoked(ctx context.Context, env events.Envelope[json.RawMessage], consumerName, eventID string) error {
 	var payload domain.MembershipRevokedPayload
 	if err := json.Unmarshal(env.Payload, &payload); err != nil {
 		return fmt.Errorf("cascadeconsumer: decode MembershipRevoked payload for event %s: %w", env.ID, err)
 	}
 
 	gucCtx := c.bindGUC(ctx, payload.TenantID, systemPrincipal)
-	if err := c.cascade.EndForUser(gucCtx, payload.TenantID, payload.UserID); err != nil {
-		return fmt.Errorf("cascadeconsumer: EndForUser tenant=%s user=%s: %w", payload.TenantID, payload.UserID, err)
-	}
-	return nil
+	return c.runCascadeAndMark(gucCtx, consumerName, eventID, func(txCtx context.Context) error {
+		if err := c.cascade.EndForUser(txCtx, payload.TenantID, payload.UserID); err != nil {
+			return fmt.Errorf("cascadeconsumer: EndForUser tenant=%s user=%s: %w", payload.TenantID, payload.UserID, err)
+		}
+		return nil
+	})
 }
 
 // handleTenantMembershipsPurged decodes a TenantMembershipsPurged payload
@@ -240,17 +253,19 @@ func (c *CascadeConsumer) handleMembershipRevoked(ctx context.Context, env event
 // (iam-org-membership's) tenant-scrub relay on iam.membership.events —
 // renamed from "TenantOffboarded" on Core's side to avoid colliding with
 // Realm Provisioner's own TenantOffboarded event.
-func (c *CascadeConsumer) handleTenantMembershipsPurged(ctx context.Context, env events.Envelope[json.RawMessage]) error {
+func (c *CascadeConsumer) handleTenantMembershipsPurged(ctx context.Context, env events.Envelope[json.RawMessage], consumerName, eventID string) error {
 	var payload domain.TenantMembershipsPurgedPayload
 	if err := json.Unmarshal(env.Payload, &payload); err != nil {
 		return fmt.Errorf("cascadeconsumer: decode TenantMembershipsPurged payload for event %s: %w", env.ID, err)
 	}
 
 	gucCtx := c.bindGUC(ctx, payload.TenantID, systemPrincipal)
-	if err := c.cascade.ScrubTenant(gucCtx, payload.TenantID); err != nil {
-		return fmt.Errorf("cascadeconsumer: ScrubTenant tenant=%s: %w", payload.TenantID, err)
-	}
-	return nil
+	return c.runCascadeAndMark(gucCtx, consumerName, eventID, func(txCtx context.Context) error {
+		if err := c.cascade.ScrubTenant(txCtx, payload.TenantID); err != nil {
+			return fmt.Errorf("cascadeconsumer: ScrubTenant tenant=%s: %w", payload.TenantID, err)
+		}
+		return nil
+	})
 }
 
 // isUserUpdatedDisabled decodes a UserUpdated payload and reports whether
@@ -273,7 +288,7 @@ func isUserUpdatedDisabled(env events.Envelope[json.RawMessage]) (bool, error) {
 // MembershipRevoked/TenantMembershipsPurged, UserUpdatedPayload carries no
 // tenant_id field of its own (it is User Profile's own event, scoped by
 // the envelope like every other event on iam.user.events).
-func (c *CascadeConsumer) handleUserDisabled(ctx context.Context, env events.Envelope[json.RawMessage]) error {
+func (c *CascadeConsumer) handleUserDisabled(ctx context.Context, env events.Envelope[json.RawMessage], consumerName, eventID string) error {
 	var payload domain.UserUpdatedPayload
 	if err := json.Unmarshal(env.Payload, &payload); err != nil {
 		return fmt.Errorf("cascadeconsumer: decode UserUpdated payload for event %s: %w", env.ID, err)
@@ -284,8 +299,39 @@ func (c *CascadeConsumer) handleUserDisabled(ctx context.Context, env events.Env
 	}
 
 	gucCtx := c.bindGUC(ctx, tenantID, systemPrincipal)
-	if err := c.cascade.EndForDisabledDelegate(gucCtx, tenantID, payload.UserID); err != nil {
-		return fmt.Errorf("cascadeconsumer: EndForDisabledDelegate tenant=%s delegate=%s: %w", tenantID, payload.UserID, err)
+	return c.runCascadeAndMark(gucCtx, consumerName, eventID, func(txCtx context.Context) error {
+		if err := c.cascade.EndForDisabledDelegate(txCtx, tenantID, payload.UserID); err != nil {
+			return fmt.Errorf("cascadeconsumer: EndForDisabledDelegate tenant=%s delegate=%s: %w", tenantID, payload.UserID, err)
+		}
+		return nil
+	})
+}
+
+// runCascadeAndMark opens one TxRunner transaction around the cascade
+// handler and MarkProcessed (IDEMP-2). CascadeService.RunInTx joins that
+// ambient tx (postgres.TxRunner), so the PG write, outbox enqueue, and
+// processed_events insert commit together. EndForUser's best-effort User
+// Profile call still runs after its inner RunInTx returns — while this
+// outer tx is open. That call is timeout-bounded (USER_PROFILE_TIMEOUT_MS)
+// and fail-open, matching the existing cascade contract. Nil tx (unit
+// tests) runs fn then marks directly.
+func (c *CascadeConsumer) runCascadeAndMark(ctx context.Context, consumerName, eventID string, fn func(ctx context.Context) error) error {
+	if c.tx == nil {
+		if err := fn(ctx); err != nil {
+			return err
+		}
+		if err := c.idempotency.MarkProcessed(ctx, consumerName, eventID); err != nil {
+			return fmt.Errorf("cascadeconsumer: mark event %s processed: %w", eventID, err)
+		}
+		return nil
 	}
-	return nil
+	return c.tx.RunInTx(ctx, func(txCtx context.Context) error {
+		if err := fn(txCtx); err != nil {
+			return err
+		}
+		if err := c.idempotency.MarkProcessed(txCtx, consumerName, eventID); err != nil {
+			return fmt.Errorf("cascadeconsumer: mark event %s processed: %w", eventID, err)
+		}
+		return nil
+	})
 }

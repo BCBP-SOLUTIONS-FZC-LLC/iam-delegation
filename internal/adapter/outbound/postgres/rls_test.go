@@ -388,3 +388,26 @@ func TestProcessedEvents_CompositePKDedup(t *testing.T) {
 	require.NoError(t, db.Raw.QueryRow(ctx, `SELECT count(*) FROM processed_events WHERE event_id = 'evt-1'`).Scan(&count))
 	assert.Equal(t, 2, count)
 }
+
+func TestSchema_OutboxPayloadIsTextWithNormalizeTrigger(t *testing.T) {
+	db := setupTestDB(t)
+	ctx := context.Background()
+
+	var dataType string
+	err := db.Raw.QueryRow(ctx, `
+		SELECT data_type FROM information_schema.columns
+		WHERE table_schema = 'public' AND table_name = 'outbox_events' AND column_name = 'payload'`).Scan(&dataType)
+	require.NoError(t, err)
+	assert.Equal(t, "text", dataType, "pgx SimpleProtocol bytea-hex is invalid for jsonb; siblings store payload as text")
+
+	var n int
+	require.NoError(t, db.Raw.QueryRow(ctx, `
+		SELECT count(*) FROM pg_trigger
+		WHERE tgname = 'trg_outbox_normalize_payload' AND NOT tgisinternal`).Scan(&n))
+	assert.Equal(t, 1, n)
+
+	require.NoError(t, db.Raw.QueryRow(ctx, `
+		SELECT count(*) FROM pg_indexes
+		WHERE schemaname = 'public' AND indexname = 'idx_processed_events_processed_at'`).Scan(&n))
+	assert.Equal(t, 1, n)
+}

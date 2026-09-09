@@ -3,6 +3,9 @@ package postgres
 import (
 	"context"
 	"errors"
+	"io"
+	"net"
+	"syscall"
 	"testing"
 
 	"github.com/BCBP-SOLUTIONS-FZC-LLC/iam-delegation/internal/core/domain"
@@ -61,4 +64,32 @@ func TestWrapConnErr_ClosedPoolMapsToDBUnavailable(t *testing.T) {
 	var de *domain.Error
 	require.True(t, errors.As(got, &de))
 	assert.Equal(t, domain.ErrDBUnavailable.Error(), de.Code)
+}
+
+func TestWrapConnErr_DeadlineExceededPassesThroughUnchanged(t *testing.T) {
+	got := wrapConnErr(context.DeadlineExceeded)
+	assert.Equal(t, context.DeadlineExceeded, got)
+	assert.True(t, errors.Is(got, context.DeadlineExceeded))
+}
+
+func TestWrapConnErr_NetworkErrorMapsToDBUnavailable(t *testing.T) {
+	cases := []struct {
+		name string
+		err  error
+	}{
+		{name: "eof", err: io.EOF},
+		{name: "unexpected_eof", err: io.ErrUnexpectedEOF},
+		{name: "op_error", err: &net.OpError{Op: "read", Net: "tcp", Err: errors.New("connection reset by peer")}},
+		{name: "conn_refused_text", err: errors.New("dial tcp: connection refused")},
+		{name: "broken_pipe_text", err: errors.New("write: broken pipe")},
+		{name: "syscall_reset", err: syscall.ECONNRESET},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := wrapConnErr(tc.err)
+			var de *domain.Error
+			require.True(t, errors.As(got, &de), "got %v", got)
+			assert.Equal(t, domain.ErrDBUnavailable.Error(), de.Code)
+		})
+	}
 }

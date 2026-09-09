@@ -363,9 +363,9 @@ table covers only the ones most likely to trip someone up.
 
 | Variable | Required | Default | Notes |
 |---|---|---|---|
-| `DATABASE_URL` | Yes | — | App role (`delegation_app`), `NOBYPASSRLS` — RLS is enforced even locally |
-| `MIGRATION_DATABASE_URL` | No | falls back to `DATABASE_URL`'s DSN shape | BYPASSRLS role; the server self-migrates at startup, no separate migrate step |
-| `SYSTEM_DATABASE_URL` | Required outside `development`/`dev`/`local` `ENVIRONMENT` (both binaries fail fast otherwise); required in Helm always | falls back with a startup warning in local/dev | BYPASSRLS pool for cross-tenant reconciler sweeps, cascade `processed_events`, and the active-gauge exporter — unset outside local/dev means cross-tenant queries silently return zero rows |
+| `DATABASE_URL` | Yes (or `PG_HOST`+`PG_USER`+`PG_PASSWORD`) | — | App role (`delegation_app`), `NOBYPASSRLS` — RLS is enforced even locally. `loadConfig` fails fast at startup if neither form is set |
+| `MIGRATION_DATABASE_URL` | Required when `PG_BOUNCER_MODE=true` | falls back to `DATABASE_URL`'s DSN shape | BYPASSRLS role; the server self-migrates at startup, no separate migrate step. Migrations take a session-scoped `pg_advisory_lock`, so they must bypass PgBouncer's transaction pooling |
+| `SYSTEM_DATABASE_URL` | Required outside `development`/`dev`/`local`/`test` (resolved via `APP_ENV`, then `ENVIRONMENT`; both binaries fail fast otherwise); required in Helm always | falls back with a startup warning in local/dev | BYPASSRLS pool for cross-tenant reconciler sweeps, cascade `processed_events`, and the active-gauge exporter — unset outside local/dev means cross-tenant queries silently return zero rows |
 | `USER_PROFILE_BASE_URL` / `ORG_MEMBERSHIP_BASE_URL` | Yes | — | Client constructors fail fast at startup if empty; neither service is part of this repo's compose stack |
 | `SNS_TOPIC_ARN` / `CASCADE_QUEUE_URL` | **Yes** | — | `loadConfig` returns an error and the process never starts if either is empty |
 | `AWS_REGION` | No | `ap-south-1` | |

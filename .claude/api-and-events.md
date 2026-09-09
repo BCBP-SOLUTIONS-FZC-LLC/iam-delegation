@@ -122,7 +122,7 @@ Every published envelope carries `specversion: "1"` (`eventbus.Publisher.Enqueue
 |---|---|---|---|
 | `iam.membership.events` | `MembershipRevoked` | `CascadeService.EndForUser` (§11.5) | `"cascade"` |
 | `iam.membership.events` | `TenantMembershipsPurged` | `CascadeService.ScrubTenant` (§11.6) | `"offboarding"` |
-| `iam.user.events` | `UserUpdated` (only when decoded `status=="disabled"`; other deliveries are acked without dispatch) | `CascadeService.EndForDisabledDelegate` (§11.5a, Bug 2/DLG-D26) | `"delegate_disable"` |
+| `iam.user.events` | `UserUpdated` (only when decoded `status=="disabled"`; other deliveries are acked and recorded in `processed_events` without dispatch) | `CascadeService.EndForDisabledDelegate` (§11.5a, Bug 2/DLG-D26) | `"delegate_disable"` |
 
 The first two event types are produced by Core / Org & Membership on `iam.membership.events`. `TenantMembershipsPurged` was renamed from `TenantOffboarded` by Core to avoid colliding with Realm Provisioner's own, differently-scoped `TenantOffboarded` event on `iam.tenant.events`, which this service does not consume. `UserUpdated` is produced by User Profile on a third, distinct topic — `iam.user.events` — a second SNS subscription onto this same queue (Bug 2/DLG-D26); its filter policy can only match on `EventType`, not payload content, so this service decodes every delivery and dispatches only on `status=="disabled"`.
 

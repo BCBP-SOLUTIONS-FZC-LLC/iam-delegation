@@ -114,6 +114,21 @@ func (f *fakeDelegationRepo) HardPurgeSoftDeletedBefore(_ context.Context, befor
 	return f.purgeCount, f.purgeErr
 }
 
+type fakeProcessedEvents struct {
+	ttlDays int
+	limit   int
+	err     error
+}
+
+func (f *fakeProcessedEvents) Prune(_ context.Context, ttlDays, limit int) (int, error) {
+	f.ttlDays = ttlDays
+	f.limit = limit
+	if f.err != nil {
+		return 0, f.err
+	}
+	return 0, nil
+}
+
 func noopBind(ctx context.Context, _ uuid.UUID, _ string) context.Context { return ctx }
 
 // fakeMetrics records calls to the three deferred-counter methods so tests
@@ -587,6 +602,36 @@ func TestCleanup_DefaultsRetentionWhenUnset(t *testing.T) {
 	wantBefore := before.AddDate(0, 0, -defaultRetentionDays)
 	if diff := repo.purgeBefore.Sub(wantBefore); diff < -time.Minute || diff > time.Minute {
 		t.Fatalf("expected default retention ~90d, got threshold %v", repo.purgeBefore)
+	}
+}
+
+func TestCleanup_UsesProcessedEventsTTLDays(t *testing.T) {
+	repo := &fakeDelegationRepo{}
+	pe := &fakeProcessedEvents{}
+	jctx := &Context{
+		Delegations:            repo,
+		Logger:                 fakeLogger{},
+		ProcessedEvents:        pe,
+		ProcessedEventsTTLDays: 8,
+		BatchLimit:             25,
+	}
+	if _, err := Cleanup(context.Background(), jctx); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if pe.ttlDays != 8 || pe.limit != 25 {
+		t.Fatalf("Prune called with ttl=%d limit=%d, want 8/25", pe.ttlDays, pe.limit)
+	}
+}
+
+func TestCleanup_DefaultsProcessedEventsTTLWhenUnset(t *testing.T) {
+	repo := &fakeDelegationRepo{}
+	pe := &fakeProcessedEvents{}
+	jctx := &Context{Delegations: repo, Logger: fakeLogger{}, ProcessedEvents: pe}
+	if _, err := Cleanup(context.Background(), jctx); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if pe.ttlDays != defaultProcessedEventsTTLDays {
+		t.Fatalf("expected default TTL %d, got %d", defaultProcessedEventsTTLDays, pe.ttlDays)
 	}
 }
 

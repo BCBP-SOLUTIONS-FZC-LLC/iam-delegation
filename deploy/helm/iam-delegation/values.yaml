@@ -423,6 +423,10 @@ cronJobs:
     successfulJobsHistoryLimit: 3
     failedJobsHistoryLimit: 3
     activeDeadlineSeconds: 1800
+    # processed_events prune window in days (LLD §18.4). Realm provisioner
+    # defaults to 8 with a dedicated CronJob; this service keeps the LLD's
+    # 30-day window bundled into monthly cleanup.
+    processedEventsTTLDays: 30
     resources:
       requests:
         cpu: 100m

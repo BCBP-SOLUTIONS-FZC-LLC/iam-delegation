@@ -93,6 +93,7 @@ func NewRouter(
 	docs DocsConfig,
 	bindTenantGUC BindTenantGUC,
 ) *Router {
+	errorLogger = ginCfg.Logger
 	engine := gin.New()
 	engine.HandleMethodNotAllowed = true
 

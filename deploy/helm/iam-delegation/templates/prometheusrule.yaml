@@ -252,4 +252,165 @@ spec:
               last 5 minutes. New delegation creates are being rejected with
               422/503 — check iam-org-membership's health and the mesh path
               between the two services.
+
+    # ── SLO burn-rate recording — deploy/monitoring/slo-rules.yml is this
+    #    same content as a standalone --rule-files copy for environments not
+    #    installing this service via the Helm chart; keep both in sync.
+    #    Four SLOs (LLD §14.1/§14.5): SLO-1 write-path error rate (99.9%),
+    #    SLO-2 grant-time membership-check success (99%), SLO-3 reconciler
+    #    convergence (activation/expiry/review defer counters, DEL-6),
+    #    SLO-4 delegation-cascade-q convergence. Recording rules pre-compute
+    #    the SLI numerator/denominator so the burn-rate alerts below can key
+    #    off a scalar (SRE book Ch. 5 multi-window multi-burn-rate pattern).
+    - name: iam_delegation_slo_records
+      interval: 30s
+      rules:
+        - record: iam:delegation_write_error_rate:ratio_rate_5m
+          expr: |
+            sum(rate(http_requests_total{
+              job={{ include "iam-delegation.fullname" . | quote }},
+              method=~"POST|PUT|PATCH|DELETE",
+              status_class="5xx"
+            }[5m]))
+            /
+            clamp_min(sum(rate(http_requests_total{
+              job={{ include "iam-delegation.fullname" . | quote }},
+              method=~"POST|PUT|PATCH|DELETE"
+            }[5m])), 0.001)
+
+        - record: iam:delegation_membership_check_success_ratio:rate_5m
+          expr: |
+            1 - (
+              sum(rate(iam_delegation_membership_check_failures_total{job={{ include "iam-delegation.fullname" . | quote }}}[5m]))
+              /
+              clamp_min(sum(rate(iam_delegation_membership_check_duration_seconds_count{job={{ include "iam-delegation.fullname" . | quote }}}[5m])), 0.001)
+            )
+
+        - record: iam:delegation_membership_check_success_ratio:rate_1h
+          expr: |
+            1 - (
+              sum(rate(iam_delegation_membership_check_failures_total{job={{ include "iam-delegation.fullname" . | quote }}}[1h]))
+              /
+              clamp_min(sum(rate(iam_delegation_membership_check_duration_seconds_count{job={{ include "iam-delegation.fullname" . | quote }}}[1h])), 0.001)
+            )
+
+        # Reconciler convergence — durable defer-counter accumulation across
+        # the three availability-first CronJobs (DLG-D25 activation, DLG-I1
+        # expiry, DLG-I2 review). Each counter only ever increases, so this
+        # sums the 1h increase of all three rather than a raw gauge value.
+        - record: iam:delegation_reconciler_deferrals:sum_increase_1h
+          expr: |
+            sum(increase(iam_delegation_activation_deferred_total{job={{ include "iam-delegation.fullname" . | quote }}}[1h]))
+            + sum(increase(iam_delegation_expiry_deferred_total{job={{ include "iam-delegation.fullname" . | quote }}}[1h]))
+            + sum(increase(iam_delegation_review_deferred_total{job={{ include "iam-delegation.fullname" . | quote }}}[1h]))
+
+        # delegation-cascade-q cascade error rate — DLQ deliveries over
+        # total attempted (processed + DLQ'd).
+        - record: iam:delegation_cascade_error_rate:ratio_rate_5m
+          expr: |
+            sum(rate(iam_delegation_cascade_dlq_total{job={{ include "iam-delegation.fullname" . | quote }}}[5m]))
+            /
+            clamp_min(sum(rate(iam_delegation_cascade_processed_total{job={{ include "iam-delegation.fullname" . | quote }}}[5m]))
+              + sum(rate(iam_delegation_cascade_dlq_total{job={{ include "iam-delegation.fullname" . | quote }}}[5m])), 0.001)
+
+    - name: iam_delegation_slo_burn
+      interval: 1m
+      rules:
+        # SLO-1: fast burn (2% of a 0.1% budget in 1h → page).
+        - alert: IAMSLO1_DelegationWriteErrorFastBurn
+          expr: |
+            iam:delegation_write_error_rate:ratio_rate_5m > (14.4 * 0.001)
+          for: 2m
+          labels:
+            severity: page
+            slo: SLO-1
+            team: platform
+          annotations:
+            summary: "SLO-1 fast-burn: iam-delegation write-path 5xx rate above target"
+            description: >-
+              {{ "{{ $value | humanizePercentage }}" }} of mutating requests
+              (DLG-2/3/4/5/7) are returning 5xx over the last 5m. Check
+              Postgres, iam-user-profile (the write-error SLI only covers
+              iam-org-membership's grant-time check — cross-check /readyz
+              for the User Profile pointer dependency too), and application
+              logs.
+
+        # SLO-1: slow burn (6x budget sustained over 1h → ticket).
+        - alert: IAMSLO1_DelegationWriteErrorSlowBurn
+          expr: |
+            iam:delegation_write_error_rate:ratio_rate_5m > (6 * 0.001)
+          for: 15m
+          labels:
+            severity: ticket
+            slo: SLO-1
+            team: platform
+          annotations:
+            summary: "SLO-1 slow-burn: iam-delegation write-path error rate elevated for 15m+"
+
+        # SLO-2: membership-check failures — fast burn.
+        - alert: IAMSLO2_DelegationMembershipCheckFastBurn
+          expr: |
+            (1 - iam:delegation_membership_check_success_ratio:rate_5m) > (14.4 * (1 - 0.99))
+            and
+            (1 - iam:delegation_membership_check_success_ratio:rate_1h) > (14.4 * (1 - 0.99))
+          for: 2m
+          labels:
+            severity: page
+            slo: SLO-2
+            team: platform
+          annotations:
+            summary: "SLO-2 fast-burn: iam-org-membership grant-time check success ratio degraded"
+            description: >-
+              Grant-time membership-existence check (DLG-D3) success ratio
+              is {{ "{{ $value | humanizePercentage }}" }} below target over
+              the 5m + 1h windows. New delegation creates/reassigns are
+              being rejected with 422/503 — check iam-org-membership's
+              health.
+
+        # SLO-2: slow burn.
+        - alert: IAMSLO2_DelegationMembershipCheckSlowBurn
+          expr: |
+            (1 - iam:delegation_membership_check_success_ratio:rate_1h) > (6 * (1 - 0.99))
+          for: 15m
+          labels:
+            severity: ticket
+            slo: SLO-2
+            team: platform
+          annotations:
+            summary: "SLO-2 slow-burn: iam-org-membership grant-time check success ratio below target for 15m+"
+
+        # SLO-3: reconciler deferrals accumulating across cron cycles.
+        - alert: IAMSLO3_DelegationReconcilerDeferralsElevated
+          expr: iam:delegation_reconciler_deferrals:sum_increase_1h > 3
+          for: 20m
+          labels:
+            severity: ticket
+            slo: SLO-3
+            team: platform
+          annotations:
+            summary: "SLO-3: iam-delegation availability-first crons accumulating deferrals"
+            description: >-
+              Combined 1h defer-increase across delegation-activation,
+              delegation-expiry, and delegation-review =
+              {{ "{{ $value }}" }} for 20m+. Each cron self-retries and no
+              data is lost (DEL-6 fail-open), but this is a real freshness
+              gap. Check iam-user-profile's health.
+
+        # SLO-4: cascade DLQ errors not self-healing.
+        - alert: IAMSLO4_DelegationCascadeErrorRateElevated
+          expr: iam:delegation_cascade_error_rate:ratio_rate_5m > 0
+          for: 20m
+          labels:
+            severity: ticket
+            slo: SLO-4
+            team: platform
+          annotations:
+            summary: "SLO-4: iam-delegation cascade convergence not self-healing"
+            description: >-
+              iam:delegation_cascade_error_rate:ratio_rate_5m has been
+              non-zero for 20m+. delegation-cascade-q deliveries should
+              converge on redelivery — a sustained non-zero rate means a
+              persistent handler error or schema-decode failure, not
+              transient contention. Inspect delegation-cascade-q-dlq
+              payloads and consumer logs (LLD §11.5/§11.6).
 {{- end }}

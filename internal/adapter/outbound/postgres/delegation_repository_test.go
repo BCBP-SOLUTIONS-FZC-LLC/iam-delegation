@@ -81,6 +81,43 @@ func TestDelegationRepository_Insert_InsideRunInTx(t *testing.T) {
 	assert.Equal(t, created.ID, got.ID)
 }
 
+func TestTxRunner_NestedRunInTx_JoinsAndRollsBackWithOuter(t *testing.T) {
+	db := setupTestDB(t)
+	repo := NewDelegationRepository(db.App)
+	runner := NewTxRunner(db.App, nil)
+	tenantID := uuid.New()
+	ctxA := withTenant(context.Background(), tenantID)
+
+	var id uuid.UUID
+	err := runner.RunInTx(ctxA, func(outerCtx context.Context) error {
+		outerTx, ok := TxFromContext(outerCtx)
+		require.True(t, ok)
+		if err := runner.RunInTx(outerCtx, func(innerCtx context.Context) error {
+			innerTx, ok := TxFromContext(innerCtx)
+			require.True(t, ok)
+			require.Equal(t, outerTx, innerTx, "nested RunInTx must join the ambient tx, not Begin a second one")
+			created, err := repo.Insert(innerCtx, &domain.Delegation{
+				TenantID: tenantID, DelegatorID: uuid.New(), DelegateID: uuid.New(),
+				DelegatorMembershipID: uuid.New(), DelegateMembershipID: uuid.New(),
+				Scope: domain.ScopeAll, StartsAt: time.Now().UTC().Truncate(time.Millisecond),
+			})
+			if err != nil {
+				return err
+			}
+			id = created.ID
+			return nil
+		}); err != nil {
+			return err
+		}
+		return errors.New("force outer rollback")
+	})
+	require.Error(t, err)
+	require.NotEqual(t, uuid.Nil, id)
+
+	_, err = repo.FindByID(ctxA, tenantID, id)
+	assert.ErrorIs(t, err, domain.ErrDelegationNotFound, "inner insert must roll back with the outer tx")
+}
+
 func TestDelegationRepository_Insert_OpenEnded_SetsNoEndsAt(t *testing.T) {
 	db := setupTestDB(t)
 	ctx := context.Background()

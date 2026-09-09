@@ -2,11 +2,16 @@
 
 **Database:** `delegation` on shared RDS PostgreSQL Multi-AZ (LLD §7). Connection,
 pool sizing, PgBouncer mode, transactions, and health all go through
-`platform-pgcommon` (DLG-D23/D32, matching `iam-realm-provisioner`):
-`pgcommon.ConfigFromEnv` / `pgcommon.NewPool` / `pgcommon.RunInTxWithRetryOpts` /
-`pgcommon.Pool.Health` / `DrainAndClose`. `PG_BOUNCER_MODE` is a standard
-`ConfigFromEnv` var (app pool); `SystemPoolConfig` forces `PGBouncerMode: true`
-unconditionally so the BYPASSRLS pool still works under transaction pooling.
+`platform-pgcommon` (DLG-D23/D32/D37, matching `iam-realm-provisioner` /
+`iam-org-membership`): `pgcommon.ConfigFromEnv` / `pgcommon.NewPool` /
+`pgcommon.RunInTxWithRetryOpts` / `pgcommon.Pool.Health` / `DrainAndClose`.
+`PG_BOUNCER_MODE` is a standard `ConfigFromEnv` var (app pool);
+`SystemPoolConfig` forces `PGBouncerMode: true` unconditionally so the
+BYPASSRLS pool still works under transaction pooling. `wrapConnErr` maps
+SQLSTATE 08/53/57/58, `puddle.ErrClosedPool`, and Go-level network/IO
+failures to `db_unavailable`. Startup runs `postgres.Migrate` (outbox schema
+then domain). `loadConfig` requires `DATABASE_URL` (or split `PG_*`) and
+`MIGRATION_DATABASE_URL` when `PG_BOUNCER_MODE=true`.
 
 **Pool configuration** (`cmd/server/main.go` and `cmd/reconciler/main.go`):
 ```go
@@ -39,7 +44,7 @@ Plus `rls_violation_log` — not a business table, RLS-disabled audit sink (see 
 
 **`delegation_tenant_settings`** — PK is `tenant_id` itself (one row per tenant); `CHECK` both `max_duration_days`/`review_window_days BETWEEN 1 AND 180`.
 
-**`processed_events`** — PK `(event_id, consumer)`; `consumer` distinguishes `cascade` from a future second inbound subscription if one is ever added. Monthly-pruned (LLD §18.4, `delegation-cleanup` CronJob).
+**`processed_events`** — PK `(event_id, consumer)`; `consumer` ∈ `{cascade, offboarding, delegate_disable}`. Indexed on `processed_at` for the prune path. Monthly-pruned (LLD §18.4, `delegation-cleanup` CronJob, `PROCESSED_EVENTS_TTL_DAYS` default 30). Cascade PG writes and the dedup insert commit in one `TxRunner.RunInTx` (IDEMP-2, DLG-D38).
 
 ## Row-Level Security (LLD §7.3)
 
@@ -70,7 +75,7 @@ sysCfg := pgadapter.SystemPoolConfig(sysDSN, logger) // forces PGBouncerMode, no
 sysCfg.Tracer = queryTracer
 sysPool, err := pgcommon.NewPool(ctx, sysCfg)
 ```
-Falls back to `DSNFromEnv()` in dev with a startup warning — cross-tenant reads then return zero rows under RLS (fail-quiet, not fail-loud). `cmd/server/config.go`'s `loadConfig()` fails fast instead of falling through to this warning whenever `ENVIRONMENT` isn't one of `isDevLikeEnvironment`'s recognized local/dev aliases (`development`/`dev`/`local`) — originally gated on a literal `"production"` compare (DLG-D34), widened to every other environment name in DLG-D35.
+Falls back to `DSNFromEnv()` in dev with a startup warning — cross-tenant reads then return zero rows under RLS (fail-quiet, not fail-loud). `cmd/server/config.go`'s `loadConfig()` fails fast instead of falling through to this warning whenever `resolveAppEnv()` (`APP_ENV` if set, else `ENVIRONMENT`) isn't one of `isDevLikeEnvironment`'s recognized local/dev aliases (`development`/`dev`/`local`/`test`) — originally gated on a literal `ENVIRONMENT=="production"` compare (DLG-D34), widened to every other environment name in DLG-D35, then keyed off `resolveAppEnv()` with `test` added as a fourth alias in DLG-D37 (matching `iam-org-membership`'s `isDevLikeEnv`). `cmd/reconciler/main.go` uses the identical helper.
 
 **What actually uses `sysPool` in this repo:**
 - `cmd/server/main.go`: `delegationRepoSys := pgadapter.NewDelegationRepository(sysPool)` — backs the mesh-only DLG-I3/I4 internal reads (`gucBoundReader`, cross-tenant lookups by design).
@@ -87,8 +92,8 @@ Falls back to `DSNFromEnv()` in dev with a startup warning — cross-tenant read
 
 ## Migrations
 
-**Startup order (DLG-D32, matching `iam-realm-provisioner` / `postgres.Migrate`):** `outbox.ApplySchema` first (creates `outbox_events`), then the domain migration (which GRANTs `delegation_app` on that table). The reverse order — domain then outbox, which `iam-user-profile` uses — fails every fresh-database bring-up here.
+**Startup order (DLG-D32, matching `iam-realm-provisioner` / `postgres.Migrate`):** `outbox.ApplySchema` first (creates `outbox_events`), then the domain migration (which GRANTs `delegation_app` on that table, ALTERs `payload` JSONB → TEXT, and installs `outbox_normalize_payload` for PgBouncer SimpleProtocol — DLG-D38). The reverse order — domain then outbox, which `iam-user-profile` uses — fails every fresh-database bring-up here.
 
 This service has never been deployed (no Git tag has ever been pushed — see `../VERSIONING.md`), so there is no rolling-upgrade history across incremental migration files worth preserving — one file (`000001_schema`) is the whole schema, verified round-trip (`up` then `down`) against a real Postgres container. Every schema fix so far (the `scheduled` status/`idx_delegations_starts_at` for DLG-D25, the `delegate_disabled` end reason, etc.) has been folded back into that single file rather than layered as a new migration. Once a real deployment exists, future schema changes should go back to the normal forward-only, additive-where-possible discipline (column drops split across two releases to stay compatible with rolling deploys) — see `../VERSIONING.md`.
 
-**Trigger:** `touch_row()` — identical pattern to user-profile's: maintains `updated_at` and increments `record_version` on every genuine `UPDATE`, guarded by `WHEN (OLD.* IS DISTINCT FROM NEW.*)` from day one (not retrofitted in a later migration the way user-profile's was) so a no-op `UPDATE` never bumps the version. Attached to both `delegations` and `delegation_tenant_settings` (`trg_touch_delegations`, `trg_touch_delegation_tenant_settings`).
+**Trigger:** `touch_row()` — identical pattern to user-profile's: maintains `updated_at` and increments `record_version` on every genuine `UPDATE`, guarded by `WHEN (OLD.* IS DISTINCT FROM NEW.*)` from day one (not retrofitted in a later migration the way user-profile's was) so a no-op `UPDATE` never bumps the version. Attached to both `delegations` and `delegation_tenant_settings` (`trg_touch_delegations`, `trg_touch_delegation_tenant_settings`). `trg_outbox_normalize_payload` on `outbox_events` decodes pgx SimpleProtocol bytea-hex payloads back to UTF-8 text (DLG-D38).

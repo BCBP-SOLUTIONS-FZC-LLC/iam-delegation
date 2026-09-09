@@ -21,11 +21,22 @@ func resolveAppEnv() string {
 	if v := os.Getenv("APP_ENV"); v != "" {
 		return v
 	}
-	switch getEnv("ENVIRONMENT", "development") {
-	case "development", "dev", "local":
+	if isDevLikeEnvironment(getEnv("ENVIRONMENT", "development")) {
 		return "dev"
+	}
+	return getEnv("ENVIRONMENT", "production")
+}
+
+// isDevLikeEnvironment reports whether env is one of this binary's
+// recognized local/dev aliases — the only environments exempt from the
+// SYSTEM_DATABASE_URL fail-fast. Mirrors cmd/server's helper so staging/uat
+// cannot silently reuse the RLS-scoped app DSN.
+func isDevLikeEnvironment(env string) bool {
+	switch env {
+	case "development", "dev", "local", "test", "":
+		return true
 	default:
-		return getEnv("ENVIRONMENT", "production")
+		return false
 	}
 }
 

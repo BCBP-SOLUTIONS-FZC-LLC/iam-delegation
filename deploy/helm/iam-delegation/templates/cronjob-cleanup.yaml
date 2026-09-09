@@ -64,6 +64,12 @@ spec:
                 # saturating.
                 - name: CRON_BATCH_LIMIT
                   value: {{ .Values.cronJobs.batchLimit | quote }}
+                # processed_events prune window (LLD §18.4, default 30).
+                # Matching iam-realm-provisioner's PROCESSED_EVENTS_TTL_DAYS
+                # env; this job bundles prune into monthly cleanup rather
+                # than a dedicated CronJob.
+                - name: PROCESSED_EVENTS_TTL_DAYS
+                  value: {{ .Values.cronJobs.cleanup.processedEventsTTLDays | quote }}
                 {{- $secretName := include "iam-delegation.secretName" . }}
                 {{- range .Values.envFromSecret }}
                 - name: {{ . }}

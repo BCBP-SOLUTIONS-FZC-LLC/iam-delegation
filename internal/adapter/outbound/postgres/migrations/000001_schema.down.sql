@@ -1,5 +1,10 @@
 -- Reverses 000001_schema.up.sql in full, in reverse dependency order.
 
+-- ── outbox_events customization (reverse first — added last in up.sql) ──
+DROP TRIGGER IF EXISTS trg_outbox_normalize_payload ON public.outbox_events;
+DROP FUNCTION IF EXISTS public.outbox_normalize_payload();
+ALTER TABLE public.outbox_events ALTER COLUMN payload TYPE jsonb USING payload::jsonb;
+
 -- ── Roles ─────────────────────────────────────────────────────────────────
 REVOKE ALL PRIVILEGES ON ALL SEQUENCES IN SCHEMA public FROM delegation_migrator;
 REVOKE ALL PRIVILEGES ON ALL TABLES IN SCHEMA public FROM delegation_migrator;

@@ -8,8 +8,11 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
+	"net"
 	"os"
 	"strings"
+	"syscall"
 	"time"
 
 	"github.com/BCBP-SOLUTIONS-FZC-LLC/iam-delegation/internal/core/domain"
@@ -183,7 +186,24 @@ func NewTxRunner(pool *pgcommon.Pool, events port.EventPublisher) *TxRunner {
 // RunInTx implements port.TxRunner (see the TxRunner doc comment above).
 // Contended writes retry via pgcommon.RunInTxWithRetryOpts on deadlock /
 // serialization failure (iam-realm-provisioner).
+//
+// Nested calls join the ambient pgx.Tx already bound on ctx (the same
+// contract withPool uses) instead of Begin-ing a second transaction.
+// CascadeConsumer holds one outer RunInTx around CascadeService +
+// MarkProcessed (IDEMP-2); CascadeService.RunInTx must join that tx so
+// the PG write, outbox enqueue, and processed_events insert commit
+// together. A nested Begin would commit independently and reopen the
+// crash window the outer tx exists to close.
 func (r *TxRunner) RunInTx(ctx context.Context, fn func(ctx context.Context) error) error {
+	if _, ok := TxFromContext(ctx); ok {
+		txCtx := ctx
+		if r.events != nil {
+			if _, bound := port.EventPublisherFromContext(ctx); !bound {
+				txCtx = port.WithEventPublisher(ctx, r.events)
+			}
+		}
+		return wrapConnErr(fn(txCtx))
+	}
 	return wrapConnErr(pgcommon.RunInTxWithRetryOpts(ctx, r.pool, pgx.TxOptions{}, writeRetryOpts, func(ctx context.Context, tx pgx.Tx) error {
 		txCtx := WithTx(ctx, tx)
 		if r.events != nil {
@@ -228,9 +248,12 @@ func withPool(ctx context.Context, pool *pgcommon.Pool, fn func(pgx.Tx) error) e
 // 57 (operator intervention) and 58 (system error) are remapped here so
 // HTTP HandleError never needs to inspect a raw *pgconn.PgError.
 // puddle.ErrClosedPool is the other positively-identifiable connectivity
-// failure. Everything else — including a plain Go error a caller's own
-// RunInTx/withPool callback returns — passes through unchanged.
-// Matching iam-realm-provisioner (pgcommon v1.3.0 helpers).
+// failure. Go-level network/IO errors (io.EOF, *net.OpError, ECONNRESET)
+// are remapped too — pgx surfaces those when the TCP connection drops
+// mid-flight and they never become a *pgconn.PgError. Everything else —
+// including a plain Go error a caller's own RunInTx/withPool callback
+// returns — passes through unchanged.
+// Matching iam-realm-provisioner (pgcommon v1.3.0 helpers + isNetworkError).
 func wrapConnErr(err error) error {
 	if err == nil {
 		return nil
@@ -242,7 +265,41 @@ func wrapConnErr(err error) error {
 	if pgcommon.IsConnectionException(err) || pgcommon.IsInsufficientResources(err) || isOperatorOrSystemErrorSQLState(err) || errors.Is(err, puddle.ErrClosedPool) {
 		return domain.NewError(domain.ErrDBUnavailable, "database unavailable")
 	}
+	// pgx returns Go-level network errors when the connection is dropped
+	// mid-flight. These are not *pgconn.PgError values so the SQLSTATE
+	// checks above miss them — matching iam-realm-provisioner wrapConnErr.
+	if isNetworkError(err) {
+		return domain.NewError(domain.ErrDBUnavailable, "database unavailable")
+	}
 	return err
+}
+
+// isNetworkError reports whether err is a Go-level network/IO failure that
+// pgx surfaces when the TCP connection to Postgres is lost mid-flight
+// (container stop, network partition, ECONNRESET). These never reach the
+// SQLSTATE classification path because pgx never received a protocol
+// response — they are unambiguously availability failures (503).
+// Matching iam-realm-provisioner; pgcommon v1.3.0 has no dedicated helper.
+func isNetworkError(err error) bool {
+	if errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) {
+		return true
+	}
+	var netErr *net.OpError
+	if errors.As(err, &netErr) {
+		return true
+	}
+	var sysErr syscall.Errno
+	if errors.As(err, &sysErr) {
+		switch sysErr { //nolint:exhaustive // only transient-connection codes are availability failures
+		case syscall.ECONNRESET, syscall.ECONNREFUSED, syscall.EPIPE, syscall.ETIMEDOUT:
+			return true
+		}
+	}
+	msg := err.Error()
+	return strings.Contains(msg, "connection refused") ||
+		strings.Contains(msg, "connection reset") ||
+		strings.Contains(msg, "broken pipe") ||
+		strings.Contains(msg, "EOF")
 }
 
 // isOperatorOrSystemErrorSQLState reports whether err is a Postgres error

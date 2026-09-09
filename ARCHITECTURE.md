@@ -664,7 +664,9 @@ Every mutating operation writes the business row and the domain event in the **s
 via `TxRunner.RunInTx` — no dual-write risk. `eventbus.Publisher` (injected into `ctx` by
 `postgres.TxRunner`) owns enqueue; `ValidatingCodec` validates the payload against its registered
 JSON Schema at enqueue time (missing schema = pass-through, DLG-D24/D33), storing plain JSON in
-`outbox_events`. Wire-format (Glue) encoding happens later, transiently, at SNS-publish time only —
+`outbox_events.payload` (`TEXT`, with `outbox_normalize_payload` decoding PgBouncer SimpleProtocol
+bytea-hex on INSERT — DLG-D38, matching `iam-realm-provisioner` / `iam-org-membership`). Wire-format
+(Glue) encoding happens later, transiently, at SNS-publish time only —
 never written back to the outbox row.
 
 ### Published — `iam.delegation.events` (one dedicated topic, four types, no RoutingPublisher)
@@ -695,7 +697,7 @@ Workflow-side fallback this unblocks but does not itself build).
 |---|---|---|---|
 | `iam.membership.events` (Core) | `MembershipRevoked` | `CascadeService.EndForUser` | `"cascade"` |
 | `iam.membership.events` (Core) | `TenantMembershipsPurged` | `CascadeService.ScrubTenant` | `"offboarding"` |
-| `iam.user.events` (User Profile) | `UserUpdated` (only when decoded `status=="disabled"`; other deliveries acked without dispatch) | `CascadeService.EndForDisabledDelegate` (DLG-D26) | `"delegate_disable"` |
+| `iam.user.events` (User Profile) | `UserUpdated` (only when decoded `status=="disabled"`; other deliveries acked and recorded in `processed_events` without dispatch) | `CascadeService.EndForDisabledDelegate` (DLG-D26) | `"delegate_disable"` |
 
 `TenantMembershipsPurged` was renamed from `TenantOffboarded` by Core to avoid colliding with Realm
 Provisioner's own, differently-scoped `TenantOffboarded` event on `iam.tenant.events`, which this
@@ -703,7 +705,10 @@ service does not consume. `UserUpdated` is produced by User Profile on a third, 
 second SNS subscription onto this same queue — whose filter policy can only match on `EventType`,
 not payload content, so this service decodes every delivery and dispatches only on
 `status=="disabled"`. Three distinct idempotency buckets (`cascade`/`offboarding`/
-`delegate_disable`), keyed into `processed_events (event_id, consumer)`. DLQ:
+`delegate_disable`), keyed into `processed_events (event_id, consumer)`. Filtered
+(non-disabled) `UserUpdated` deliveries use the same `"delegate_disable"` bucket so
+redelivery does not re-decode the same no-op. Cascade PG writes, outbox enqueue, and
+the `processed_events` insert commit in one `TxRunner.RunInTx` (IDEMP-2, DLG-D38). DLQ:
 `delegation-cascade-q-dlq`, `maxReceiveCount=5`.
 
 **Consumer-side Glue decoding (DLG-D21):** Core Glue-encodes `MembershipRevoked`/
@@ -763,15 +768,19 @@ shared across the app pool and sysPool so `db.query` spans share the HTTP OTLP p
 User Profile / Org Membership calls go through `internal/adapter/outbound/httpx` (`otelhttp`) so
 they emit client spans and inject `traceparent` (DLG-D31). The reconciler wraps each job in a
 `reconciler.<job>` span. The outbox stamps `trace_id` onto every published event (LLD §14.3) so a
-create → `DelegationStarted` → Workflow reroute is one trace end-to-end.
+create → `DelegationStarted` → Workflow reroute is one trace end-to-end. Process exit flushes the
+TracerProvider then `gincommon.Shutdown` (Zap Sync) after pool drain — the same order as
+`iam-realm-provisioner` / `iam-org-membership` (DLG-D36).
 
 **Logging:** the Zap-backed logger `platform-gincommon/pkg/logger.NewLogger` returns is constructed
 once in each binary's `main()` and threaded everywhere — `gincommon.Config.Logger`,
 `platform-events`' publisher/consumer/outbox `Logger` fields, this repo's own outbound-adapter/jobs
 `Logger` interfaces, and (via `internal/adapter/outbound/postgres.NewLoggerAdapter`)
 `platform-pgcommon`'s `domain.Logger` — with no separate hand-rolled logger anywhere in the process
-(DLG-D22). Logs carry `delegation_id`, `tenant_id`, `actor`, and DEL-6 defer reasons (LLD §14.3) —
-no PII beyond what's already gateway-scoped.
+(DLG-D22). HTTP `http_request` lines come from `ObservabilityMiddlewares`' LoggingMiddleware; inbound
+`HandleError` logs unclassified 500s through that same logger (DLG-D36). Logs carry `delegation_id`,
+`tenant_id`, `actor`, and DEL-6 defer reasons (LLD §14.3) — no PII beyond what's already
+gateway-scoped.
 
 **Metrics — CLOSED (DLG-D19).** Every registered `iam_delegation_*` Prometheus instrument now has a
 real call site: `DelegationService.WithMetrics`/`CascadeService.WithMetrics` (an injected `Metrics`
@@ -805,6 +814,19 @@ emit-once at start so the first scrape is populated).
 are only actually observable via `cmd/server`'s DLG-I1/I2 on-demand HTTP entry points (DLG-D17),
 which share the same `jobs.Context`-calling code and do have a live scrape target.
 
+**Alerting (LLD §14.5, DLG-D39).** Two layers, both sourced from the metrics above and kept in
+sync across three files: `deploy/monitoring/app-alerts.yml` and `templates/prometheusrule.yaml`
+render the same flat threshold alerts (availability, 5xx rate, per-cron deferral, cascade DLQ,
+outbox dead-letters, membership-check failure rate); `deploy/monitoring/slo-rules.yml` and the
+same `templates/prometheusrule.yaml`'s `iam_delegation_slo_records`/`iam_delegation_slo_burn`
+groups add a multi-window multi-burn-rate layer (SRE book Ch. 5) on top — four SLOs (write-path
+error rate 99.9%, DLG-D3 membership-check success 99%, reconciler-defer convergence, cascade
+convergence), each a recording rule plus a fast-burn/page and slow-burn/ticket alert pair. Unlike
+the three sibling services that already have a standalone `slo-rules.yml`
+(`iam-group-mapping`/`iam-org-membership`/`iam-realm-provisioner`), this service also wires the
+same groups into the Helm-rendered `PrometheusRule` — the standalone file exists only as the
+`--rule-files` copy for environments not installing via the chart, per its own header.
+
 ### Background workers — six, not three
 
 `cmd/server/main.go` runs **six** real background goroutines under one `errgroup` (plus a
@@ -823,11 +845,14 @@ Both `cmd/server/main.go` and `cmd/reconciler/main.go` build a second `*pgcommon
 `PGBouncerMode: true` unconditionally so the BYPASSRLS pool still works under transaction pooling).
 Falls back to `DSNFromEnv()` in dev with a startup warning — cross-tenant reads then return zero
 rows under RLS (fail-quiet, not fail-loud); **both binaries now fail fast at startup if
-`SYSTEM_DATABASE_URL` is unset outside a recognized local/dev `ENVIRONMENT`** (`development`/`dev`/
-`local`, DLG-D34; originally gated on a literal `ENVIRONMENT=="production"` string compare, widened
-in DLG-D35 to every other environment name — staging/uat/etc. would otherwise silently hit the
-identical degrade-with-no-alert failure mode), rather than silently degrading every cross-tenant
-sweep query to zero rows with no alert.
+`SYSTEM_DATABASE_URL` is unset outside a recognized local/dev environment** (`development`/`dev`/
+`local`/`test`, DLG-D34; originally gated on a literal `ENVIRONMENT=="production"` string compare,
+widened in DLG-D35 to every other environment name — staging/uat/etc. would otherwise silently hit
+the identical degrade-with-no-alert failure mode), rather than silently degrading every cross-tenant
+sweep query to zero rows with no alert. The environment name is resolved via `resolveAppEnv()`
+(`APP_ENV` if set, else `ENVIRONMENT`) rather than reading `ENVIRONMENT` directly, and `test` was
+added as a fourth dev-like alias so CI doesn't need the variable set — both matching
+`iam-org-membership`'s `isDevLikeEnv` (DLG-D37).
 
 **What actually uses `sysPool`:**
 - `cmd/server`: `DelegationRepository` backing the mesh-only DLG-I3/I4 internal reads
@@ -1165,6 +1190,10 @@ this build had to make its own call ahead of any of these existing, it is called
 | DLG-D33 | Events/outbox/dedup re-audited against `iam-realm-provisioner`: enqueue moved from `postgres.txBoundPublisher` to `eventbus.Publisher` + `ValidatingCodec` (missing schema = pass-through); both binaries inject that publisher into `TxRunner` so cron events are schema-validated; the cascade consumer marks unknown types in `processed_events`, counts duplicates, and `MarkProcessed` goes through `TxRunner.RunInTx`; SQS wiring sets `Region`/`EndpointURL`/`WithConcurrency`; monthly cleanup uses bounded `Prune` instead of unbounded `CleanupExpired`. |
 | DLG-D34 | **Production-readiness sweep.** `make lint` failed outright (17 issues — unchecked `os.Setenv`/`gincommon.Shutdown` errors, a missing `//nolint:contextcheck`, missing package comments, an unexported return type, stale `//nolint:errcheck` directives) — all fixed. `go.mod`/`go.sum` had `make tidy` drift — fixed. Both binaries now fail fast at startup if `SYSTEM_DATABASE_URL` is unset when `ENVIRONMENT=production` (see sysPool architecture above), instead of silently degrading every cross-tenant sweep query and the active-gauge exporter to zero rows with no alert. Removed a stray, untracked ~88 MB `server` binary from the repo root and hardened `.gitignore`. Global statement coverage raised from 83.9% to 95.2% (coverage gate threshold bumped 70% → 95% in the same pass) — the largest single gain was direct AWS Glue Schema Registry API mocking via a real `httptest.Server` speaking AWS JSON 1.1. One real bug found along the way: a test-only `fakeLogger` field was read/written from two goroutines with no synchronization, caught by `-race` as a genuine data race. **Superseded in part by DLG-D35:** the `SYSTEM_DATABASE_URL` guard's literal `ENVIRONMENT=="production"` comparison was widened to cover every non-dev environment name. |
 | DLG-D35 | **Production-readiness sweep, prompted by a direct "is this production ready" review with a follow-up "fix all."** One real correctness bug, one config-guard gap, two hardening fixes — `go build`/`go vet`/`golangci-lint`/`go-arch-lint`/the full test suite (unit + Postgres/RLS/Valkey testcontainers) all stayed green throughout, coverage held ≥95%. (1) **Idempotency race:** `DelegationService.Create`'s dedup check was a plain Valkey `GET`-then-`SET` — LLD §9.2 always specified `SETNX`, so this was an implementation gap, not a design change. Two concurrent `POST /delegations` calls sharing one `Idempotency-Key` could both miss the `GET` and both insert a delegation. Fixed by adding `Reserve`/`Release` to `port.IdempotencyStore` (`internal/adapter/outbound/valkey/idempotency.go`, atomic `SET NX`): `Create` reserves the key before any membership check/User Profile call/insert, releases it on any failure (so a retry isn't stuck for the 24 h TTL), and a losing concurrent caller gets a new `409 idempotency_key_in_flight` (`domain.ErrIdempotencyKeyInFlight`). (2) **`SYSTEM_DATABASE_URL` guard too narrow (DLG-D34 follow-up):** widened from a literal `ENVIRONMENT=="production"` compare to a new `isDevLikeEnvironment` helper (`development`/`dev`/`local`/empty are exempt, everything else fails fast) — staging/uat previously fell through to the same "cross-tenant sweeps silently return zero rows, no alert" failure mode DLG-D34 was written to close. Also used to simplify `resolveAppEnv`'s equivalent switch. (3) **Docs bearer-token compare wasn't constant-time:** `router.go`'s `docsAuthMiddleware` switched from `!=` to `crypto/subtle.ConstantTimeCompare`, closing a timing side-channel on the Swagger/AsyncAPI gate (not the API itself). (4) **Outbound response bodies were unbounded:** added `httpx.LimitBody` (1 MiB `io.LimitReader`) and applied it at both JSON-decode call sites in the User Profile and Org Membership HTTP clients, capping worst-case memory use against a misbehaving mesh peer. |
+| DLG-D36 | Logging/metrics/traces re-checked against `iam-realm-provisioner` / `iam-org-membership`. Init path was already gincommon-native (`logger.NewLogger` → `InitTracingFromEnv` → `ObservabilityMiddlewares` → `metrics.Register` onto `MetricsRegisterer` → `events`/`pgmetrics` InitWithRegisterer → dedicated `:9090/metrics` → `otelhttp` outbound + `PropagateHeaders`). Two remaining gaps vs the siblings: (1) both binaries flushed `gincommon.Shutdown` (Zap Sync + `otel.Shutdown`) *before* the `InitTracingFromEnv` shutdown func — reversed so pool drain → TracerProvider flush → `gincommon.Shutdown`, matching the siblings' explicit shutdown block; (2) inbound `HandleError` wrote unclassified 500 JSON without logging — now logs through `ginCfg.Logger` the same way realm-provisioner's `errorLogger` does. |
+| DLG-D37 | Database connection/configuration/operations re-checked against `iam-realm-provisioner` / `iam-org-membership`. The pgcommon pass-through from DLG-D32 was already in place (`ConfigFromEnv`, `NewPool`, `RunInTxWithRetryOpts`, dual-pool `Health`/`DrainAndClose`, outbox-then-domain migrations). Remaining sibling gaps: `wrapConnErr` now maps Go-level network/IO failures to `db_unavailable` (realm-provisioner's `isNetworkError`; pgcommon v1.3.0 has no helper); `loadConfig` requires `DATABASE_URL` or the split `PG_*` vars and `MIGRATION_DATABASE_URL` whenever `PG_BOUNCER_MODE=true` (sibling `validateRequiredEnv`, with the bouncer check actually firing when Helm sets `DATABASE_URL`); both binaries key the `SYSTEM_DATABASE_URL` fail-fast off `resolveAppEnv()` (`APP_ENV`, then `ENVIRONMENT`) and treat `test` as a local/dev alias, matching `iam-org-membership`'s `isDevLikeEnv`; both pools `defer Close()` after `DrainAndClose`; `cmd/server` calls `postgres.Migrate` (variadic logger, matching sibling `RunMigrations`) instead of inlining `outbox.ApplySchema` + `RunMigrations`. |
+| DLG-D38 | Events/outbox/dedup re-checked against `iam-realm-provisioner` / `iam-org-membership`. The platform-events pass-through from DLG-D24/D33 was already in place (`ValidatingCodec` enqueue, Glue/Noop publish, `outbox.NewRunner` + `OUTBOX_*`, `ApplySchema` before the domain GRANT, SQS `GlueDecodeCodec`, `processed_events` via `withPool`). Remaining sibling gaps: `outbox_events.payload` is now `TEXT` with `outbox_normalize_payload` (PgBouncer SimpleProtocol `[]byte` as bytea hex — folded into `000001_schema`, service not deployed); `CascadeConsumer` commits cascade PG writes + `MarkProcessed` in one `TxRunner.RunInTx` (`TxRunner` joins an ambient tx so `CascadeService` does not Begin a second one); filtered (non-disabled) `UserUpdated` acks record `processed_events` like unknown-type acks; `idx_processed_events_processed_at` backs the prune path; `PROCESSED_EVENTS_TTL_DAYS` drives monthly cleanup (default 30, LLD §18.4 — not realm's dedicated 8-day CronJob). This service still uses `GlueDecodeCodec` on consume (O&M's catalog-only consume is an explicit LLD A68 deferral) and does not copy O&M's dual-topic `RoutingPublisher`. |
+| DLG-D39 | **SLO burn-rate alerting added** (LLD §14.5), on top of the existing threshold alerts in `deploy/monitoring/app-alerts.yml`/`templates/prometheusrule.yaml`. Four sibling services already carry a standalone `deploy/monitoring/slo-rules.yml` (`iam-group-mapping`/`iam-org-membership`/`iam-realm-provisioner`/`iam-tender-acl`); this service's own copy is grounded in its actual metrics and LLD §14.1/§14.5 targets, not copied verbatim from any one sibling (`iam-realm-provisioner`'s SLO-2, for example, targets its own Keycloak dependency — this service has no such call). Two SLOs are new burn-rate framings of existing threshold alerts (write-path error rate 99.9%; DLG-D3 membership-check success 99%, tightening the existing 5%-failure warning); two combine several existing per-cron/per-queue counters into one convergence signal (reconciler-defer sum across activation/expiry/review; cascade DLQ-vs-processed ratio). Unlike every sibling with a `slo-rules.yml`, this service also renders the same two groups inside `templates/prometheusrule.yaml` (`iam_delegation_slo_records`/`iam_delegation_slo_burn`) — a deliberate deviation, so the SLOs ship with every Helm install rather than needing a separate `--rule-files` deploy step; the standalone file is kept only as that fallback copy, per its own header comment. |
 
 **Known deviations from a literal reading of the LLD:**
 

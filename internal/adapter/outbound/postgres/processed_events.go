@@ -14,9 +14,8 @@ import (
 //
 // SQL goes through withPool so a caller already inside TxRunner.RunInTx
 // joins that transaction (iam-realm-provisioner / iam-org-membership
-// IDEMP-2). The cascade consumer today marks processed after the service
-// returns, so each call still opens its own short tx; withPool is what
-// makes a future in-tx mark atomic without a second code path.
+// IDEMP-2). CascadeConsumer.runCascadeAndMark opens that outer tx so
+// MarkProcessed commits atomically with the cascade write.
 type ProcessedEventsRepository struct {
 	pool *pgcommon.Pool
 }

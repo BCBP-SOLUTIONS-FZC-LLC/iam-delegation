@@ -71,6 +71,23 @@ deferred counters reach Prometheus via `cmd/server`'s DLG-I1/I2 HTTP entry point
 | `iam_delegation_cascade_processed_total` | Counter | — | `RecordCascadeProcessed()` |
 | `iam_delegation_cascade_dlq_total` | Counter | — | `RecordCascadeDLQ()` |
 
+## Alerting (LLD §14.5, DLG-D39)
+
+Two layers, both sourced from the metrics table above and kept in sync across three files:
+
+- **Threshold alerts** — `deploy/monitoring/app-alerts.yml` and `templates/prometheusrule.yaml`
+  render the same flat alerts: availability (`up`, replica count), HTTP 5xx rate (warning/critical),
+  per-cron deferral (`*_deferred_total` increase over 30m, one per CronJob), cascade DLQ growth,
+  outbox dead-letters (`platform-events`' own metric), and membership-check failure rate > 5%.
+- **SLO burn-rate alerts** — `deploy/monitoring/slo-rules.yml` and the same
+  `templates/prometheusrule.yaml`'s `iam_delegation_slo_records`/`iam_delegation_slo_burn` groups
+  add a multi-window multi-burn-rate layer (SRE book Ch. 5) on top: four SLOs (write-path error
+  rate 99.9%, DLG-D3 membership-check success 99%, reconciler-defer convergence, cascade
+  convergence), each a recording rule plus a fast-burn/page and slow-burn/ticket alert pair. Unlike
+  the sibling services that keep `slo-rules.yml` standalone, this service also wires the same
+  groups into the Helm-rendered `PrometheusRule` — the standalone file is kept only as the
+  `--rule-files` copy for environments not installing via the chart.
+
 ## Tracing and logging
 
 OTel via `platform-gincommon` (same shared lib as sibling services); structured logging via Zap,
@@ -113,11 +130,12 @@ IAM permission failures, and the `schema-gov` CLI (written this session, DLG-D20
 
 | Variable | Required | Default | Notes |
 |---|---|---|---|
-| `ENVIRONMENT` | No | `development` | |
+| `ENVIRONMENT` | No | `development` | Read by `resolveAppEnv()` only when `APP_ENV` is unset (DLG-D37) |
+| `APP_ENV` | No | — | Takes precedence over `ENVIRONMENT` in `resolveAppEnv()` — so a deploy that sets only `APP_ENV=production` cannot accidentally skip the `SYSTEM_DATABASE_URL` guard below the way a bare `ENVIRONMENT` default would (DLG-D37, matching `iam-org-membership`'s `isDevLikeEnv`) |
 | `PORT` | No | `8080` | HTTP listen port — **not** `HTTP_PORT` (no dead config remains as of this pass, see below) |
-| `DATABASE_URL` | Yes (via pgcommon) | — | App role (`delegation_app`, RLS-enforced, no BYPASSRLS) — or set `PG_HOST`/`PG_PORT`/`PG_USER`/`PG_PASSWORD`/`PG_DBNAME`/`PG_SSLMODE` individually; both forms go through `pgcommon.ConfigFromEnv` via `postgres.DSNFromEnv` |
-| `MIGRATION_DATABASE_URL` | No | falls back to `postgres.DSNFromEnv()` | BYPASSRLS role for the server's self-migration at startup; must bypass PgBouncer |
-| `SYSTEM_DATABASE_URL` | Helm: required. Go: required outside `isDevLikeEnvironment` (`development`/`dev`/`local` — both binaries fail fast at startup otherwise, DLG-D34, widened from a literal `production` check in DLG-D35); optional in local/dev | falls back to `postgres.DSNFromEnv()` with a startup warning in local/dev | BYPASSRLS pool for cross-tenant reconciler/cron sweeps, cascade `processed_events`, and the active-gauge exporter (`postgres.SystemDSNFromEnv`). Unset outside local/dev → RLS-filtered zero rows, no alert |
+| `DATABASE_URL` | Yes | — | App role (`delegation_app`, RLS-enforced, no BYPASSRLS) — or set `PG_HOST`/`PG_PORT`/`PG_USER`/`PG_PASSWORD`/`PG_DBNAME`/`PG_SSLMODE` individually; both forms go through `pgcommon.ConfigFromEnv` via `postgres.DSNFromEnv`. `loadConfig` now fails fast with an explicit error if neither form is set (DLG-D37, matching `iam-realm-provisioner`'s/`iam-org-membership`'s `validateRequiredEnv`) rather than relying on pgcommon's own error |
+| `MIGRATION_DATABASE_URL` | Required when `PG_BOUNCER_MODE=true` (DLG-D37) | falls back to `postgres.DSNFromEnv()` | BYPASSRLS role for the server's self-migration at startup; must bypass PgBouncer — migrations take a session-scoped `pg_advisory_lock`, which PgBouncer's transaction pooling cannot hold across statements |
+| `SYSTEM_DATABASE_URL` | Helm: required. Go: required outside `isDevLikeEnvironment(resolveAppEnv())` (`development`/`dev`/`local`/`test` — both binaries fail fast at startup otherwise, DLG-D34, widened from a literal `production` check in DLG-D35, then keyed off `resolveAppEnv()` with `test` added as a fourth alias in DLG-D37); optional in local/dev | falls back to `postgres.DSNFromEnv()` with a startup warning in local/dev | BYPASSRLS pool for cross-tenant reconciler/cron sweeps, cascade `processed_events`, and the active-gauge exporter (`postgres.SystemDSNFromEnv`). Unset outside local/dev → RLS-filtered zero rows, no alert |
 | `PG_STATEMENT_TIMEOUT` | No | Helm `5s` | Applied to migration + sysPool DSNs (`postgres.ApplyStatementTimeout`); ignored on the app pool when `DATABASE_URL` is set verbatim |
 | `PG_MAX_CONNS` / `PG_MIN_CONNS` / `PG_SLOW_QUERY_THRESHOLD` / `PG_BOUNCER_MODE` / `PG_SSLMODE` | No | Helm: `10` / `0` / `200ms` / `true` | Standard `pgcommon.ConfigFromEnv` vars. `PG_MIN_CONNS=0` with `PG_BOUNCER_MODE=true` is pgcommon's transaction-pooling recommendation |
 | `VALKEY_ADDR` | No | `localhost:6379` | |
@@ -135,6 +153,7 @@ IAM permission failures, and the `schema-gov` CLI (written this session, DLG-D20
 | `GLUE_REGISTRY_NAME` | No | `""` → `NoopCodec` | Set to `iam-delegation-events` to activate `GlueCodec` (added this session, DLG-D20) |
 | `OUTBOX_POLL_INTERVAL` / `OUTBOX_BATCH_SIZE` / `OUTBOX_MAX_ATTEMPTS` / `OUTBOX_DRAIN_TIMEOUT` / `OUTBOX_PUBLISH_CONCURRENCY` / `OUTBOX_PUBLISH_TIMEOUT` / `OUTBOX_STARTUP_JITTER` / `OUTBOX_CLAIM_LEASE_DURATION` | No | `500ms`/`50`/`5`/`30s`/`4`/`10s`/`2s`/`10m` | `outbox.Config` tunables — matches `iam-org-membership`'s identical env-var surface (DLG-D24) |
 | `OUTBOX_PRUNE_INTERVAL` / `OUTBOX_PRUNE_RETENTION` / `OUTBOX_PRUNE_LIMIT` | No | `24h` / `168h` (7d) / `1000` | Daily sweep calling `outbox.Runner.PrunePublished` — matches `iam-user-profile`'s `runMaintenanceSweep`; without it `outbox_events` grows unbounded (DLG-D24) |
+| `PROCESSED_EVENTS_TTL_DAYS` | No | `30` | Monthly `delegation-cleanup` prune window for `processed_events` (LLD §18.4, DLG-D38). Realm-provisioner defaults to 8 with a dedicated CronJob; this service keeps the LLD's 30-day window bundled into cleanup. |
 | `OTEL_EXPORTER_OTLP_ENDPOINT` | No | — | |
 | `DOCS_ENABLED` | No | `true` outside `production` | Gates `/swagger`, `/asyncapi` |
 | `DOCS_AUTH_TOKEN` | No | — | Bearer-gates docs routes when `DOCS_ENABLED=true` in production — compared via `crypto/subtle.ConstantTimeCompare`, not `!=` (DLG-D35) |

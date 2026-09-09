@@ -28,7 +28,6 @@ import (
 	"github.com/BCBP-SOLUTIONS-FZC-LLC/platform-events/pkg/outbox"
 	gincommon "github.com/BCBP-SOLUTIONS-FZC-LLC/platform-gincommon/pkg/gincommon"
 	gclogger "github.com/BCBP-SOLUTIONS-FZC-LLC/platform-gincommon/pkg/logger"
-	pgmigrate "github.com/BCBP-SOLUTIONS-FZC-LLC/platform-pgcommon/pkg/migrate"
 	pgcommon "github.com/BCBP-SOLUTIONS-FZC-LLC/platform-pgcommon/pkg/pgcommon"
 	"github.com/BCBP-SOLUTIONS-FZC-LLC/platform-pgcommon/pkg/pgmetrics"
 
@@ -93,7 +92,17 @@ func run(logger Logger) error {
 	//      the same middleware slice; gincommon's metrics.Init is sync.Once.
 	//   3. metrics.Register() + events/pgmetrics Init immediately after,
 	//      before DB or outbound clients.
+	// Telemetry shutdown must run AFTER pool DrainAndClose (those defers
+	// register later) and in this order, matching iam-realm-provisioner /
+	// iam-org-membership: flush the TracerProvider first, then
+	// gincommon.Shutdown (which also calls otel.Shutdown and Syncs Zap).
+	// Defers are LIFO, so Shutdown is registered first.
 	shutdownTracing := gincommon.InitTracingFromEnv()
+	defer func() {
+		if shutdownErr := gincommon.Shutdown(logger); shutdownErr != nil {
+			logger.Error("telemetry shutdown failed", map[string]interface{}{"error": shutdownErr.Error()})
+		}
+	}()
 	defer shutdownTracing()
 	ginCfg := gincommon.Config{
 		Logger:       logger,
@@ -104,11 +113,6 @@ func run(logger Logger) error {
 	appMetrics := metrics.Register()
 	events.InitWithRegisterer(ginCfg.ServiceName, ginCfg.BuildVersion, gincommon.MetricsRegisterer())
 	pgmetrics.InitWithRegisterer(ginCfg.ServiceName, ginCfg.BuildVersion, gincommon.MetricsRegisterer())
-	defer func() {
-		if shutdownErr := gincommon.Shutdown(logger); shutdownErr != nil {
-			logger.Error("telemetry shutdown failed", map[string]interface{}{"error": shutdownErr.Error()})
-		}
-	}()
 
 	// Database — pgcommon.ConfigFromEnv reads DATABASE_URL/PG_* directly so
 	// pool sizing, PgBouncer mode, and DSN assembly have exactly one
@@ -134,10 +138,7 @@ func run(logger Logger) error {
 	// every fresh-database bring-up. Crucially, migrations must also precede
 	// pool construction — the domain migration creates the delegation_app role,
 	// so opening the app pool before it runs fails on a fresh database.
-	if err := outbox.ApplySchema(baseCtx, &pgmigrate.Runner{DSN: migratorDSN}); err != nil {
-		return fmt.Errorf("apply outbox schema: %w", err)
-	}
-	if err := pgadapter.RunMigrations(baseCtx, migratorDSN, pgadapter.NewLoggerAdapter(logger)); err != nil {
+	if err := pgadapter.Migrate(baseCtx, migratorDSN, logger); err != nil {
 		return fmt.Errorf("run migrations: %w", err)
 	}
 
@@ -154,10 +155,11 @@ func run(logger Logger) error {
 	if err != nil {
 		return fmt.Errorf("connect app pool: %w", err)
 	}
-	// DrainAndClose waits for in-flight WithConn/RunInTx then force-closes
-	// — pgcommon's documented graceful path (iam-realm-provisioner). A 30s
-	// budget matches the HTTP/outbox drain above so a hung checkout cannot
-	// block process exit indefinitely.
+	// Close is the panic/early-return safety net; DrainAndClose is the
+	// graceful path. pgcommon forbids calling them concurrently — these
+	// defers are LIFO so DrainAndClose runs first, then Close (idempotent
+	// after DrainAndClose). Matching iam-realm-provisioner.
+	defer pool.Close()
 	defer func() {
 		drainCtx, cancelDrain := context.WithTimeout(context.Background(), 30*time.Second)
 		defer cancelDrain()
@@ -182,6 +184,7 @@ func run(logger Logger) error {
 	if sysDSN == dsn {
 		logger.Warn("SYSTEM_DATABASE_URL not set — sysPool reuses app DSN; cross-tenant cron/internal sweeps will be RLS-filtered", nil)
 	}
+	defer sysPool.Close()
 	defer func() {
 		drainCtx, cancelDrain := context.WithTimeout(context.Background(), 30*time.Second)
 		defer cancelDrain()

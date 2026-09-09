@@ -71,13 +71,35 @@ func TestHandleError_EverySentinel(t *testing.T) {
 	}
 }
 
+// capturingLogger records Error calls so tests can assert unhandled 500s
+// go through the gincommon-backed logger NewRouter installs.
+type capturingLogger struct {
+	errors []string
+}
+
+func (capturingLogger) Debug(string, map[string]interface{}) {}
+func (capturingLogger) Info(string, map[string]interface{})  {}
+func (capturingLogger) Warn(string, map[string]interface{})  {}
+func (l *capturingLogger) Error(msg string, _ map[string]interface{}) {
+	l.errors = append(l.errors, msg)
+}
+
 // TestHandleError_UnrecognizedError asserts a plain (non-*domain.Error)
-// error becomes a generic 500 rather than leaking implementation detail.
+// error becomes a generic 500 rather than leaking implementation detail,
+// and that the 500 is logged through the gincommon logger (iam-realm-provisioner).
 func TestHandleError_UnrecognizedError(t *testing.T) {
+	log := &capturingLogger{}
+	prev := errorLogger
+	errorLogger = log
+	t.Cleanup(func() { errorLogger = prev })
+
 	c, w := newTestGinContext()
 	HandleError(c, errors.New("some internal plumbing failure"))
 	if w.Code != http.StatusInternalServerError {
 		t.Fatalf("got status %d, want %d", w.Code, http.StatusInternalServerError)
+	}
+	if len(log.errors) != 1 || log.errors[0] != "unhandled 500 error" {
+		t.Fatalf("unhandled 500 must log through gincommon logger, got %v", log.errors)
 	}
 }
 

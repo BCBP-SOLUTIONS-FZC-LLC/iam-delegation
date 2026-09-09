@@ -92,6 +92,36 @@ func (passthroughTx) RunInTx(ctx context.Context, fn func(context.Context) error
 	return fn(ctx)
 }
 
+// recordingTx counts RunInTx invocations and whether MarkProcessed ran
+// inside the same callback — the IDEMP-2 seam CascadeConsumer must keep.
+type recordingTx struct {
+	calls       int
+	markedInTx  int
+	cascadeInTx int
+	idem        *fakeIdempotencyStore
+	cascade     *fakeCascadeService
+}
+
+func (r *recordingTx) RunInTx(ctx context.Context, fn func(context.Context) error) error {
+	r.calls++
+	marksBefore := 0
+	if r.idem != nil {
+		marksBefore = len(r.idem.markCalls)
+	}
+	cascadeBefore := 0
+	if r.cascade != nil {
+		cascadeBefore = len(r.cascade.endForUserCalls)
+	}
+	err := fn(ctx)
+	if r.idem != nil && len(r.idem.markCalls) > marksBefore {
+		r.markedInTx++
+	}
+	if r.cascade != nil && len(r.cascade.endForUserCalls) > cascadeBefore {
+		r.cascadeInTx++
+	}
+	return err
+}
+
 func newTestConsumer(cascade cascadeService, idem idempotencyStore, bindGUC GUCBinder) *CascadeConsumer {
 	return NewCascadeConsumer(cascade, idem, bindGUC, passthroughTx{}, noopLogger{})
 }
@@ -154,6 +184,60 @@ func TestHandle_MembershipRevoked_DispatchesToEndForUser(t *testing.T) {
 	}
 	if !idem.processed[consumerCascade+":"+eventID] {
 		t.Fatalf("expected event marked processed under %q bucket", consumerCascade)
+	}
+}
+
+func TestHandle_MembershipRevoked_MarksProcessedInsideSameTx(t *testing.T) {
+	cascade := &fakeCascadeService{}
+	idem := newFakeIdempotencyStore()
+	tx := &recordingTx{idem: idem, cascade: cascade}
+	c := NewCascadeConsumer(cascade, idem, fakeGUCBinder(&[]gucBindCall{}), tx, noopLogger{})
+
+	env := mustEnvelope(t, uuid.New().String(), domain.EventMembershipRevoked, domain.MembershipRevokedPayload{
+		TenantID: uuid.New(), UserID: uuid.New(), ActorID: uuid.New(),
+	})
+	if err := c.Handle(context.Background(), env); err != nil {
+		t.Fatalf("Handle returned error: %v", err)
+	}
+	if tx.calls != 1 {
+		t.Fatalf("expected a single RunInTx wrapping cascade + MarkProcessed, got %d", tx.calls)
+	}
+	if tx.cascadeInTx != 1 || tx.markedInTx != 1 {
+		t.Fatalf("EndForUser and MarkProcessed must run inside the same tx (cascadeInTx=%d markedInTx=%d)", tx.cascadeInTx, tx.markedInTx)
+	}
+}
+
+func TestHandle_NilTx_MarksDirectly(t *testing.T) {
+	cascade := &fakeCascadeService{}
+	idem := newFakeIdempotencyStore()
+	c := NewCascadeConsumer(cascade, idem, fakeGUCBinder(&[]gucBindCall{}), nil, noopLogger{})
+
+	eventID := uuid.New().String()
+	env := mustEnvelope(t, eventID, domain.EventMembershipRevoked, domain.MembershipRevokedPayload{
+		TenantID: uuid.New(), UserID: uuid.New(), ActorID: uuid.New(),
+	})
+	if err := c.Handle(context.Background(), env); err != nil {
+		t.Fatalf("Handle returned error: %v", err)
+	}
+	if len(cascade.endForUserCalls) != 1 {
+		t.Fatalf("expected EndForUser to run")
+	}
+	if !idem.processed[consumerCascade+":"+eventID] {
+		t.Fatalf("nil tx must still MarkProcessed")
+	}
+}
+
+func TestHandle_NilTx_MarkError_Propagates(t *testing.T) {
+	cascade := &fakeCascadeService{}
+	idem := newFakeIdempotencyStore()
+	idem.markProcessedErr = errors.New("db down")
+	c := NewCascadeConsumer(cascade, idem, fakeGUCBinder(&[]gucBindCall{}), nil, noopLogger{})
+
+	env := mustEnvelope(t, uuid.New().String(), domain.EventMembershipRevoked, domain.MembershipRevokedPayload{
+		TenantID: uuid.New(), UserID: uuid.New(), ActorID: uuid.New(),
+	})
+	if err := c.Handle(context.Background(), env); err == nil {
+		t.Fatalf("expected mark-processed error to propagate")
 	}
 }
 
@@ -367,8 +451,9 @@ func TestHandle_UserUpdatedDisabled_DispatchesToEndForDisabledDelegate(t *testin
 // TestHandle_UserUpdatedNotDisabled_AcksWithoutDispatching covers the common
 // case: this queue's filter policy admits every UserUpdated on
 // iam.user.events (it can only filter on EventType), so most deliveries are
-// unrelated field changes and must be acked without calling the cascade or
-// touching idempotency state at all.
+// unrelated field changes and must be acked without calling the cascade,
+// while still recording processed_events so redelivery does not re-decode
+// the same no-op (IDEMP-2, matching unknown-type ack).
 func TestHandle_UserUpdatedNotDisabled_AcksWithoutDispatching(t *testing.T) {
 	tests := []struct {
 		name    string
@@ -394,13 +479,34 @@ func TestHandle_UserUpdatedNotDisabled_AcksWithoutDispatching(t *testing.T) {
 			if len(cascade.endForDisabledDelegateCalls) != 0 {
 				t.Fatalf("EndForDisabledDelegate must not be called")
 			}
-			if len(idem.markCalls) != 0 {
-				t.Fatalf("MarkProcessed should not have been called")
+			if len(idem.markCalls) != 1 {
+				t.Fatalf("MarkProcessed must be called for a filtered UserUpdated (IDEMP-2) — got %v", idem.markCalls)
 			}
-			if len(idem.processed) != 0 {
-				t.Fatalf("IsProcessed should not have been checked either — no cascade work means nothing to dedup")
+			if !idem.processed[consumerDelegateDisable+":"+env.ID] {
+				t.Fatalf("expected event marked processed under %q bucket", consumerDelegateDisable)
 			}
 		})
+	}
+}
+
+func TestHandle_UserUpdatedNotDisabled_AlreadyProcessed_SkipsMark(t *testing.T) {
+	cascade := &fakeCascadeService{}
+	idem := newFakeIdempotencyStore()
+	eventID := uuid.New().String()
+	idem.processed[consumerDelegateDisable+":"+eventID] = true
+	c := newTestConsumer(cascade, idem, fakeGUCBinder(&[]gucBindCall{}))
+
+	env := mustUserUpdatedEnvelope(t, eventID, uuid.New(), domain.UserUpdatedPayload{
+		UserID: uuid.New(), ChangedFields: []string{"display_name"},
+	})
+	if err := c.Handle(context.Background(), env); err != nil {
+		t.Fatalf("expected nil (ack) for an already-processed filtered UserUpdated, got %v", err)
+	}
+	if len(cascade.endForDisabledDelegateCalls) != 0 {
+		t.Fatalf("EndForDisabledDelegate must not be called")
+	}
+	if len(idem.markCalls) != 0 {
+		t.Fatalf("MarkProcessed must not be called again, got %v", idem.markCalls)
 	}
 }
 
@@ -554,7 +660,7 @@ func TestHandleUserDisabled_MalformedPayload_ReturnsError(t *testing.T) {
 		Payload:  json.RawMessage(`{"user_id": 99999}`), // int instead of UUID string
 	}
 
-	err := c.handleUserDisabled(context.Background(), env)
+	err := c.handleUserDisabled(context.Background(), env, consumerDelegateDisable, env.ID)
 	require.Error(t, err, "handleUserDisabled must return a decode error for a malformed user_id")
 	require.Empty(t, cascade.endForDisabledDelegateCalls)
 }

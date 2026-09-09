@@ -100,14 +100,18 @@ CREATE TABLE public.delegation_tenant_settings (
 
 -- ── processed_events (LLD §7.2.3) ─────────────────────────────────────────
 -- Idempotency ledger for the inbound cascade consumer
--- (consumer ∈ {cascade, offboarding}). Exempt from RLS (operational).
--- Monthly-pruned (LLD §18.4).
+-- (consumer ∈ {cascade, offboarding, delegate_disable}). Exempt from RLS
+-- (operational). Monthly-pruned (LLD §18.4).
 CREATE TABLE public.processed_events (
     event_id     text NOT NULL,
     consumer     text NOT NULL,
     processed_at timestamp with time zone NOT NULL DEFAULT now(),
     CONSTRAINT processed_events_pkey PRIMARY KEY (event_id, consumer)
 );
+
+-- Prune path (delegation-cleanup / ProcessedEventsRepository.Prune) filters
+-- on processed_at; matching iam-realm-provisioner / iam-org-membership.
+CREATE INDEX idx_processed_events_processed_at ON public.processed_events (processed_at);
 
 -- ── rls_violation_log (sampled audit trail) ───────────────────────────────
 -- RLS is DISABLED on this table (below) so log_rls_violation() — which
@@ -263,6 +267,43 @@ GRANT EXECUTE ON FUNCTION public.rls_check_tenant(uuid, text)        TO delegati
 -- the application's INSERT both fail with "permission denied for table
 -- outbox_events" (SQLSTATE 42501).
 GRANT SELECT, INSERT, UPDATE, DELETE ON public.outbox_events TO delegation_app;
+
+-- ─────────────────────────────────────────────────────────────────────────
+-- outbox_events customization — platform-events creates outbox_events with
+-- a JSONB payload column (via outbox.ApplySchema, which postgres.Migrate
+-- runs BEFORE this domain migration). pgx encodes []byte as bytea hex in
+-- PgBouncer SimpleProtocol mode, which is invalid for jsonb; text accepts
+-- the raw bytes as-is, and the outbox runner reads the value back via JSON
+-- unmarshal, which works identically with text.
+-- Matching iam-realm-provisioner / iam-org-membership.
+--
+-- This service is not yet deployed, so the ALTER is folded into the single
+-- 000001_schema migration (same "runs once, against an empty DB" invariant
+-- as the siblings). A USING-clause ALTER COLUMN TYPE takes an ACCESS
+-- EXCLUSIVE lock and rewrites the table; on a fresh empty outbox that is
+-- instant. Do not reuse this file as a template for re-running against a
+-- populated outbox_events.
+-- ─────────────────────────────────────────────────────────────────────────
+ALTER TABLE public.outbox_events ALTER COLUMN payload TYPE text USING payload::text;
+
+-- pgx SimpleProtocol encodes []byte as bytea hex (\x...) even for text
+-- columns. This trigger decodes it back to UTF-8 text on every INSERT so
+-- the outbox runner can JSON-unmarshal the payload without errors.
+CREATE OR REPLACE FUNCTION public.outbox_normalize_payload()
+RETURNS trigger AS $$
+BEGIN
+  IF left(NEW.payload, 2) = '\x' THEN
+    NEW.payload = convert_from(decode(substring(NEW.payload FROM 3), 'hex'), 'UTF8');
+  END IF;
+  RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+
+CREATE TRIGGER trg_outbox_normalize_payload
+BEFORE INSERT ON public.outbox_events
+FOR EACH ROW EXECUTE FUNCTION public.outbox_normalize_payload();
+
+GRANT EXECUTE ON FUNCTION public.outbox_normalize_payload() TO delegation_app;
 
 -- delegation_migrator: applies schema migrations and backs the reconciler
 -- jobs / cascade consumer's cross-tenant reads (LLD §7.4). Holds BYPASSRLS.

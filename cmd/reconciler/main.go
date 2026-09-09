@@ -61,7 +61,11 @@ func run(logger Logger) error {
 	// matching iam-realm-provisioner's reconciler: InitTracingFromEnv,
 	// then ObservabilityMiddlewares so Register() picks up {service,
 	// version} const labels, then a job-root span.
+	// Same LIFO order as cmd/server / iam-realm-provisioner: drain pools
+	// (registered later) → shutdownTracing → gincommon.Shutdown (Zap Sync).
 	shutdownTracing := gincommon.InitTracingFromEnv()
+	//nolint:errcheck // best-effort flush on exit; the job's own exit code is what matters
+	defer func() { _ = gincommon.Shutdown(logger) }()
 	defer shutdownTracing()
 	serviceName := getEnv("APP_NAME", "iam-delegation-reconciler")
 	_ = gincommon.ObservabilityMiddlewares(gincommon.Config{
@@ -70,8 +74,6 @@ func run(logger Logger) error {
 		BuildVersion: getEnv("BUILD_VERSION", "dev"),
 	})
 	reconcilerMetrics := metrics.Register()
-	//nolint:errcheck // best-effort flush on exit; the job's own exit code is what matters
-	defer func() { _ = gincommon.Shutdown(logger) }()
 
 	ctx, jobSpan := otel.Tracer(serviceName).Start(ctx, "reconciler."+*jobName)
 	defer jobSpan.End()
@@ -124,15 +126,14 @@ func run(logger Logger) error {
 	}
 	defer drainPools()
 
-	// Fail fast in production rather than let the dev-safe fallback below
-	// degrade silently: every cross-tenant sweep this binary runs
-	// (ListExpiringBefore/FindDueForDailyWarn/FindDueForAutoEnd/
-	// HardPurgeSoftDeletedBefore) would then execute under RLS with no
-	// tenant GUC bound and return zero rows instead of erroring — no alert
-	// fires, since that's a different failure mode than the existing
-	// "deferred" counters/alerts cover.
-	if getEnv("ENVIRONMENT", "development") == "production" && os.Getenv("SYSTEM_DATABASE_URL") == "" {
-		return fmt.Errorf("SYSTEM_DATABASE_URL is required when ENVIRONMENT=production (must be the BYPASSRLS delegation_migrator role, see .claude/database.md)")
+	// Fail fast outside local/dev rather than let the dev-safe fallback
+	// below degrade silently: every cross-tenant sweep this binary runs
+	// would then execute under RLS with no tenant GUC bound and return
+	// zero rows instead of erroring — no alert fires. Matching cmd/server
+	// loadConfig's isDevLikeEnvironment guard (DLG-D35), not a literal
+	// ENVIRONMENT=="production" compare.
+	if !isDevLikeEnvironment(resolveAppEnv()) && os.Getenv("SYSTEM_DATABASE_URL") == "" {
+		return fmt.Errorf("SYSTEM_DATABASE_URL is required outside local/dev environments (must be the BYPASSRLS delegation_migrator role, see .claude/database.md)")
 	}
 	sysDSN := pgadapter.SystemDSNFromEnv()
 	sysCfg := pgadapter.SystemPoolConfig(sysDSN, logger)
@@ -173,6 +174,10 @@ func run(logger Logger) error {
 	if err != nil {
 		return err
 	}
+	processedEventsTTLDays, err := getEnvIntVar("PROCESSED_EVENTS_TTL_DAYS", 30)
+	if err != nil {
+		return err
+	}
 
 	// jobs.Cleanup (delegation-cleanup, LLD §18.4/GAP-09) only ever runs
 	// through this binary — cmd/server has no HTTP entry point for it
@@ -189,15 +194,16 @@ func run(logger Logger) error {
 	// only via cmd/server's DLG-I1/I2 on-demand entry points. See
 	// .claude/operations.md.
 	jctx := &jobs.Context{
-		Delegations:     pgadapter.NewDelegationRepository(sysPool),
-		UserProfile:     userProfileClient,
-		TxRunner:        txRunner,
-		BindTenantGUC:   pgadapter.WithTenantGUC,
-		Logger:          logger,
-		BatchLimit:      batchLimit,
-		RetentionDays:   retentionDays,
-		ProcessedEvents: processedEvents,
-		Metrics:         reconcilerMetrics,
+		Delegations:            pgadapter.NewDelegationRepository(sysPool),
+		UserProfile:            userProfileClient,
+		TxRunner:               txRunner,
+		BindTenantGUC:          pgadapter.WithTenantGUC,
+		Logger:                 logger,
+		BatchLimit:             batchLimit,
+		RetentionDays:          retentionDays,
+		ProcessedEvents:        processedEvents,
+		ProcessedEventsTTLDays: processedEventsTTLDays,
+		Metrics:                reconcilerMetrics,
 	}
 
 	var result jobs.Result
