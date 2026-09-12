@@ -73,7 +73,7 @@ func run(logger Logger) error {
 		ServiceName:  serviceName,
 		BuildVersion: getEnv("BUILD_VERSION", "dev"),
 	})
-	reconcilerMetrics := metrics.Register()
+	reconcilerMetrics := metrics.Register(metrics.RegisterConfig{Environment: resolveAppEnv()})
 
 	ctx, jobSpan := otel.Tracer(serviceName).Start(ctx, "reconciler."+*jobName)
 	defer jobSpan.End()

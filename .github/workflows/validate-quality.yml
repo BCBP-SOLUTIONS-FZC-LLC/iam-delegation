@@ -69,6 +69,14 @@ jobs:
       - name: Reject non-transaction-local SET app.tenant_id
         run: bash .github/scripts/check-forbidden-set-guc.sh
 
+      # Enterprise Platform Observability Standard — metric naming conventions.
+      # Enforces suffix rules (_total / _seconds / _gauge), namespace classification
+      # (platform_* vs iam_delegation_*), and high-cardinality label prohibition on
+      # shared metrics.  Runtime label invariants are covered by
+      # TestMetricsConformanceStandard in internal/adapter/outbound/metrics/.
+      - name: Metric namespacing and naming conventions
+        run: bash .github/scripts/check-metric-namespacing.sh
+
       - name: Format check
         run: |
           unformatted=$(gofmt -l cmd/ internal/ pkg/ 2>/dev/null || true)

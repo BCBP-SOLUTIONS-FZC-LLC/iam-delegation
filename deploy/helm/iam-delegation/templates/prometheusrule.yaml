@@ -175,19 +175,21 @@ spec:
               returning 5xx errors. This exceeds the critical threshold —
               escalate immediately, the service is severely degraded.
 
-    # ── delegation-cascade-q DLQ — LLD §14.5 "cascade_dlq > 0 (warning)" ───
+    # ── delegation-cascade-q — legacy alert (compatibility period) ──────────
+    # Uses iam_delegation_cascade_dlq_total (Tier 3 legacy metric).
+    # The canonical alert is IamDelegationCascadeMessagesFailing below
+    # (iam_delegation_cascade_platform group, Tier 1 platform_messages_failed_total).
+    # Remove after dashboards migrate to platform_messages_failed_total.
     - name: iam_delegation_cascade
       rules:
         - alert: IamDelegationCascadeDLQGrowing
-          # Same counter-vs-increase() reasoning as IamDelegationExpiryDeferred
-          # above: iam_delegation_cascade_dlq_total only ever goes up, so
-          # increase()-over-a-window is used instead of the raw value.
           expr: |
             sum(increase(iam_delegation_cascade_dlq_total{job={{ include "iam-delegation.fullname" . | quote }}}[30m])) > 0
           for: 5m
           labels:
             severity: warning
             team: platform
+            compatibility_period: "true"
           annotations:
             summary: iam-delegation delegation-cascade-q DLQ is receiving messages
             description: >-
@@ -196,6 +198,30 @@ spec:
               delegation-cascade-q-dlq after exhausting retries (or failing
               schema decode). Inspect the DLQ payloads and consumer logs;
               once fixed, redrive them back to delegation-cascade-q.
+
+    # ── Tier 1 platform_* cascade alert (canonical) ───────────────────────────
+    # Primary on-call signal; mirrors deploy/monitoring/app-alerts.yml's
+    # iam_delegation_cascade_platform group.
+    - name: iam_delegation_cascade_platform
+      rules:
+        - alert: IamDelegationCascadeMessagesFailing
+          expr: |
+            increase(platform_messages_failed_total{
+              service="iam-delegation",
+              queue="delegation-cascade-q"
+            }[30m]) > 0
+          for: 5m
+          labels:
+            severity: warning
+            team: platform
+          annotations:
+            summary: iam-delegation cascade consumer is failing messages
+            description: >-
+              {{ "{{ $value | humanize }}" }} cascade message(s) returned a
+              handler error in the last 30 minutes — SQS will redeliver up to
+              maxReceiveCount=5 times before routing to the DLQ
+              (delegation-cascade-q-dlq). Inspect consumer logs and the DLQ
+              payload if retries are exhausted (LLD §10.1).
 
     # ── Transactional outbox dead-letter queue — outbox_dead_letters_total is
     #    platform-events' own metric (registered automatically by
@@ -304,14 +330,28 @@ spec:
             + sum(increase(iam_delegation_expiry_deferred_total{job={{ include "iam-delegation.fullname" . | quote }}}[1h]))
             + sum(increase(iam_delegation_review_deferred_total{job={{ include "iam-delegation.fullname" . | quote }}}[1h]))
 
-        # delegation-cascade-q cascade error rate — DLQ deliveries over
-        # total attempted (processed + DLQ'd).
+        # delegation-cascade-q cascade error rate — legacy Tier 3 (compatibility
+        # period). Kept so dashboards continue working unchanged. Remove once all
+        # consumers migrate to iam:delegation_cascade_error_rate:ratio_rate_5m_platform.
         - record: iam:delegation_cascade_error_rate:ratio_rate_5m
           expr: |
             sum(rate(iam_delegation_cascade_dlq_total{job={{ include "iam-delegation.fullname" . | quote }}}[5m]))
             /
             clamp_min(sum(rate(iam_delegation_cascade_processed_total{job={{ include "iam-delegation.fullname" . | quote }}}[5m]))
               + sum(rate(iam_delegation_cascade_dlq_total{job={{ include "iam-delegation.fullname" . | quote }}}[5m])), 0.001)
+
+        # delegation-cascade-q cascade error rate — Tier 1 platform_* (canonical).
+        # Uses platform_messages_failed/processed_total{service,queue} const labels
+        # injected by WrapRegistererWith — no job label selector needed.
+        - record: iam:delegation_cascade_error_rate:ratio_rate_5m_platform
+          expr: |
+            sum(rate(platform_messages_failed_total{service="iam-delegation",queue="delegation-cascade-q"}[5m]))
+            /
+            clamp_min(
+              sum(rate(platform_messages_processed_total{service="iam-delegation",queue="delegation-cascade-q"}[5m]))
+                + sum(rate(platform_messages_failed_total{service="iam-delegation",queue="delegation-cascade-q"}[5m])),
+              0.001
+            )
 
     - name: iam_delegation_slo_burn
       interval: 1m
@@ -396,9 +436,11 @@ spec:
               data is lost (DEL-6 fail-open), but this is a real freshness
               gap. Check iam-user-profile's health.
 
-        # SLO-4: cascade DLQ errors not self-healing.
+        # SLO-4: cascade convergence (Tier 1 platform_* canonical).
+        # References iam:delegation_cascade_error_rate:ratio_rate_5m_platform;
+        # the legacy rule ratio_rate_5m is kept for dashboard compatibility.
         - alert: IAMSLO4_DelegationCascadeErrorRateElevated
-          expr: iam:delegation_cascade_error_rate:ratio_rate_5m > 0
+          expr: iam:delegation_cascade_error_rate:ratio_rate_5m_platform > 0
           for: 20m
           labels:
             severity: ticket
@@ -407,8 +449,8 @@ spec:
           annotations:
             summary: "SLO-4: iam-delegation cascade convergence not self-healing"
             description: >-
-              iam:delegation_cascade_error_rate:ratio_rate_5m has been
-              non-zero for 20m+. delegation-cascade-q deliveries should
+              iam:delegation_cascade_error_rate:ratio_rate_5m_platform has
+              been non-zero for 20m+. delegation-cascade-q deliveries should
               converge on redelivery — a sustained non-zero rate means a
               persistent handler error or schema-decode failure, not
               transient contention. Inspect delegation-cascade-q-dlq

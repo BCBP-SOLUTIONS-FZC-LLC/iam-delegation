@@ -27,6 +27,10 @@ const (
 	consumerDelegateDisable = "delegate_disable"
 )
 
+// cascadeQueueName is the logical name of the SQS queue this consumer reads
+// from — used as the queue label value on platform_messages_* Tier 1 metrics.
+const cascadeQueueName = "delegation-cascade-q"
+
 // systemPrincipal is the GUC user identity bound for this consumer's
 // system-initiated writes — there is no per-request caller identity for an
 // event delivery. Mirrors the "iam-system" convention used elsewhere in the
@@ -144,6 +148,13 @@ func NewCascadeConsumer(cascade cascadeService, idempotency idempotencyStore, bi
 // queue's redrive policy (maxReceiveCount=5) once this handler keeps
 // returning an error — no explicit DLQ-routing code belongs here.
 func (c *CascadeConsumer) Handle(ctx context.Context, env events.Envelope[json.RawMessage]) error {
+	// Count every SQS delivery regardless of outcome (duplicate, unknown type,
+	// decode error, success) — the platform_messages_received_total Tier 1
+	// signal is the broadest visibility into queue throughput.
+	if metrics.Live != nil {
+		metrics.Live.RecordMessageReceived(cascadeQueueName)
+	}
+
 	eventID, err := uuid.Parse(env.ID)
 	if err != nil || eventID == uuid.Nil {
 		c.logger.Error("envelope has invalid or missing id — cannot dedup, acknowledging to prevent redelivery loop", map[string]interface{}{

@@ -24,7 +24,7 @@ func TestSkipDuplicate_IsProcessedError_Propagates(t *testing.T) {
 
 func TestSkipDuplicate_Duplicate_RecordsMetric(t *testing.T) {
 	prev := metrics.Live
-	m, err := metrics.RegisterOn(prometheus.NewRegistry())
+	m, err := metrics.RegisterOn(prometheus.NewRegistry(), metrics.RegisterConfig{})
 	require.NoError(t, err)
 	metrics.Live = m
 	t.Cleanup(func() { metrics.Live = prev })
@@ -65,7 +65,7 @@ func TestMarkProcessedInTx_WithTx_PropagatesMarkError(t *testing.T) {
 
 func TestAckUnknown_RecordsMetricAndMarksProcessed(t *testing.T) {
 	prev := metrics.Live
-	m, err := metrics.RegisterOn(prometheus.NewRegistry())
+	m, err := metrics.RegisterOn(prometheus.NewRegistry(), metrics.RegisterConfig{})
 	require.NoError(t, err)
 	metrics.Live = m
 	t.Cleanup(func() { metrics.Live = prev })
