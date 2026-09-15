@@ -101,6 +101,12 @@ type GUCBinder func(ctx context.Context, tenantID uuid.UUID, userID string) cont
 // events.Handler function type
 // (func(ctx, events.Envelope[json.RawMessage]) error) and is passed
 // directly to events.NewSQSConsumerWithClient (see wiring.go).
+//
+// Gap-6 PRE-DEPLOY ACTION REQUIRED (infrastructure team):
+// The second SNS subscription (iam.user.events → delegation-cascade-q,
+// filter: EventType=UserUpdated) is NOT YET PROVISIONED in any environment.
+// Until it is added, the delegate-disabled cascade (EndForDisabledDelegate)
+// will never fire. Add via Terraform/CDK before deploying to production.
 type CascadeConsumer struct {
 	cascade     cascadeService
 	idempotency idempotencyStore

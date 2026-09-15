@@ -23,10 +23,14 @@ import (
 // endpoint is tenant-scoped (unlike iam-catalog-admin's tenant-agnostic
 // internal routes), so tenantID must be the real tenant being checked, not
 // a placeholder.
+// Gap-9 fix: x-caller-service identifies this service so org_membership's
+// I-15 metrics can distinguish delegation from tender-acl (previously both
+// showed as "unknown" in the caller label).
 func setInternalHeaders(req *http.Request, tenantID uuid.UUID) {
 	req.Header.Set("x-user-id", "iam-system")
 	req.Header.Set("x-tenant-id", tenantID.String())
 	req.Header.Set("x-tenant-roles", "iam-system")
+	req.Header.Set("x-caller-service", "iam-delegation")
 }
 
 // propagate copies the caller's trace context onto the outbound request.

@@ -1457,3 +1457,43 @@ The removal-gate errors (`409 workflow_resolution_required`, `503 workflow_servi
 | DLG-D12 | **v1 scope is active-at-create** (no future-dating); future-dated activation is a v2 feature needing a start-scheduler (§22, DLG-Q10). **Superseded by rev 2.5/DLG-D25:** a `scheduled` status and the `delegation-activation` CronJob (§7.1/§11.1a) deliver exactly this, ahead of any "v2" timeline — see §22 for the note on why this was pulled forward. |
 
 *End of document. This v2 resolves all ten open questions as decisions for the development-stage build; the DLG-Q4 cross-team task (Core adding the `MembershipRevoked`/`TenantMembershipsPurged` emission this service's cascade consumes) is confirmed shipped as of v2.3 — no open cross-team tasks remain.*
+
+---
+
+## Appendix — Compatibility Gap Fixes (2026-09-15)
+
+Cross-service compatibility audit against `iam-org-membership` identified and resolved the following issues in this service.
+
+### Fix 1 — `iam.user.events` SNS Subscription Terraform IaC (Gap 6)
+
+**Problem:** `delegation-cascade-q` is documented in `api/asyncapi.yaml §sqsDelegationCascade` to receive from TWO SNS topics — `iam.membership.events` (MembershipRevoked, TenantMembershipsPurged) and `iam.user.events` (UserUpdated). The `iam.user.events` subscription was never provisioned, so `CascadeService.EndForDisabledDelegate` (Bug 2 / DLG-D26) never fired.
+
+**Fix:** Added Terraform IaC files providing the exact resource definitions for infra team to apply. Also added a `PRE-DEPLOY ACTION REQUIRED` comment in the consumer code.
+
+**Files added:**
+- `deploy/messaging/README.md` — documents the gap and what the infra team must do
+- `deploy/messaging/sns_subscriptions.tf.example` — complete Terraform for `aws_sns_topic_subscription` (filter: `EventType = ["UserUpdated"]`), SQS queue policy update
+
+**Status:** Infra team must apply the Terraform before deploying to any environment.
+
+---
+
+### Fix 2 — `ScrubTenant` Documentation Mismatch (Gap 7)
+
+**Problem:** `.claude/flows-and-concurrency.md` stated `ScrubTenant` was "not wrapped in a RunInTx". The actual code in `cascade_service.go` clearly wraps both deletes inside `RunInTx`.
+
+**Fix:** Updated the documentation to match the code.
+
+**Files changed:**
+- `.claude/flows-and-concurrency.md` — corrected to say "wrapped in one RunInTx"
+
+---
+
+### Fix 3 — `x-caller-service` Header for I-15 Metrics (Gap 9)
+
+**Problem:** Both Delegation and Tender-ACL call org_membership's I-15 (`GET /internal/tenants/:id/members/:user_id/exists`) as `"iam-system"`. org_membership's metrics showed `caller = "unknown"` for all I-15 traffic — impossible to distinguish between the two callers.
+
+**Fix:** Added `x-caller-service: iam-delegation` header to all outbound I-15 calls so org_membership can label them correctly.
+
+**Files changed:**
+- `internal/adapter/outbound/orgmembership/propagate.go` — added `req.Header.Set("x-caller-service", "iam-delegation")`

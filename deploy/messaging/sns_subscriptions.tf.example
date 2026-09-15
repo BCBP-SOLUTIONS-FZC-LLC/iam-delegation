@@ -1,0 +1,130 @@
+# Terraform — SNS subscriptions for delegation-cascade-q
+#
+# Gap 6 fix: provisions the MISSING iam.user.events → delegation-cascade-q
+# subscription (Bug 2 / DLG-D26, documented in api/asyncapi.yaml).
+#
+# The two existing subscriptions from iam.membership.events are shown for
+# reference. The third (iam.user.events) is the one that must be added.
+#
+# This file is *illustrative*, not applied automatically.
+# Platform Terraform owns the authoritative version of these resources.
+# Adapt ARN references to match your environment before applying.
+#
+# After applying, set CASCADE_QUEUE_URL in the iam-delegation Helm values
+# if it is not already set — the consumer is already wired in the binary.
+
+# ── Data sources ──────────────────────────────────────────────────────────
+
+data "aws_sns_topic" "iam_membership_events" {
+  name = "iam-membership-events"
+}
+
+# Gap 6: the User Profile service's event topic (iam.user.events).
+# This topic is owned by iam-user-profile — confirm the exact topic name
+# with the User Profile team before applying.
+data "aws_sns_topic" "iam_user_events" {
+  name = "iam-user-events"   # confirm with User Profile team
+}
+
+data "aws_sqs_queue" "delegation_cascade_q" {
+  name = "delegation-cascade-q"
+}
+
+data "aws_sqs_queue" "delegation_cascade_dlq" {
+  name = "delegation-cascade-q-dlq"
+}
+
+# ── Existing subscriptions (already provisioned — shown for reference) ────
+
+# Subscription 1 — iam.membership.events → MembershipRevoked
+# (already exists, do not re-create)
+# resource "aws_sns_topic_subscription" "delegation_cascade_membership_revoked" { ... }
+
+# Subscription 2 — iam.membership.events → TenantMembershipsPurged
+# (already exists, do not re-create)
+# resource "aws_sns_topic_subscription" "delegation_cascade_tenant_purged" { ... }
+
+# ── Gap 6: NEW subscription — iam.user.events → UserUpdated ───────────────
+
+resource "aws_sns_topic_subscription" "delegation_cascade_user_updated" {
+  # Source: iam-user-profile's event topic
+  topic_arn = data.aws_sns_topic.iam_user_events.arn
+
+  # Target: this service's cascade queue
+  protocol  = "sqs"
+  endpoint  = data.aws_sqs_queue.delegation_cascade_q.arn
+
+  # Filter: deliver ONLY UserUpdated messages.
+  # PascalCase ("UserUpdated") is User Profile's own convention — matches
+  # exactly what iam-user-profile stamps in the EventType message attribute.
+  # (Migrated from dot-notation while User Profile was still pre-deployment;
+  # see delegation asyncapi.yaml §UserUpdated message.)
+  filter_policy = jsonencode({
+    EventType = ["UserUpdated"]
+  })
+
+  # Raw message delivery OFF — delegation-cascade-q consumer expects the full
+  # SNS notification envelope (with MessageAttributes for filter-policy
+  # evaluation), not a raw message body. The consumer strips the Glue header
+  # from env.Payload internally (Gap-15 fix).
+  raw_message_delivery = false
+}
+
+# ── SQS queue policy update ───────────────────────────────────────────────
+#
+# If the delegation-cascade-q already has an SQS queue policy that restricts
+# which SNS topics can publish to it, add iam.user.events to the allow-list.
+# Below is the complete queue policy including all three producing topics.
+
+data "aws_iam_policy_document" "delegation_cascade_q_policy" {
+  statement {
+    sid    = "AllowSNSPublishFromMembershipEvents"
+    effect = "Allow"
+    principals {
+      type        = "Service"
+      identifiers = ["sns.amazonaws.com"]
+    }
+    actions   = ["sqs:SendMessage"]
+    resources = [data.aws_sqs_queue.delegation_cascade_q.arn]
+    condition {
+      test     = "ArnLike"
+      variable = "aws:SourceArn"
+      values   = [data.aws_sns_topic.iam_membership_events.arn]
+    }
+  }
+
+  # Gap 6: allow iam.user.events to publish to delegation-cascade-q
+  statement {
+    sid    = "AllowSNSPublishFromUserEvents"
+    effect = "Allow"
+    principals {
+      type        = "Service"
+      identifiers = ["sns.amazonaws.com"]
+    }
+    actions   = ["sqs:SendMessage"]
+    resources = [data.aws_sqs_queue.delegation_cascade_q.arn]
+    condition {
+      test     = "ArnLike"
+      variable = "aws:SourceArn"
+      values   = [data.aws_sns_topic.iam_user_events.arn]
+    }
+  }
+}
+
+resource "aws_sqs_queue_policy" "delegation_cascade_q" {
+  queue_url = data.aws_sqs_queue.delegation_cascade_q.url
+  policy    = data.aws_iam_policy_document.delegation_cascade_q_policy.json
+}
+
+# ── DLQ redrive policy ────────────────────────────────────────────────────
+#
+# delegation-cascade-q-dlq already exists. Confirm its redrive policy has
+# maxReceiveCount = 5 (as documented in api/asyncapi.yaml §sqsDelegationCascade).
+# No change needed if already set.
+
+# ── Outputs ───────────────────────────────────────────────────────────────
+
+output "delegation_cascade_user_events_subscription_arn" {
+  description = "ARN of the new iam.user.events → delegation-cascade-q subscription (Gap 6)"
+  value       = aws_sns_topic_subscription.delegation_cascade_user_updated.arn
+}

@@ -155,10 +155,11 @@ adds it.
 
 ## Cascade removal — `CascadeService.ScrubTenant` (`TenantMembershipsPurged`)
 
-Two plain soft-delete calls (`delegations.SoftDeleteTenant`, `settings.SoftDeleteTenant`), no event
+Two soft-delete calls (`delegations.SoftDeleteTenant`, `settings.SoftDeleteTenant`), no event
 emission at all — the LLD reasons that soft-deleted rows are inert, so nothing downstream needs to
-react. Not wrapped in a `RunInTx` — the two deletes are independent statements, not required to be
-atomic with each other.
+react. Both deletes are wrapped in a single `RunInTx` so they commit atomically — if the settings
+delete fails, the delegations delete rolls back too, keeping the two tables consistent.
+(Gap-7 fix: previous version of this doc incorrectly stated "not wrapped in RunInTx".)
 
 ## Cleanup job (`delegation-cleanup`, monthly) — `jobs.Cleanup`
 
