@@ -300,9 +300,7 @@ func (s *DelegationService) Create(ctx context.Context, tenantID, delegatorID uu
 			// updated before this tx; if tx failed, clear the stale OOO
 			// pointer. Not needed when isScheduled: UP was never called.
 			//nolint:errcheck // best-effort: failure is logged by UP client; must not mask the original tx error
-			_ = s.userProfile.SetAvailability(ctx, port.SetAvailabilityRequest{
-				TenantID: tenantID, UserID: delegatorID, ClearDelegate: true,
-			})
+			_ = s.userProfile.ClearDelegatePointer(ctx, tenantID, delegatorID)
 		}
 		return nil, err
 	}
@@ -383,9 +381,7 @@ func (s *DelegationService) cancelInternal(ctx context.Context, tenantID, id uui
 	}
 	// fail-open by design (LLD §11.2): if UP is down, log
 	// and proceed — the expiry cron re-clears the pointer later (DEL-6).
-	if err := s.userProfile.SetAvailability(ctx, port.SetAvailabilityRequest{
-		TenantID: tenantID, UserID: d.DelegatorID, ClearDelegate: true,
-	}); err != nil && s.metrics != nil {
+	if err := s.userProfile.ClearDelegatePointer(ctx, tenantID, d.DelegatorID); err != nil && s.metrics != nil {
 		s.metrics.RecordUPAvailabilityFailure("cancel")
 	}
 	actorID := d.DelegatorID

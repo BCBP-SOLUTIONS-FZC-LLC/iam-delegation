@@ -436,6 +436,26 @@ To exercise the real Glue codec instead of `NoopCodec`, use `docker-compose.pro.
 `CASCADE_QUEUE_URL` — the process fails fast at startup if any of these five is empty (the last
 two unconditionally; the dependency base URLs via their client constructors).
 
+## Cross-service dependencies
+
+Reads (DLG-1, DLG-6, DLG-I3, DLG-I4), Extend (DLG-4), and read-only reconciler sweeps (`delegation-review`, `delegation-cleanup`) have **no** synchronous cross-service dependency — Postgres + Valkey only.
+
+| Operation | Sync dependency | Posture | On failure |
+|---|---|---|---|
+| Create (DLG-2) — grant-time membership-existence check (delegator + delegate, concurrent) | `iam-org-membership` I-15 × 2 | fail-closed | `503 org_membership_unavailable`; no delegation written |
+| Create (DLG-2, immediate activation) — delegate OOO check + set availability pointer | `iam-user-profile` DEL-6 | fail-closed | `503 user_profile_unavailable`; no delegation written |
+| Create (DLG-2, future-dated `scheduled`) — membership check only; User Profile deferred to activation flip | `iam-org-membership` I-15 × 2 only | fail-closed | `503 org_membership_unavailable`; no delegation written; User Profile not called until `delegation-activation` promotes the row |
+| Cancel (DLG-3) — clear availability pointer | `iam-user-profile` DEL-6 | fail-open | Cancel commits; pointer-clear omitted |
+| Reassign (DLG-5) — end-leg: clear old delegate's pointer | `iam-user-profile` DEL-6 | fail-open | End-leg commits; pointer-clear omitted |
+| Reassign (DLG-5) — create-leg: membership check + set new delegate's pointer | `iam-org-membership` I-15 + `iam-user-profile` DEL-6 | fail-closed | `503`; full reassign rolled back |
+| `delegation-activation` CronJob (scheduled → active) — set availability pointer | `iam-user-profile` DEL-6 | fail-closed | Row stays `scheduled`; retried at next `*/5` run |
+| `delegation-expiry` CronJob — clear availability pointer on expiry | `iam-user-profile` DEL-6 | self-retrying | Pointer-clear deferred; row remains `active`; retried at next `*/5` run |
+| Cascade `MembershipRevoked` (inbound async, `delegation-cascade-q`) | — | at-least-once | Message requeued on processing failure; `delegation-cascade-q-dlq` after `maxReceiveCount=5` |
+| Cascade `TenantMembershipsPurged` (inbound async, `delegation-cascade-q`) | — | at-least-once | Message requeued on processing failure; `delegation-cascade-q-dlq` after `maxReceiveCount=5` |
+| Cascade `UserUpdated{status:disabled}` (inbound async, `delegation-cascade-q`) | — | at-least-once | Message requeued on processing failure; `delegation-cascade-q-dlq` after `maxReceiveCount=5` |
+
+---
+
 ## Out of scope
 
 | Concern | Owner |

@@ -7,7 +7,6 @@ import (
 	"testing"
 
 	"github.com/BCBP-SOLUTIONS-FZC-LLC/iam-delegation/internal/core/domain"
-	"github.com/BCBP-SOLUTIONS-FZC-LLC/iam-delegation/internal/core/port"
 	"github.com/google/uuid"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -60,12 +59,11 @@ func TestCascadeService_EndForUser_DelegatorDelegateAsymmetry(t *testing.T) {
 	assert.Equal(t, domain.EndReasonDelegateRemoved, payload.EndedReason)
 	assert.Equal(t, delegateSideRow.ID, payload.DelegationID)
 
-	require.Len(t, up.calls, 1, "exactly one pointer-clear call, for the delegate-side row's delegator")
-	assert.Equal(t, otherUser2, up.calls[0].UserID)
-	assert.True(t, up.calls[0].ClearDelegate)
+	require.Len(t, up.clearCalls, 1, "exactly one pointer-clear call, for the delegate-side row's delegator")
+	assert.Equal(t, otherUser2, up.clearCalls[0])
 
-	for _, c := range up.calls {
-		assert.NotEqual(t, removedUserID, c.UserID, "the removed user's own record must never be targeted for a clear")
+	for _, uid := range up.clearCalls {
+		assert.NotEqual(t, removedUserID, uid, "the removed user's own record must never be targeted for a clear")
 	}
 }
 
@@ -88,7 +86,7 @@ func TestCascadeService_EndForUser_RecordsMetrics(t *testing.T) {
 		Scope: domain.ScopeAll, Status: domain.DelegationEnded,
 	}
 	repo.endForUserResult = []domain.Delegation{delegateSideRow}
-	up.fn = func(ctx context.Context, r port.SetAvailabilityRequest) error {
+	up.clearFn = func(_ context.Context, _, _ uuid.UUID) error {
 		return errors.New("user-profile down")
 	}
 

@@ -21,19 +21,13 @@ func TestNewHTTPClient_EmptyBaseURL_Errors(t *testing.T) {
 	require.Error(t, err)
 }
 
-func TestBuildBody_DelegateIDThreeStates(t *testing.T) {
+func TestBuildBody_DelegateIDTwoStates(t *testing.T) {
 	delegateID := uuid.New()
 
 	// Omitted entirely.
 	body := buildBody(port.SetAvailabilityRequest{})
 	_, ok := body["delegate_id"]
-	assert.False(t, ok)
-
-	// Explicit null.
-	body = buildBody(port.SetAvailabilityRequest{ClearDelegate: true})
-	val, ok := body["delegate_id"]
-	require.True(t, ok)
-	assert.Nil(t, val)
+	assert.False(t, ok, "delegate_id must be absent when DelegateID is nil")
 
 	// Explicit value.
 	body = buildBody(port.SetAvailabilityRequest{DelegateID: &delegateID})
@@ -79,33 +73,58 @@ func TestHTTPClient_SetAvailability_Create(t *testing.T) {
 	assert.False(t, hasUntil)
 }
 
-// TestHTTPClient_SetAvailability_End covers DEL-6's pointer-clear-only end
-// path: {delegate_id: null, status: "available"}. iam-user-profile's
-// PutAvailabilityRequest DTO requires `status` (binding:"required"), so a
-// bare {delegate_id: null} body — the original design here — gets a clean
-// 400 rather than a clean pointer-clear; defaulting to "available" on this
-// path is the fix (see buildBody's doc comment).
-func TestHTTPClient_SetAvailability_End(t *testing.T) {
-	var gotBody map[string]any
+// TestHTTPClient_ClearDelegatePointer covers DEL-6's pointer-clear end path.
+// The dedicated DELETE endpoint is called with no body; UP clears delegate_id
+// without touching the user's status (Gap 3 Option B).
+func TestHTTPClient_ClearDelegatePointer(t *testing.T) {
+	tenantID, userID := uuid.New(), uuid.New()
+	var gotPath, gotMethod, gotTenantID, gotUserID, gotTenantRoles string
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		b, _ := io.ReadAll(r.Body)
-		_ = json.Unmarshal(b, &gotBody)
-		w.WriteHeader(http.StatusOK)
+		gotPath = r.URL.Path
+		gotMethod = r.Method
+		gotTenantID = r.Header.Get("x-tenant-id")
+		gotUserID = r.Header.Get("x-user-id")
+		gotTenantRoles = r.Header.Get("x-tenant-roles")
+		w.WriteHeader(http.StatusNoContent)
 	}))
 	defer server.Close()
 
 	c, err := NewHTTPClient(server.URL, nil, 0)
 	require.NoError(t, err)
 
-	err = c.SetAvailability(t.Context(), port.SetAvailabilityRequest{
-		TenantID: uuid.New(), UserID: uuid.New(), ClearDelegate: true,
-	})
+	err = c.ClearDelegatePointer(t.Context(), tenantID, userID)
 	require.NoError(t, err)
 
-	val, ok := gotBody["delegate_id"]
-	require.True(t, ok, "delegate_id must be present (explicit null)")
-	assert.Nil(t, val)
-	assert.Equal(t, "available", gotBody["status"], "end must send status:\"available\" — iam-user-profile requires status on every call")
+	assert.Equal(t, http.MethodDelete, gotMethod)
+	assert.Equal(t, "/api/v1/internal/users/"+userID.String()+"/availability/delegate", gotPath)
+	assert.Equal(t, tenantID.String(), gotTenantID)
+	assert.Equal(t, "iam-system", gotUserID)
+	assert.Equal(t, "iam-system", gotTenantRoles)
+}
+
+// TestHTTPClient_ClearDelegatePointer_5xx_WrapsErrDependencyUnavailable checks
+// that 5xx from UP is wrapped with port.ErrDependencyUnavailable.
+func TestHTTPClient_ClearDelegatePointer_5xx_WrapsErrDependencyUnavailable(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusServiceUnavailable)
+	}))
+	defer server.Close()
+
+	c, err := NewHTTPClient(server.URL, nil, 0)
+	require.NoError(t, err)
+	err = c.ClearDelegatePointer(t.Context(), uuid.New(), uuid.New())
+	require.Error(t, err)
+	assert.True(t, errors.Is(err, port.ErrDependencyUnavailable))
+}
+
+// TestHTTPClient_ClearDelegatePointer_NetworkError_WrapsErrDependencyUnavailable
+// checks that network errors are wrapped with port.ErrDependencyUnavailable.
+func TestHTTPClient_ClearDelegatePointer_NetworkError_WrapsErrDependencyUnavailable(t *testing.T) {
+	c, err := NewHTTPClient("http://127.0.0.1:1", nil, 50*time.Millisecond)
+	require.NoError(t, err)
+	err = c.ClearDelegatePointer(t.Context(), uuid.New(), uuid.New())
+	require.Error(t, err)
+	assert.True(t, errors.Is(err, port.ErrDependencyUnavailable))
 }
 
 // TestHTTPClient_SetAvailability_5xx_WrapsErrDependencyUnavailable covers
@@ -118,7 +137,7 @@ func TestHTTPClient_SetAvailability_5xx_WrapsErrDependencyUnavailable(t *testing
 
 	c, err := NewHTTPClient(server.URL, nil, 0)
 	require.NoError(t, err)
-	err = c.SetAvailability(t.Context(), port.SetAvailabilityRequest{TenantID: uuid.New(), UserID: uuid.New(), ClearDelegate: true})
+	err = c.SetAvailability(t.Context(), port.SetAvailabilityRequest{TenantID: uuid.New(), UserID: uuid.New()})
 	require.Error(t, err)
 	assert.True(t, errors.Is(err, port.ErrDependencyUnavailable))
 }
@@ -140,7 +159,7 @@ func TestHTTPClient_SetAvailability_422_CarriesErrorCode(t *testing.T) {
 
 	c, err := NewHTTPClient(server.URL, nil, 0)
 	require.NoError(t, err)
-	err = c.SetAvailability(t.Context(), port.SetAvailabilityRequest{TenantID: uuid.New(), UserID: uuid.New(), ClearDelegate: true})
+	err = c.SetAvailability(t.Context(), port.SetAvailabilityRequest{TenantID: uuid.New(), UserID: uuid.New()})
 	require.Error(t, err)
 	assert.False(t, errors.Is(err, port.ErrDependencyUnavailable), "4xx business rejection must not be wrapped")
 	assert.Contains(t, err.Error(), "delegate_unavailable")
@@ -149,7 +168,7 @@ func TestHTTPClient_SetAvailability_422_CarriesErrorCode(t *testing.T) {
 func TestHTTPClient_SetAvailability_NetworkError_WrapsErrDependencyUnavailable(t *testing.T) {
 	c, err := NewHTTPClient("http://127.0.0.1:1", nil, 50*time.Millisecond)
 	require.NoError(t, err)
-	err = c.SetAvailability(t.Context(), port.SetAvailabilityRequest{TenantID: uuid.New(), UserID: uuid.New(), ClearDelegate: true})
+	err = c.SetAvailability(t.Context(), port.SetAvailabilityRequest{TenantID: uuid.New(), UserID: uuid.New()})
 	require.Error(t, err)
 	assert.True(t, errors.Is(err, port.ErrDependencyUnavailable))
 }
@@ -165,10 +184,66 @@ func TestHTTPClient_SetAvailability_4xx_NonJSONBody(t *testing.T) {
 
 	c, err := NewHTTPClient(server.URL, nil, 0)
 	require.NoError(t, err)
-	err = c.SetAvailability(t.Context(), port.SetAvailabilityRequest{TenantID: uuid.New(), UserID: uuid.New(), ClearDelegate: true})
+	err = c.SetAvailability(t.Context(), port.SetAvailabilityRequest{TenantID: uuid.New(), UserID: uuid.New()})
 	require.Error(t, err)
 	assert.False(t, errors.Is(err, port.ErrDependencyUnavailable))
 	assert.Contains(t, err.Error(), "400")
+}
+
+// TestUPContract_HybridErrorEnvelope_ExtraFieldsIgnored verifies that
+// iam-user-profile's hybrid error envelope (which includes extra fields
+// code/message/details beyond gincommon.ErrorResponse) is parsed correctly.
+// encoding/json must silently ignore the extra fields — if DisallowUnknownFields
+// were ever added, this test would catch the breakage.
+func TestUPContract_HybridErrorEnvelope_ExtraFieldsIgnored(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusUnprocessableEntity)
+		// Full hybrid envelope as produced by iam-user-profile's newErrorResponse.
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"error":      "delegate_unavailable",
+			"status":     422,
+			"trace_id":   "abc123",
+			"request_id": "req456",
+			"code":       "delegate_unavailable",
+			"message":    "delegate is currently out of office",
+			"details":    []any{},
+		})
+	}))
+	defer server.Close()
+
+	c, err := NewHTTPClient(server.URL, nil, 0)
+	require.NoError(t, err)
+	err = c.SetAvailability(t.Context(), port.SetAvailabilityRequest{
+		TenantID: uuid.New(), UserID: uuid.New(),
+	})
+	require.Error(t, err)
+	assert.False(t, errors.Is(err, port.ErrDependencyUnavailable), "4xx must not be wrapped as dependency unavailable")
+	assert.Contains(t, err.Error(), "delegate_unavailable", "error code from UP's hybrid envelope must be surfaced")
+}
+
+// TestUPContract_NoExpectedVersionSent verifies that DEL-6 calls never include
+// an expected_version field. Delegation has no prior GET so it always uses
+// last-writer-wins semantics — sending a stale version would cause spurious
+// 409 conflicts on every availability write.
+func TestUPContract_NoExpectedVersionSent(t *testing.T) {
+	var gotBody map[string]any
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		b, _ := io.ReadAll(r.Body)
+		_ = json.Unmarshal(b, &gotBody)
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer server.Close()
+
+	c, err := NewHTTPClient(server.URL, nil, 0)
+	require.NoError(t, err)
+
+	status := "ooo"
+	_ = c.SetAvailability(t.Context(), port.SetAvailabilityRequest{
+		TenantID: uuid.New(), UserID: uuid.New(), Status: &status,
+	})
+	_, hasVersion := gotBody["expected_version"]
+	assert.False(t, hasVersion, "DEL-6 must never send expected_version — delegation uses last-writer-wins")
 }
 
 // TestHTTPClient_SetAvailability_InvalidURL covers lines 116–118:
@@ -186,10 +261,9 @@ func TestHTTPClient_SetAvailability_InvalidURL_Errors(t *testing.T) {
 func TestBuildBody_WithOOOUntil(t *testing.T) {
 	var oooTime = time.Date(2026, 9, 1, 12, 0, 0, 0, time.UTC)
 	req := port.SetAvailabilityRequest{
-		TenantID:      uuid.New(),
-		UserID:        uuid.New(),
-		OOOUntil:      &oooTime,
-		ClearDelegate: false,
+		TenantID: uuid.New(),
+		UserID:   uuid.New(),
+		OOOUntil: &oooTime,
 	}
 	body := buildBody(req)
 	require.NotNil(t, body["ooo_until"])

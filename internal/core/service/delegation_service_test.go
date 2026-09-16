@@ -586,7 +586,7 @@ func TestDelegationService_Cancel_FailOpenOnUserProfileFailure(t *testing.T) {
 		TenantID: tenantID, DelegatorID: uuid.New(), DelegateID: uuid.New(),
 		Scope: domain.ScopeAll, Status: domain.DelegationActive, RecordVersion: 1,
 	})
-	h.up.fn = func(ctx context.Context, r port.SetAvailabilityRequest) error {
+	h.up.clearFn = func(_ context.Context, _, _ uuid.UUID) error {
 		return errors.New("user-profile down")
 	}
 
@@ -613,7 +613,7 @@ func TestDelegationService_Cancel_RecordsMetrics(t *testing.T) {
 		TenantID: tenantID, DelegatorID: uuid.New(), DelegateID: uuid.New(),
 		Scope: domain.ScopeAll, Status: domain.DelegationActive, RecordVersion: 1,
 	})
-	h.up.fn = func(ctx context.Context, r port.SetAvailabilityRequest) error {
+	h.up.clearFn = func(_ context.Context, _, _ uuid.UUID) error {
 		return errors.New("user-profile down")
 	}
 
@@ -1022,9 +1022,10 @@ func TestDelegationService_Create_TxFailure_CompensatesUserProfile(t *testing.T)
 
 	_, err := h.svc.Create(context.Background(), tenantID, delegatorID, "", req)
 	require.Error(t, err)
-	// UP called twice: once for OOO set, once for compensating clear
-	require.Equal(t, 2, h.up.callCount())
-	assert.True(t, h.up.calls[1].ClearDelegate, "second UP call must be a compensating clear")
+	// SetAvailability called once (OOO set); compensating clear uses ClearDelegatePointer
+	require.Equal(t, 1, h.up.callCount())
+	require.Len(t, h.up.clearCalls, 1, "compensating pointer-clear must be called on tx failure")
+	assert.Equal(t, delegatorID, h.up.clearCalls[0])
 }
 
 func TestDelegationService_CancelInternal_FindByIDError(t *testing.T) {

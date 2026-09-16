@@ -82,9 +82,7 @@ func (s *CascadeService) EndForUser(ctx context.Context, tenantID, userID uuid.U
 		// (§7.6.5) — a UP failure here is not retried by this cascade, only
 		// logged upstream by the consumer; the delegation-expiry cron only
 		// revisits still-active rows, so there's nothing to retry against.
-		if err := s.userProfile.SetAvailability(ctx, port.SetAvailabilityRequest{
-			TenantID: tenantID, UserID: d.DelegatorID, ClearDelegate: true,
-		}); err != nil && s.metrics != nil {
+		if err := s.userProfile.ClearDelegatePointer(ctx, tenantID, d.DelegatorID); err != nil && s.metrics != nil {
 			s.metrics.RecordUPAvailabilityFailure("cascade")
 		}
 	}
