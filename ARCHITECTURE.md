@@ -124,7 +124,8 @@ iam-delegation/
 │   │                                            + delegation-cascade-q SQS consumer, one process
 │   │   ├── main.go
 │   │   ├── adapters.go                      -- gucBoundReader · reconcilerRunner · redisPinger
-│   │   ├── config.go                        -- loadConfig() + fail-fast checks
+│   │   ├── config.go                        -- loadConfig() + fail-fast checks (incl. DOCS_AUTH_TOKEN, DLG-D40)
+│   │   ├── wiring.go                        -- buildSNSPublisher · cascadeSQSEnv (platform-events config.* composition, DLG-D44)
 │   │   └── exporters.go                     -- runActiveGaugeExporter (5-min sysPool snapshot)
 │   └── reconciler/
 │       ├── main.go                          -- --job=<name> dispatch (this chart's own convention)
@@ -142,14 +143,16 @@ iam-delegation/
 │   │   │   ├── event.go / event_payloads.go -- outbound event envelope + payload shapes
 │   │   │   └── errors.go                    -- delegation_* sentinel error taxonomy (LLD §20)
 │   │   ├── port/
+│   │   │   ├── logger.go                    -- port.Logger, the one logging port every adapter/binary shares (DLG-D42)
 │   │   │   ├── delegation_repository.go
 │   │   │   ├── settings_repository.go       -- delegation_tenant_settings
 │   │   │   ├── user_profile_client.go       -- UserProfileClient (DEL-6)
 │   │   │   ├── membership_check_client.go   -- MembershipCheckClient (§7.6.2, swappable)
+│   │   │   ├── tender_scope_client.go       -- TenderScopeClient (§7.6.7, swappable, scope='tender' only — DLG-D13, unwired pending Tender's endpoint)
 │   │   │   ├── idempotency_store.go         -- create-dedup (DLG-Q3)
 │   │   │   ├── event_publisher.go
 │   │   │   ├── cache.go
-│   │   │   └── tx_runner.go
+│   │   │   └── tx_runner.go                 -- TxRunner + WithTx/TxFromContext (tx handle carried as `any` — core imports no pgx, DLG-D46)
 │   │   └── service/
 │   │       ├── delegation_service.go        -- DLG-1..5 orchestration
 │   │       ├── settings_service.go          -- DLG-6/7
@@ -163,6 +166,7 @@ iam-delegation/
 │           ├── postgres/                    -- repositories, migrations, processed_events, gauge_repository.go
 │           ├── userprofile/                 -- UserProfileClient HTTP impl
 │           ├── orgmembership/                -- MembershipCheckClient HTTP impl
+│           ├── tender/                      -- TenderScopeClient HTTP impl (§7.6.7, DLG-D13 — built/tested, not constructed in cmd/server)
 │           ├── eventbus/                    -- SNS publisher (iam-delegation-events) + Glue codec (encode+decode)
 │           ├── valkey/                      -- del: cache + idempotency store
 │           └── metrics/                     -- iam_delegation_* Prometheus instruments
@@ -1210,6 +1214,7 @@ this build had to make its own call ahead of any of these existing, it is called
 | DLG-D43 | Database connection/configuration/operations re-checked against `iam-user-profile` / `iam-org-membership`. Pools, GUC, migrate, health, and `TxRunner` already went through pgcommon (DLG-D23/D32/D37) — including `SystemPoolConfig` (UP's sysPool is still a raw `pgxpool.New`; we match O&M). Remaining sibling gaps: the active-gauge snapshot used `withPool`/`RunInTx` for a read-only `COUNT` — now `pgcommon.Pool.WithConn`, matching O&M's `cmd/server/exporters.go`; `ApplyStatementTimeout` used `&options=` even when the DSN had no `?`, which produced an invalid URL for a bare `SYSTEM_DATABASE_URL`/`MIGRATION_DATABASE_URL`. `wrapConnErr` keeps D32's pass-through for callback/business errors (O&M's catch-all 503 would mask those) plus D37's network/IO mapping. Nested `TxRunner.RunInTx` join is kept (cascade IDEMP-2); O&M's TxRunner does not join. |
 | DLG-D44 | Events/outbox/dedup re-checked against `iam-user-profile` / `iam-org-membership`. The platform-events pass-through from DLG-D24/D33/D38 was already in place (`ValidatingCodec` enqueue, Glue/Noop publish, `outbox.Enqueue`, `ApplySchema` before the domain GRANT, SQS `GlueDecodeCodec`, `processed_events` via `withPool`, cascade+`MarkProcessed` in one `RunInTx`). Remaining sibling gaps: SNS/SQS/outbox runner now go through `config.LoadSNS` / `LoadSQS` / `LoadOutbox` + `SNSConfigFromEnv` / `SQSConfigFromEnv` / `SQSConsumerOptions` / `RunnerConfigFromEnv` (the siblings' composition contract); `CASCADE_*` overlays `SQS_QUEUE_URL`/`SQS_CONCURRENCY` the way O&M overlays per-queue names; `eventbus.Publisher` reads the tx via `port.TxFromContext` so it no longer imports the postgres adapter. Helm / `.env.example` keep the historical `OUTBOX_*` values so library defaults (`5s` poll / concurrency 1) do not silently change production. Consume still uses `GlueDecodeCodec` (O&M catalog-only consume is LLD A68); RoutingPublisher is not copied. |
 | DLG-D45 | Events/outbox/dedup pass through `platform-events` **only**. Composition from DLG-D44 (`LoadSNS`/`LoadSQS`/`LoadOutbox`, `outbox.Enqueue`, `port.TxFromContext`) was already in place. Remaining duplicate: a local enqueue `Codec`/`NoopCodec` (Encode-only) sat beside `events.Codec`/`events.NoopCodec`. Deleted it; `Publisher` and `ValidatingCodec` now take/implement `events.Codec` and wrap `events.NoopCodec`. Glue encode/decode and JSON-schema validation stay as service-side `events.Codec` implementations — the library ships neither. `processed_events` stays local (`Envelope.ID` + `ON CONFLICT DO NOTHING`, the library's documented pattern). |
+| DLG-D46 | **Correctness pass over the DLG-D40..D45 sweep, plus a new CI gate and a docs fix.** (1) DLG-D44's move of the tx-context key into `internal/core/port/tx_runner.go` had it importing `github.com/jackc/pgx/v5` directly — a real regression against this repo's own "`internal/core/*` imports no adapter, Gin, pgx, or AWS SDK" rule (not caught by `go-arch-lint` because its vendor-import check is off). `port.WithTx`/`port.TxFromContext` now carry the tx as `any`; the `pgx.Tx` type assertion lives only on the two adapter-side call sites that need it (`postgres/db.go`'s `TxFromContext` re-export, `eventbus/publisher.go`'s `EnqueueCtx`). (2) DLG-D42's `logger` import rename (dropping the `gclogger` alias) collided with a `logger` parameter name in both `run()` functions — a real `golangci-lint` `importShadow` failure that would have failed CI; restored the `gclogger` alias in `cmd/server/main.go` and `cmd/reconciler/main.go`. (3) DLG-D44's `config.LoadOutbox()` composition has different library defaults (`5s` poll / concurrency 1 / no jitter / no claim-lease) than this service's historical ones (`500ms` / 4 / `2s` / `10m`); Helm's `values.yaml` and `.env.example` were updated to pin the historical values explicitly, but any *other* invocation path (a bare `go run`, a test binary) would have silently gotten the library's slower defaults with no error — confirmed by the new e2e suite (DLG-D41) running 2x slower before this fix. `cmd/server/config.go`'s new `ensureOutboxEnv()` backfills the historical values whenever the env var is unset, mirroring `ensureGincommonEnv`'s existing pattern; regression-tested (`TestEnsureOutboxEnv`). (4) New CI gate, `.github/scripts/check-forbidden-events-bypass.sh`: rejects any `aws-sdk-go-v2/service/{sns,sqs}` import outside `cmd/server/main.go` (the one legitimate client-construction site), any direct call to an SNS/SQS transport method, and any hand-built `events.Envelope{}` literal — wired into `validate-quality.yml` alongside the existing RLS-6 GUC gate. (5) `api/asyncapi.yaml`'s four published-event schemas were missing the `tenant_id` property that `internal/eventschema/*.json` (the real validation source) already declares per DLG-EVT-7's self-contained-snapshot design — added to all four. |
 
 **Known deviations from a literal reading of the LLD:**
 

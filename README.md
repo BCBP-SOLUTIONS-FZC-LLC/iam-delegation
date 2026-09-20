@@ -116,6 +116,7 @@ internal/
         ├── postgres/    # TxRunner, repositories, migrations, sysPool config
         ├── userprofile/ # DEL-6 HTTP client
         ├── orgmembership/ # DLG-D3 HTTP client
+        ├── tender/      # DLG-D13 HTTP client (§7.6.7 tender-scope liveness) — built/tested, not yet wired in cmd/server
         ├── eventbus/    # enqueue-time validation, SNS-publish-time Glue codec
         ├── valkey/      # cache + idempotency store
         └── metrics/     # iam_delegation_* Prometheus instruments

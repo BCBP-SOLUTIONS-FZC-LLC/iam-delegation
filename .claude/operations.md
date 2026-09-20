@@ -178,10 +178,14 @@ GitHub Actions (`.github/workflows/`), all names/steps verified against current 
    single global floor**, not a per-package gate — bumped from the original 70% during the
    DLG-D34 production-readiness sweep, global coverage sat at 95.2% as of that pass, 95.4% as of
    the DLG-D35 follow-up sweep) → upload coverage artifact → architecture lint (`go-arch-lint`) →
-   Swagger staleness check → end-to-end tests.
+   Swagger staleness check → end-to-end tests (`make test-e2e`, `-tags=e2e` — genuinely exercises
+   `cmd/server/e2e_test.go` against real Postgres/Valkey/floci containers as of DLG-D41; this step
+   pre-dates that file and was previously a silent no-op re-run of the unit suite).
 2. **`validate-quality.yml`** (`Validate / Quality`) — on push/PR: a repo-specific check rejecting
    HTML-escaped operators in workflow files, a repo-specific check rejecting non-transaction-local
-   `SET app.tenant_id` (RLS-6 enforcement, `.github/scripts/check-forbidden-set-guc.sh`), gofmt
+   `SET app.tenant_id` (RLS-6 enforcement, `.github/scripts/check-forbidden-set-guc.sh`), a
+   repo-specific check rejecting AWS SDK SNS/SQS bypass of `platform-events`
+   (`.github/scripts/check-forbidden-events-bypass.sh`, DLG-D45/D46), gofmt
    check, `go mod tidy` drift check, `go vet`, `golangci-lint`, `govulncheck`, `go mod verify`,
    Dockerfile base-image digest check.
 3. **`ci.yml`** (`CI`) — `build-image` job: Hadolint + `.dockerignore` check → Buildx build

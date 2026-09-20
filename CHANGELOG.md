@@ -44,6 +44,24 @@ index into those, not a duplicate of them.
 
 ### Fixed
 
+- **Correctness pass over the DLG-D40..D45 sweep, plus a new CI gate (DLG-D46):**
+  DLG-D44's tx-context move left `internal/core/port/tx_runner.go` importing
+  `github.com/jackc/pgx/v5` directly, violating this repo's own "core imports no
+  pgx" rule — `port.WithTx`/`port.TxFromContext` now carry the tx as `any`, with
+  the `pgx.Tx` assertion only on the two adapter call sites that need it.
+  DLG-D42's `logger` import rename collided with a `logger` parameter in both
+  `run()` functions (`golangci-lint` `importShadow`) — restored the `gclogger`
+  alias. DLG-D44's `config.LoadOutbox()` has different library defaults (`5s`
+  poll / concurrency 1) than this service's historical ones (`500ms` / 4); Helm
+  and `.env.example` were already pinned, but any other invocation path wasn't —
+  added `ensureOutboxEnv()` (mirrors `ensureGincommonEnv`) so the historical
+  defaults apply everywhere, not just those two files. New CI gate,
+  `.github/scripts/check-forbidden-events-bypass.sh`, rejects any AWS SDK
+  SNS/SQS import/call outside `cmd/server/main.go`'s one legitimate
+  client-construction site, and any hand-built `events.Envelope{}` literal.
+  `api/asyncapi.yaml`'s four published-event schemas were missing the
+  `tenant_id` property `internal/eventschema/*.json` already declares —
+  added to all four.
 - **Production-readiness sweep (DLG-D40):** `registerDocsRoutes` only gates `/swagger` and
   `/asyncapi` behind `docsAuthMiddleware` when `Environment=="production"` AND `AuthToken!=""` —
   `loadConfig` had no matching fail-fast, so `DOCS_ENABLED=true` with `DOCS_AUTH_TOKEN` unset in
