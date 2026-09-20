@@ -118,6 +118,8 @@ Every published envelope carries `specversion: "1"` (`eventbus.Publisher.Enqueue
 
 CI-enforced (`.github/scripts/check-forbidden-events-bypass.sh`): no direct `aws-sdk-go-v2/service/{sns,sqs}` import outside `cmd/server/main.go` (which only constructs the raw client to hand to `events.NewSNSPublisher`/`events.NewSQSConsumerWithClient`), no direct call to an SNS/SQS transport method anywhere, and no hand-built `events.Envelope{}` literal (always via `events.NewEnvelope`). Consumer-side dedup (`processed_events`, above) is the one deliberate exception to "platform-events only" — that library has no consumer-side idempotency mechanism, only the publish-side, SNS-FIFO-only `events.WithMessageDeduplicationID`.
 
+Also CI-enforced (`.github/scripts/check-outbox-access.sh`, DLG-D47): `outbox_events` itself is never read/written via hand-rolled SQL — only `outbox.Enqueue` (write) and `outbox.Runner.PrunePublished` (delete) — scanning Go backtick string literals in `internal/`/`cmd/`/`pkg/` for `from|into|update outbox_events` outside `internal/adapter/outbound/eventbus`. Ported from `iam-org-membership`, which hit this exact bypass once (a hand-rolled batched DELETE duplicating `PrunePublished`) before removing it; this service has no history of the violation, but the same architectural gap applies equally here.
+
 ## Consumed — `delegation-cascade-q` (one SQS queue, two upstream producers, three event types)
 
 | Source topic | Event | Dispatched to | `processed_events.consumer` bucket |

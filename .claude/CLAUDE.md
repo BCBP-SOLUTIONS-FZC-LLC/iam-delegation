@@ -179,6 +179,7 @@ Also notable: `github.com/aws/aws-sdk-go-v2/service/glue` (GlueCodec's schema-ve
 - `cmd/*` is the only place concretes get wired together.
 - No session-scoped `SET app.tenant_id` — only `SET LOCAL` via `pgcommon.GUCSetFromContext` (CI greps the forbidden form, `.github/scripts/check-forbidden-set-guc.sh`, RLS-6).
 - Events/outbox pass through `platform-events` only — no direct AWS SDK SNS/SQS client calls or hand-built `events.Envelope` struct literals outside it (CI greps for both, `.github/scripts/check-forbidden-events-bypass.sh`). Consumer-side dedup (`processed_events`) is the one deliberate exception — `platform-events` has no consumer-side idempotency mechanism of its own, only the publish-side, SNS-FIFO-only `WithMessageDeduplicationID`.
+- `outbox_events` is never touched via hand-rolled SQL — only `outbox.Enqueue`/`outbox.Runner.PrunePublished` (CI scans Go backtick literals for `from|into|update outbox_events`, `.github/scripts/check-outbox-access.sh`, DLG-D47; ported from `iam-org-membership`, where this exact bypass happened once and was removed).
 
 ## Key Files to Know
 

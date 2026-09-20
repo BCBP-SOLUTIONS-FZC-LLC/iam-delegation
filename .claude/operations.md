@@ -185,7 +185,9 @@ GitHub Actions (`.github/workflows/`), all names/steps verified against current 
    HTML-escaped operators in workflow files, a repo-specific check rejecting non-transaction-local
    `SET app.tenant_id` (RLS-6 enforcement, `.github/scripts/check-forbidden-set-guc.sh`), a
    repo-specific check rejecting AWS SDK SNS/SQS bypass of `platform-events`
-   (`.github/scripts/check-forbidden-events-bypass.sh`, DLG-D45/D46), gofmt
+   (`.github/scripts/check-forbidden-events-bypass.sh`, DLG-D45/D46), a repo-specific check
+   rejecting hand-rolled SQL against `outbox_events`
+   (`.github/scripts/check-outbox-access.sh`, DLG-D47), gofmt
    check, `go mod tidy` drift check, `go vet`, `golangci-lint`, `govulncheck`, `go mod verify`,
    Dockerfile base-image digest check.
 3. **`ci.yml`** (`CI`) — `build-image` job: Hadolint + `.dockerignore` check → Buildx build

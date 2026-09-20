@@ -75,6 +75,13 @@ jobs:
       - name: Reject SNS/SQS/envelope bypass of platform-events
         run: bash .github/scripts/check-forbidden-events-bypass.sh
 
+      # outbox_events must never be touched via hand-rolled SQL — see
+      # .github/scripts/check-outbox-access.sh for the full rationale
+      # (ported from iam-org-membership, where this exact bypass happened
+      # once).
+      - name: Reject hand-rolled SQL against outbox_events
+        run: bash .github/scripts/check-outbox-access.sh
+
       - name: Format check
         run: |
           unformatted=$(gofmt -l cmd/ internal/ pkg/ 2>/dev/null || true)

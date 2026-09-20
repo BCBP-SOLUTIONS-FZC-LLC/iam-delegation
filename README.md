@@ -148,6 +148,7 @@ iam-delegation/
 | Outbound adapters depend on `port`+`domain`+`eventschema` — never `service`, never inbound | `go-arch-lint` |
 | No session-scoped `SET app.tenant_id` — only `SET LOCAL` via `pgcommon.GUCSetFromContext` | `.github/scripts/check-forbidden-set-guc.sh` |
 | Events/outbox pass through `platform-events` only — no direct SNS/SQS client calls or hand-built `events.Envelope` literals outside it | `.github/scripts/check-forbidden-events-bypass.sh` |
+| `outbox_events` is never touched via hand-rolled SQL — only `outbox.Enqueue`/`outbox.Runner.PrunePublished` | `.github/scripts/check-outbox-access.sh` |
 
 ### Storage and messaging
 

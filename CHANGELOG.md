@@ -44,6 +44,14 @@ index into those, not a duplicate of them.
 
 ### Fixed
 
+- **New CI gate ported from `iam-org-membership` (DLG-D47):**
+  `.github/scripts/check-outbox-access.sh` rejects any hand-rolled SQL against
+  `outbox_events` outside `internal/adapter/outbound/eventbus` — every
+  mutation must go through `outbox.Enqueue`/`outbox.Runner.PrunePublished`.
+  The sibling repo hit this exact bypass once (a hand-rolled batched
+  `DELETE` duplicating `PrunePublished`); this service has no history of
+  it, but the same gap applies equally here. Wired into
+  `validate-quality.yml` next to DLG-D46's `check-forbidden-events-bypass.sh`.
 - **Correctness pass over the DLG-D40..D45 sweep, plus a new CI gate (DLG-D46):**
   DLG-D44's tx-context move left `internal/core/port/tx_runner.go` importing
   `github.com/jackc/pgx/v5` directly, violating this repo's own "core imports no
