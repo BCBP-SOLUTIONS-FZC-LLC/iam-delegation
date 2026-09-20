@@ -7,6 +7,7 @@ import (
 
 	pgmigrate "github.com/BCBP-SOLUTIONS-FZC-LLC/platform-pgcommon/pkg/migrate"
 
+	"github.com/BCBP-SOLUTIONS-FZC-LLC/iam-delegation/internal/core/port"
 	"github.com/BCBP-SOLUTIONS-FZC-LLC/platform-events/pkg/outbox"
 )
 
@@ -21,7 +22,7 @@ import (
 // iam-org-membership's identical RunMigrations. log is optional (variadic
 // so existing call sites keep compiling) — when provided, each step is
 // logged through LoggerAdapter onto pgmigrate.Runner.Logger.
-func RunMigrations(ctx context.Context, dsn string, log ...Logger) error {
+func RunMigrations(ctx context.Context, dsn string, log ...port.Logger) error {
 	// fs.Sub on an embedded FS with a known directory path is infallible; an
 	// error here would be a build-time programming mistake.
 	sub, _ := fs.Sub(MigrationsFS, "migrations") //nolint:errcheck // see comment above
@@ -45,7 +46,7 @@ func RunMigrations(ctx context.Context, dsn string, log ...Logger) error {
 // permissions on outbox_events. If outbox.ApplySchema ran second, that GRANT
 // would target a table that doesn't exist yet and fail every fresh-database
 // bring-up. Matching iam-realm-provisioner / iam-org-membership.
-func Migrate(ctx context.Context, dsn string, log ...Logger) error {
+func Migrate(ctx context.Context, dsn string, log ...port.Logger) error {
 	runner := &pgmigrate.Runner{DSN: dsn}
 	if len(log) > 0 && log[0] != nil {
 		runner.Logger = NewLoggerAdapter(log[0])

@@ -259,11 +259,6 @@ func (m *Metrics) RecordEnded(reason string) {
 	m.endedTotal.WithLabelValues(reason).Inc()
 }
 
-// SetActiveGauge sets iam_delegation_active_gauge for tenant to count.
-func (m *Metrics) SetActiveGauge(tenant string, count float64) {
-	m.activeGauge.WithLabelValues(tenant).Set(count)
-}
-
 // ReplaceActiveGauges republishes iam_delegation_active_gauge from a
 // full-table snapshot. Reset first so a tenant that dropped to zero
 // active delegations disappears instead of lingering at its last count

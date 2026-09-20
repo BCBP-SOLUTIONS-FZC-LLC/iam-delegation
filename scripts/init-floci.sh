@@ -1,8 +1,9 @@
 #!/usr/bin/env bash
-# LocalStack ready-hook — provisions this service's outbound SNS topic,
-# its one inbound SQS subscription, and the three downstream fan-out queues
-# owned by consuming services (Workflow, Notification, Audit) that subscribe
-# to iam-delegation-events (LLD §10):
+# Floci ready-hook — provisions this service's outbound SNS topic, its one
+# inbound SQS queue, the downstream fan-out queues owned by consuming
+# services, and the Glue Schema Registry + all 4 schemas (LLD §10). Runs
+# automatically on container start via the volume mount to
+# /etc/floci/init/ready.d/.
 #
 #   OUTBOUND (this service publishes):
 #   - iam-delegation-events SNS topic — DelegationStarted, DelegationEnded,
@@ -24,56 +25,47 @@
 #       same queue) — send directly to exercise the consumer, no SNS
 #       subscription is modeled by this script for the inbound side
 #
+#   GLUE SCHEMA REGISTRY (LLD §7.6.7-adjacent event contract, DLG-D20/D21):
+#   - iam-delegation-events registry — 4 schemas, one per published event
+#     type, registered from the same JSON Schema Draft-07 files
+#     eventbus.GlueCodec ships, so GLUE_REGISTRY_NAME can stay set in
+#     docker-compose.yml and the app runs with the real Glue wire-format
+#     codec locally — Floci includes Glue Schema Registry in its free tier
+#     (unlike LocalStack Community, which gated it behind Pro), so there's
+#     no NoopCodec fallback needed for local dev.
+#
 #   To send a test message to the inbound queue:
-#     awslocal sqs send-message --queue-url <cascade-q-url> --message-body \
+#     aws --endpoint-url http://localhost:4570 --region ap-south-1 sqs send-message \
+#       --queue-url <cascade-q-url> --message-body \
 #       '{"id":"...","type":"MembershipRevoked","source":"iam-org-membership",
 #         "specversion":"1","tenant_id":"...","time":"...","data":{"user_id":"..."}}'
 #
-# Matches api/asyncapi.yaml. Runs automatically on container start via the
-# volume mount to /etc/localstack/init/ready.d/.
+# Matches api/asyncapi.yaml. The docker-compose `floci` service mounts this
+# repo's internal/eventschema/ directory read-only at
+# /etc/floci/init/schemas so this script can read the schema definitions
+# straight from source — one place to update when a schema changes.
 
 set -euo pipefail
 
 AWS_ACCOUNT=000000000000
 AWS_REGION=ap-south-1
 MAX_RECEIVES=5
+SCHEMAS_DIR=/etc/floci/init/schemas
+
+# The AWS CLI baked into the floci compat image defaults AWS_DEFAULT_REGION
+# to us-east-1 regardless of FLOCI_DEFAULT_REGION — pin both region env vars
+# so every `aws` call below lands in ap-south-1.
+export AWS_DEFAULT_REGION="$AWS_REGION"
+export AWS_REGION="$AWS_REGION"
 
 queue_arn() { printf 'arn:aws:sqs:%s:%s:%s' "$AWS_REGION" "$AWS_ACCOUNT" "$1"; }
-
-# ── Glue Schema Registry ──────────────────────────────────────────────────────
-# Best-effort: Glue requires LocalStack Pro (docker-compose.pro.yml). If
-# unavailable the script continues so SNS/SQS are always created.
-SCHEMA_DIR="/etc/localstack/init/schemas"
-if awslocal glue create-registry --registry-name iam-delegation-events 2>/dev/null; then
-  echo "Glue registry iam-delegation-events created"
-  register_schema() {
-    local FILE="$1" NAME="$2"
-    awslocal glue create-schema \
-      --registry-id "RegistryName=iam-delegation-events" \
-      --schema-name "$NAME" \
-      --data-format JSON \
-      --compatibility BACKWARD \
-      --schema-definition "$(cat "$FILE")"
-    echo "Glue schema $NAME created (from $(basename "$FILE"))"
-  }
-  register_schema "${SCHEMA_DIR}/delegation_started.json"              DelegationStarted
-  register_schema "${SCHEMA_DIR}/delegation_ended.json"                DelegationEnded
-  register_schema "${SCHEMA_DIR}/delegation_review_requested.json"     DelegationReviewRequested
-  register_schema "${SCHEMA_DIR}/delegation_escalation_requested.json" DelegationEscalationRequested
-else
-  echo "Glue not available — skipping registry setup (GLUE_REGISTRY_NAME must remain empty)"
-fi
-
-# ── Outbound SNS topic ────────────────────────────────────────────────────────
-TOPIC_ARN=$(awslocal sns create-topic --name iam-delegation-events --query TopicArn --output text)
-echo "SNS topic: $TOPIC_ARN"
 
 # ── Helper: provision queue + DLQ (no SNS subscription) ──────────────────────
 provision_queue() {
   local queue="$1"
   local dlq="${queue}-dlq"
 
-  awslocal sqs create-queue --queue-name "$dlq" >/dev/null
+  aws sqs create-queue --queue-name "$dlq" >/dev/null
 
   local attrs
   attrs=$(mktemp)
@@ -82,11 +74,11 @@ provision_queue() {
   "RedrivePolicy": "{\"deadLetterTargetArn\":\"$(queue_arn "$dlq")\",\"maxReceiveCount\":\"${MAX_RECEIVES}\"}"
 }
 EOF
-  awslocal sqs create-queue --queue-name "$queue" --attributes "file://$attrs" >/dev/null
+  aws sqs create-queue --queue-name "$queue" --attributes "file://$attrs" >/dev/null
   rm -f "$attrs"
 
-  echo "  Queue: $(awslocal sqs get-queue-url --queue-name "$queue" --output text)"
-  echo "  DLQ:   $(awslocal sqs get-queue-url --queue-name "$dlq" --output text)"
+  echo "  Queue: $(aws sqs get-queue-url --queue-name "$queue" --output text)"
+  echo "  DLQ:   $(aws sqs get-queue-url --queue-name "$dlq" --output text)"
 }
 
 # ── Helper: provision queue + DLQ + SNS subscription with optional filter ─────
@@ -104,7 +96,7 @@ provision_subscriber() {
   queue_arn_val=$(queue_arn "$queue")
 
   local sub_arn
-  sub_arn=$(awslocal sns subscribe \
+  sub_arn=$(aws sns subscribe \
     --topic-arn "$TOPIC_ARN" \
     --protocol sqs \
     --notification-endpoint "$queue_arn_val" \
@@ -114,8 +106,8 @@ provision_subscriber() {
   if [ -n "$filter_policy" ]; then
     local attrs
     attrs=$(mktemp)
-    printf '%s' "$filter_policy" > "$attrs"
-    awslocal sns set-subscription-attributes \
+    printf '%s' "$filter_policy" >"$attrs"
+    aws sns set-subscription-attributes \
       --subscription-arn "$sub_arn" \
       --attribute-name FilterPolicy \
       --attribute-value "file://$attrs" >/dev/null
@@ -125,6 +117,22 @@ provision_subscriber() {
     echo "  Subscribed: $queue  (no filter — receives all event types)"
   fi
 }
+
+# ── Helper: register a Glue schema (idempotent create-registry, then create-schema) ─
+register_schema() {
+  local file="$1" name="$2"
+  aws glue create-schema \
+    --registry-id "RegistryName=iam-delegation-events" \
+    --schema-name "$name" \
+    --data-format JSON \
+    --compatibility BACKWARD \
+    --schema-definition "file://${SCHEMAS_DIR}/${file}" >/dev/null
+  echo "Glue schema $name created (from $(basename "$file"))"
+}
+
+# ── Outbound SNS topic ────────────────────────────────────────────────────────
+TOPIC_ARN=$(aws sns create-topic --name iam-delegation-events --query TopicArn --output text)
+echo "SNS topic: $TOPIC_ARN"
 
 # ── Inbound queue (this service consumes) ─────────────────────────────────────
 echo ""
@@ -154,12 +162,30 @@ provision_subscriber "delegation-notification-q" \
 # Audit Log — all four event types, no filter (immutable audit trail)
 provision_subscriber "delegation-audit-q" ""
 
+# ── Glue Schema Registry — registered LAST, deliberately ─────────────────────
+# The floci healthcheck (docker-compose.yml) polls for the last schema
+# registered here (DelegationEscalationRequested) to decide the container is
+# "healthy" and unblock iam-delegation's own `depends_on: condition:
+# service_healthy`. Registering Glue after every SNS/SQS resource above (not
+# before, as an earlier revision of this script did) makes that healthcheck
+# a true signal that the FULL provisioning run — topic, inbound queue, and
+# all downstream subscriptions — has actually completed, not just the Glue
+# portion; matches iam-org-membership's scripts/init-floci.sh ordering.
+aws glue create-registry --registry-name iam-delegation-events >/dev/null
+echo "Glue registry iam-delegation-events created"
+
+register_schema delegation_started.json              DelegationStarted
+register_schema delegation_ended.json                 DelegationEnded
+register_schema delegation_review_requested.json      DelegationReviewRequested
+register_schema delegation_escalation_requested.json  DelegationEscalationRequested
+
 echo ""
-echo "LocalStack init complete."
+echo "Floci init complete."
 echo ""
 echo "Resources:"
-echo "  SNS topic  : $TOPIC_ARN"
-echo "  Inbound  q : delegation-cascade-q  (MembershipRevoked / TenantMembershipsPurged / UserUpdated)"
-echo "  Subscriber : delegation-workflow-q      (DelegationStarted, DelegationEnded, DelegationEscalationRequested)"
-echo "  Subscriber : delegation-notification-q  (DelegationStarted, DelegationEnded, DelegationReviewRequested, DelegationEscalationRequested)"
-echo "  Subscriber : delegation-audit-q         (all events — no filter)"
+echo "  Glue registry : iam-delegation-events (4 schemas)"
+echo "  SNS topic     : $TOPIC_ARN"
+echo "  Inbound  q    : delegation-cascade-q  (MembershipRevoked / TenantMembershipsPurged / UserUpdated)"
+echo "  Subscriber    : delegation-workflow-q      (DelegationStarted, DelegationEnded, DelegationEscalationRequested)"
+echo "  Subscriber    : delegation-notification-q  (DelegationStarted, DelegationEnded, DelegationReviewRequested, DelegationEscalationRequested)"
+echo "  Subscriber    : delegation-audit-q         (all events — no filter)"

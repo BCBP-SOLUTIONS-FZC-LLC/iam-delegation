@@ -22,7 +22,7 @@ const listTTL = 60 * time.Second
 // logs internally on failure and degrades to a cache miss/no-op.
 type Cache struct {
 	client *redis.Client
-	logger Logger
+	logger port.Logger
 }
 
 var _ port.Cache = (*Cache)(nil)
@@ -30,7 +30,7 @@ var _ port.Cache = (*Cache)(nil)
 // NewCache builds a Cache from an existing *redis.Client (see NewClient).
 // logger may be nil, in which case failures are silently swallowed — still
 // safe per port.Cache's contract, just without an operator-visible signal.
-func NewCache(client *redis.Client, logger Logger) *Cache {
+func NewCache(client *redis.Client, logger port.Logger) *Cache {
 	return &Cache{client: client, logger: logger}
 }
 

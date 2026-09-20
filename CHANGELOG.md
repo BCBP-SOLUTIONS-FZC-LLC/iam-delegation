@@ -30,6 +30,11 @@ index into those, not a duplicate of them.
   and `templates/prometheusrule.yaml`'s new `iam_delegation_slo_records`/`iam_delegation_slo_burn`
   groups — a formalization of targets §14.1/§14.5 already stated, complementing (not replacing)
   the existing threshold alerts in `app-alerts.yml`.
+- LLD §17.4 end-to-end test suite (DLG-D41, `cmd/server/e2e_test.go`, `//go:build e2e`) — boots
+  the real composition root against real Postgres/Valkey/floci containers and drives it over real
+  HTTP/SQS, closing the gap where `make test-e2e` silently re-ran the untagged unit suite (no file
+  anywhere declared the `e2e` build tag). Covers create/cancel fan-out, expiry, the review daily
+  cascade, and the user-removal cascade (including DLG-EVT-4's silent delegator-side end).
 
 ### Changed
 
@@ -39,28 +44,55 @@ index into those, not a duplicate of them.
 
 ### Fixed
 
+- **Production-readiness sweep (DLG-D40):** `registerDocsRoutes` only gates `/swagger` and
+  `/asyncapi` behind `docsAuthMiddleware` when `Environment=="production"` AND `AuthToken!=""` —
+  `loadConfig` had no matching fail-fast, so `DOCS_ENABLED=true` with `DOCS_AUTH_TOKEN` unset in
+  production would have served both docs surfaces with no auth check at all. `loadConfig` now
+  rejects that combination at startup. Also removed `Metrics.SetActiveGauge` (dead code — no call
+  site outside its own test; `ReplaceActiveGauges` already sets the same gauge inline).
 - Database connection/configuration/operations re-checked against
-  `iam-realm-provisioner` / `iam-org-membership` (DLG-D37): `wrapConnErr` now maps
-  Go-level network/IO failures (`io.EOF`, `*net.OpError`, ECONNRESET) to
-  `db_unavailable` 503; `loadConfig` requires `DATABASE_URL` (or `PG_HOST`+
-  `PG_USER`+`PG_PASSWORD`) and `MIGRATION_DATABASE_URL` whenever
-  `PG_BOUNCER_MODE=true`; the reconciler uses the same `isDevLikeEnvironment`
-  `SYSTEM_DATABASE_URL` fail-fast as `cmd/server`; both pools `defer Close()`
-  after `DrainAndClose`; startup migrations go through a single
-  `postgres.Migrate` entry point that logs via pgcommon's `migrate.Runner`.
-  Both binaries now key the `SYSTEM_DATABASE_URL` fail-fast off `resolveAppEnv()`
-  (`APP_ENV`, then `ENVIRONMENT`) and treat `test` as a local/dev alias, matching
-  `iam-org-membership`'s `isDevLikeEnv`.
+  `iam-user-profile` / `iam-org-membership` (DLG-D43): the active-gauge
+  snapshot now uses `pgcommon.Pool.WithConn` (O&M's exporter pattern) instead
+  of opening a `RunInTx` for a read-only `COUNT`; `ApplyStatementTimeout`
+  uses `?` when the DSN has no query string so `SYSTEM_DATABASE_URL` /
+  `MIGRATION_DATABASE_URL` without `?sslmode=` stay valid URLs. Connection,
+  pool, GUC, migrate, health, and `TxRunner` already went through pgcommon
+  (DLG-D23/D32/D37); `wrapConnErr` keeps the D32 pass-through for business
+  errors rather than O&M's catch-all 503.
+- Events/outbox/dedup pass through `platform-events` only (DLG-D45):
+  deleted the local enqueue `Codec`/`NoopCodec` duplicate; `Publisher` and
+  `ValidatingCodec` now implement/wrap `events.Codec` and use
+  `events.NoopCodec` at enqueue time (the library ships no schema
+  validator or Glue codec — those remain service-side `events.Codec`
+  implementations). SNS/SQS/outbox runner/dedup composition from DLG-D44
+  is unchanged.
+- Events/outbox/dedup re-checked against `iam-user-profile` /
+  `iam-org-membership` (DLG-D44): SNS/SQS/outbox runner now go through
+  `platform-events` `config.LoadSNS` / `LoadSQS` / `LoadOutbox` +
+  `SNSConfigFromEnv` / `SQSConfigFromEnv` / `SQSConsumerOptions` /
+  `RunnerConfigFromEnv` (the siblings' composition contract). `CASCADE_*`
+  overlays `SQS_QUEUE_URL`/`SQS_CONCURRENCY` the same way O&M overlays
+  per-queue names. `eventbus.Publisher` reads the `RunInTx` tx via
+  `port.TxFromContext` so it no longer imports the postgres adapter. Helm /
+  `.env.example` keep the historical `OUTBOX_*` values so library defaults
+  (`5s` poll / concurrency 1) do not silently change production. Consume
+  still uses `GlueDecodeCodec` (O&M catalog-only consume is LLD A68);
+  RoutingPublisher is not copied.
 - Events/outbox/dedup re-checked against `iam-realm-provisioner` /
   `iam-org-membership` (DLG-D38): `outbox_events.payload` is `TEXT` with an
   `outbox_normalize_payload` trigger (PgBouncer SimpleProtocol); cascade
   PG writes and `processed_events` commit in one `TxRunner.RunInTx`; filtered
   `UserUpdated` acks record a dedup row; `idx_processed_events_processed_at`
   backs prune; `PROCESSED_EVENTS_TTL_DAYS` (default 30) drives monthly cleanup.
-- Logs/metrics/traces re-checked against `iam-realm-provisioner` / `iam-org-membership`
-  (DLG-D36): both binaries now flush the TracerProvider *then* `gincommon.Shutdown` (Zap
-  Sync) after pool drain, matching the siblings; unhandled HTTP 500s log through the
-  gincommon logger `NewRouter` installs instead of staying silent.
+- Logs/metrics/traces re-checked against `iam-user-profile` / `iam-org-membership`
+  (DLG-D42): duplicated per-package `Logger` interfaces collapsed onto one
+  `internal/core/port.Logger` matching gincommon's Zap shape; both binaries
+  construct the sink via `logger.NewLogger` and thread that value through
+  gincommon / platform-events / pgcommon (`postgres.NewLoggerAdapter` remains
+  the only adapter, for pgcommon's Field-based `domain.Logger`); the reconciler
+  now calls `events`/`pgmetrics` `InitWithRegisterer` after
+  `ObservabilityMiddlewares`; unhandled HTTP 500s include gincommon
+  `trace_id`/`request_id` plus path/method.
 - **`cmd/server` ran the outbox/domain migrations *after* opening the RLS-scoped `delegation_app`
   pool**, not just in the wrong order relative to each other (that ordering was already fixed —
   see the migration-startup-order entry below). On a genuinely fresh database the domain migration

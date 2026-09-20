@@ -77,12 +77,11 @@ and permanently corrupts the audit trail for the duration.
 
 ## Local development
 
-`scripts/init-localstack.sh` registers the four schemas under the same
-names into LocalStack's Glue mock, but only when running with
-`docker-compose.pro.yml` (Glue is a LocalStack Pro feature). Without it the
-script logs and continues, and the app must run with `GLUE_REGISTRY_NAME=""`
-(NoopCodec) — this is also the default for the plain `docker-compose.yml`
-stack.
+`scripts/init-floci.sh` registers the four schemas under the same names into
+floci's real Glue Schema Registry — floci includes it in the free tier
+(unlike LocalStack Community, which gated it behind Pro), so `docker-compose.yml`'s
+default stack always runs the real Glue codec locally; `GLUE_REGISTRY_NAME=""`
+(NoopCodec) is only needed if you deliberately want to bypass it.
 
 ## Adding a new event type
 
@@ -110,7 +109,7 @@ stack.
    at publish time even though every Go-level unit test passes.
 5. Extend `SCHEMA_NAME_MAP` in `.github/workflows/schema-registry.yml` (all
    three job blocks) and the `register_schema` call in
-   `scripts/init-localstack.sh`.
+   `scripts/init-floci.sh`.
 6. Add `x-lifecycle`/`x-owner` annotations to the new message in
    `api/asyncapi.yaml`.
 7. Run `make schema-validate` locally.
@@ -136,13 +135,15 @@ pod's own IRSA role.
 ## Required env vars
 
 Set in `deploy/helm/iam-delegation/values.yaml` (per environment) or `.env`
-(dev, via `docker-compose.pro.yml`):
+(dev, via `docker-compose.yml`'s `floci` service — Floci includes Glue
+Schema Registry in its free tier, so no separate Pro-tier compose stack is
+needed):
 
 | Variable | Purpose | Notes |
 |---|---|---|
-| `GLUE_REGISTRY_NAME` | Glue registry name | Set to `iam-delegation-events` in production/staging. Leave empty in dev (NoopCodec). |
+| `GLUE_REGISTRY_NAME` | Glue registry name | Set to `iam-delegation-events` in production/staging, and by default in local dev too (floci provisions it for free). Leave empty to force NoopCodec. |
 | `GLUE_REGISTRY_ARN` | Full registry ARN | For IAM policy scoping; used by `schema-gov register` and `deploy/iam/policy.tf.example`. Not read by the Go runtime. |
-| `AWS_REGION` | Primary region | `ap-south-1` everywhere — production, local dev, and CI (see `deploy/helm/iam-delegation/values.yaml`; local dev/CI additionally point `AWS_ENDPOINT_URL` at LocalStack). |
+| `AWS_REGION` | Primary region | `ap-south-1` everywhere — production, local dev, and CI (see `deploy/helm/iam-delegation/values.yaml`; local dev/CI additionally point `AWS_ENDPOINT_URL` at floci). |
 
 ## CI governance pipeline
 

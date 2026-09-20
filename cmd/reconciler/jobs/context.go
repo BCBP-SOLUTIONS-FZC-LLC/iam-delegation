@@ -22,15 +22,6 @@ import (
 	"github.com/google/uuid"
 )
 
-// Logger is the minimal structured-logging seam every job uses — satisfied
-// by the same slog-backed adapter cmd/server and cmd/reconciler both build
-// (mirrors the map[string]interface{}-based Logger shape used across this
-// service's adapters).
-type Logger interface {
-	Info(msg string, fields map[string]interface{})
-	Warn(msg string, fields map[string]interface{})
-}
-
 // BindTenantGUC binds app.tenant_id (and app.user_id) into ctx before any
 // per-tenant UPDATE, per LLD §7.3/RLS-6 — the split-brain trap where a
 // missing binding makes the WITH CHECK silently affect zero rows.
@@ -73,7 +64,7 @@ type Context struct {
 	UserProfile            port.UserProfileClient
 	TxRunner               port.TxRunner
 	BindTenantGUC          BindTenantGUC
-	Logger                 Logger
+	Logger                 port.Logger
 	BatchLimit             int
 	RetentionDays          int                  // delegation-cleanup only (LLD §18.4, default 90)
 	ProcessedEvents        ProcessedEventsStore // delegation-cleanup only — purges the idempotency ledger (LLD §18.4, GAP-09); nil means skip

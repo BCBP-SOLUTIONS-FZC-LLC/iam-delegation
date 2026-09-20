@@ -25,6 +25,7 @@ import (
 	"github.com/BCBP-SOLUTIONS-FZC-LLC/platform-gincommon/pkg/gincommon"
 	gclogger "github.com/BCBP-SOLUTIONS-FZC-LLC/platform-gincommon/pkg/logger"
 	pgcommon "github.com/BCBP-SOLUTIONS-FZC-LLC/platform-pgcommon/pkg/pgcommon"
+	"github.com/BCBP-SOLUTIONS-FZC-LLC/platform-pgcommon/pkg/pgmetrics"
 
 	"github.com/BCBP-SOLUTIONS-FZC-LLC/iam-delegation/cmd/reconciler/jobs"
 	"github.com/BCBP-SOLUTIONS-FZC-LLC/iam-delegation/internal/adapter/outbound/eventbus"
@@ -32,21 +33,23 @@ import (
 	pgadapter "github.com/BCBP-SOLUTIONS-FZC-LLC/iam-delegation/internal/adapter/outbound/postgres"
 	"github.com/BCBP-SOLUTIONS-FZC-LLC/iam-delegation/internal/adapter/outbound/userprofile"
 	"github.com/BCBP-SOLUTIONS-FZC-LLC/iam-delegation/internal/core/domain"
+	"github.com/BCBP-SOLUTIONS-FZC-LLC/iam-delegation/internal/core/port"
+	events "github.com/BCBP-SOLUTIONS-FZC-LLC/platform-events/pkg/events"
 )
 
 func main() {
 	ensureGincommonEnv()
-	logger, err := gclogger.NewLogger(resolveAppEnv())
+	log, err := gclogger.NewLogger(resolveAppEnv())
 	if err != nil {
 		panic("init logger: " + err.Error())
 	}
-	if err := run(logger); err != nil {
-		logger.Error("iam-delegation-reconciler exited with error", map[string]interface{}{"error": err.Error()})
+	if err := run(log); err != nil {
+		log.Error("iam-delegation-reconciler exited with error", map[string]interface{}{"error": err.Error()})
 		os.Exit(1)
 	}
 }
 
-func run(logger Logger) error {
+func run(logger port.Logger) error {
 	jobName := flag.String("job", "", "one of: delegation-expiry, delegation-activation, delegation-review, delegation-cleanup")
 	flag.Parse()
 	if *jobName == "" {
@@ -67,13 +70,16 @@ func run(logger Logger) error {
 	//nolint:errcheck // best-effort flush on exit; the job's own exit code is what matters
 	defer func() { _ = gincommon.Shutdown(logger) }()
 	defer shutdownTracing()
-	serviceName := getEnv("APP_NAME", "iam-delegation-reconciler")
-	_ = gincommon.ObservabilityMiddlewares(gincommon.Config{
+	ginCfg := gincommon.Config{
 		Logger:       logger,
-		ServiceName:  serviceName,
+		ServiceName:  getEnv("APP_NAME", "iam-delegation-reconciler"),
 		BuildVersion: getEnv("BUILD_VERSION", "dev"),
-	})
+	}
+	_ = gincommon.ObservabilityMiddlewares(ginCfg)
 	reconcilerMetrics := metrics.Register()
+	events.InitWithRegisterer(ginCfg.ServiceName, ginCfg.BuildVersion, gincommon.MetricsRegisterer())
+	pgmetrics.InitWithRegisterer(ginCfg.ServiceName, ginCfg.BuildVersion, gincommon.MetricsRegisterer())
+	serviceName := ginCfg.ServiceName
 
 	ctx, jobSpan := otel.Tracer(serviceName).Start(ctx, "reconciler."+*jobName)
 	defer jobSpan.End()
@@ -159,7 +165,7 @@ func run(logger Logger) error {
 	// DelegationEnded / DelegationReviewRequested are schema-checked at
 	// enqueue, matching cmd/server and iam-realm-provisioner. Nil publisher
 	// would leave EventPublisherFromContext empty and silently skip emission.
-	enqueueCodec, err := eventbus.NewValidatingCodec(eventbus.NoopCodec{})
+	enqueueCodec, err := eventbus.NewValidatingCodec(events.NoopCodec{})
 	if err != nil {
 		return fmt.Errorf("build enqueue codec: %w", err)
 	}

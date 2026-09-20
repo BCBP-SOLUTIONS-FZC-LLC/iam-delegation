@@ -13,8 +13,9 @@ import (
 	"github.com/stretchr/testify/require"
 	"go.opentelemetry.io/otel/trace"
 
-	pgadapter "github.com/BCBP-SOLUTIONS-FZC-LLC/iam-delegation/internal/adapter/outbound/postgres"
 	"github.com/BCBP-SOLUTIONS-FZC-LLC/iam-delegation/internal/core/domain"
+	"github.com/BCBP-SOLUTIONS-FZC-LLC/iam-delegation/internal/core/port"
+	"github.com/BCBP-SOLUTIONS-FZC-LLC/platform-events/pkg/events"
 )
 
 // fakeTx implements pgx.Tx by embedding the nil interface (any method other
@@ -37,8 +38,12 @@ func (f *fakeTx) Exec(_ context.Context, sql string, args ...any) (pgconn.Comman
 
 type failingCodec struct{ err error }
 
-func (f failingCodec) Encode(context.Context, string, []byte) ([]byte, string, error) {
+func (f failingCodec) Encode(context.Context, string, json.RawMessage) ([]byte, string, error) {
 	return nil, "", f.err
+}
+
+func (failingCodec) Decode(context.Context, string, []byte) (json.RawMessage, error) {
+	return nil, errors.New("failingCodec is encode-only")
 }
 
 type fakePublisherLogger struct {
@@ -54,10 +59,10 @@ func (f *fakePublisherLogger) Error(string, map[string]interface{}) { f.errorCou
 // p.log.Debug call is reached when p.log != nil and outbox.Enqueue succeeds.
 func TestPublisher_EnqueueCtx_WithLogger_DebugPath(t *testing.T) {
 	log := &fakePublisherLogger{}
-	p := New(domain.Source, NoopCodec{}).WithLogger(log)
+	p := New(domain.Source, events.NoopCodec{}).WithLogger(log)
 	tx := &fakeTx{}
 
-	require.NoError(t, p.EnqueueCtx(pgadapter.WithTx(context.Background(), tx), &domain.DomainEvent{
+	require.NoError(t, p.EnqueueCtx(port.WithTx(context.Background(), tx), &domain.DomainEvent{
 		Type:     domain.EventDelegationStarted,
 		TenantID: uuid.New(),
 		Data:     map[string]string{"k": "v"},
@@ -68,7 +73,7 @@ func TestPublisher_EnqueueCtx_WithLogger_DebugPath(t *testing.T) {
 }
 
 func TestPublisher_EnqueueCtx_HappyPath_InsertsIntoOutbox(t *testing.T) {
-	p := New(domain.Source, NoopCodec{})
+	p := New(domain.Source, events.NoopCodec{})
 	tx := &fakeTx{}
 
 	tenantID := uuid.New()
@@ -80,7 +85,7 @@ func TestPublisher_EnqueueCtx_HappyPath_InsertsIntoOutbox(t *testing.T) {
 		Data:     map[string]string{"k": "v"},
 	}
 
-	err := p.EnqueueCtx(pgadapter.WithTx(context.Background(), tx), event)
+	err := p.EnqueueCtx(port.WithTx(context.Background(), tx), event)
 	require.NoError(t, err)
 	require.Len(t, tx.execCalls, 1, "exactly one INSERT into outbox_events")
 
@@ -91,7 +96,7 @@ func TestPublisher_EnqueueCtx_HappyPath_InsertsIntoOutbox(t *testing.T) {
 }
 
 func TestPublisher_EnqueueCtx_RequiresOpenTx(t *testing.T) {
-	p := New(domain.Source, NoopCodec{})
+	p := New(domain.Source, events.NoopCodec{})
 	err := p.EnqueueCtx(context.Background(), &domain.DomainEvent{
 		Type:     domain.EventDelegationStarted,
 		TenantID: uuid.New(),
@@ -106,7 +111,7 @@ func TestPublisher_EnqueueCtx_CodecRejectionNeverTouchesOutbox(t *testing.T) {
 	p := New(domain.Source, failingCodec{err: wantErr})
 	tx := &fakeTx{}
 
-	err := p.EnqueueCtx(pgadapter.WithTx(context.Background(), tx), &domain.DomainEvent{
+	err := p.EnqueueCtx(port.WithTx(context.Background(), tx), &domain.DomainEvent{
 		Type:     domain.EventDelegationStarted,
 		TenantID: uuid.New(),
 		Data:     map[string]string{"k": "v"},
@@ -117,11 +122,11 @@ func TestPublisher_EnqueueCtx_CodecRejectionNeverTouchesOutbox(t *testing.T) {
 }
 
 func TestPublisher_EnqueueCtx_ExecFailurePropagates(t *testing.T) {
-	p := New(domain.Source, NoopCodec{})
+	p := New(domain.Source, events.NoopCodec{})
 	execErr := errors.New("connection reset")
 	tx := &fakeTx{execErr: execErr}
 
-	err := p.EnqueueCtx(pgadapter.WithTx(context.Background(), tx), &domain.DomainEvent{
+	err := p.EnqueueCtx(port.WithTx(context.Background(), tx), &domain.DomainEvent{
 		Type:     domain.EventDelegationEnded,
 		TenantID: uuid.New(),
 		Data:     map[string]string{"k": "v"},
@@ -131,17 +136,17 @@ func TestPublisher_EnqueueCtx_ExecFailurePropagates(t *testing.T) {
 }
 
 func TestPublisher_WithLogger_ReturnsSamePublisherForChaining(t *testing.T) {
-	p := New(domain.Source, NoopCodec{})
+	p := New(domain.Source, events.NoopCodec{})
 	got := p.WithLogger(nil)
 	assert.Same(t, p, got)
 }
 
 func TestPublisher_WithLogger_RoutesExecFailureLogThroughAttachedLogger(t *testing.T) {
 	fl := &fakePublisherLogger{}
-	p := New(domain.Source, NoopCodec{}).WithLogger(fl)
+	p := New(domain.Source, events.NoopCodec{}).WithLogger(fl)
 	tx := &fakeTx{execErr: errors.New("connection reset")}
 
-	require.Error(t, p.EnqueueCtx(pgadapter.WithTx(context.Background(), tx), &domain.DomainEvent{
+	require.Error(t, p.EnqueueCtx(port.WithTx(context.Background(), tx), &domain.DomainEvent{
 		Type:     domain.EventDelegationEnded,
 		TenantID: uuid.New(),
 		Data:     map[string]string{"k": "v"},
@@ -150,10 +155,10 @@ func TestPublisher_WithLogger_RoutesExecFailureLogThroughAttachedLogger(t *testi
 }
 
 func TestPublisher_EnqueueCtx_MarshalErrorPropagates(t *testing.T) {
-	p := New(domain.Source, NoopCodec{})
+	p := New(domain.Source, events.NoopCodec{})
 	tx := &fakeTx{}
 
-	err := p.EnqueueCtx(pgadapter.WithTx(context.Background(), tx), &domain.DomainEvent{
+	err := p.EnqueueCtx(port.WithTx(context.Background(), tx), &domain.DomainEvent{
 		Type:     domain.EventDelegationEnded,
 		TenantID: uuid.New(),
 		Data:     make(chan int),
@@ -164,11 +169,11 @@ func TestPublisher_EnqueueCtx_MarshalErrorPropagates(t *testing.T) {
 }
 
 func TestPublisher_EnqueueCtx_IPAddressAndUserAgentPropagateIntoEnvelope(t *testing.T) {
-	p := New(domain.Source, NoopCodec{})
+	p := New(domain.Source, events.NoopCodec{})
 	tx := &fakeTx{}
 
 	tenantID := uuid.New()
-	require.NoError(t, p.EnqueueCtx(pgadapter.WithTx(context.Background(), tx), &domain.DomainEvent{
+	require.NoError(t, p.EnqueueCtx(port.WithTx(context.Background(), tx), &domain.DomainEvent{
 		Type:      domain.EventDelegationEnded,
 		TenantID:  tenantID,
 		Subject:   tenantID.String(),
@@ -191,7 +196,7 @@ func TestPublisher_EnqueueCtx_IPAddressAndUserAgentPropagateIntoEnvelope(t *test
 }
 
 func TestPublisher_EnqueueCtx_ValidSpanContextPropagatesTraceAndCorrelationID(t *testing.T) {
-	p := New(domain.Source, NoopCodec{})
+	p := New(domain.Source, events.NoopCodec{})
 	tx := &fakeTx{}
 
 	traceID, err := trace.TraceIDFromHex("4bf92f3577b34da6a3ce929d0e0e4736")
@@ -201,7 +206,7 @@ func TestPublisher_EnqueueCtx_ValidSpanContextPropagatesTraceAndCorrelationID(t 
 	sc := trace.NewSpanContext(trace.SpanContextConfig{TraceID: traceID, SpanID: spanID, TraceFlags: trace.FlagsSampled})
 	ctx := trace.ContextWithSpanContext(context.Background(), sc)
 
-	require.NoError(t, p.EnqueueCtx(pgadapter.WithTx(ctx, tx), &domain.DomainEvent{
+	require.NoError(t, p.EnqueueCtx(port.WithTx(ctx, tx), &domain.DomainEvent{
 		Type:     domain.EventDelegationEnded,
 		TenantID: uuid.New(),
 		Data:     map[string]string{"k": "v"},
@@ -220,10 +225,10 @@ func TestPublisher_EnqueueCtx_ValidSpanContextPropagatesTraceAndCorrelationID(t 
 }
 
 func TestPublisher_EnqueueCtx_StampsSchemaVersion(t *testing.T) {
-	p := New(domain.Source, NoopCodec{})
+	p := New(domain.Source, events.NoopCodec{})
 	tx := &fakeTx{}
 
-	require.NoError(t, p.EnqueueCtx(pgadapter.WithTx(context.Background(), tx), &domain.DomainEvent{
+	require.NoError(t, p.EnqueueCtx(port.WithTx(context.Background(), tx), &domain.DomainEvent{
 		Type:     domain.EventDelegationStarted,
 		TenantID: uuid.New(),
 		Data:     map[string]string{"k": "v"},

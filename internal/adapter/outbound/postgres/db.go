@@ -65,7 +65,14 @@ func ApplyStatementTimeout(dsn string) string {
 			if strings.Contains(dsn, "statement_timeout") {
 				return dsn
 			}
-			dsn += fmt.Sprintf("&options=-c%%20statement_timeout%%3D%d", d.Milliseconds())
+			// DATABASE_URL / SYSTEM_DATABASE_URL may omit a query string
+			// (postgres://user@host/db). Always appending "&options=…"
+			// produces an invalid URL; use "?" when none is present.
+			sep := "&"
+			if !strings.Contains(dsn, "?") {
+				sep = "?"
+			}
+			dsn += fmt.Sprintf("%soptions=-c%%20statement_timeout%%3D%d", sep, d.Milliseconds())
 		}
 	}
 	return dsn
@@ -85,7 +92,7 @@ func ApplyStatementTimeout(dsn string) string {
 // ConfigFromEnv so sysPool and the app pool share one env-driven source
 // of truth. Tracer is left unset — call sites wire NewOTelTracer so
 // db.query spans export through gincommon's TracerProvider.
-func SystemPoolConfig(dsn string, log Logger) pgcommon.Config {
+func SystemPoolConfig(dsn string, log port.Logger) pgcommon.Config {
 	cfg, _ := pgcommon.ConfigFromEnv()
 	cfg.DSN = ApplyStatementTimeout(dsn)
 	cfg.GUCProvider = nil
@@ -156,8 +163,9 @@ func WithTenantGUC(ctx context.Context, tenantID uuid.UUID, userID string) conte
 // provided, binds it via port.WithEventPublisher so service code can
 // enqueue events atomically with the state change (DLG-EVT-1) without ever
 // importing this package or touching pgx.Tx directly.
-// Matching iam-realm-provisioner: postgres does not import platform-events;
-// eventbus.Publisher reads the tx via TxFromContext and calls outbox.Enqueue.
+// Matching iam-user-profile / iam-org-membership: postgres does not import
+// platform-events; eventbus.Publisher reads the tx via port.TxFromContext
+// and calls outbox.Enqueue.
 type TxRunner struct {
 	pool   *pgcommon.Pool
 	events port.EventPublisher
@@ -195,7 +203,7 @@ func NewTxRunner(pool *pgcommon.Pool, events port.EventPublisher) *TxRunner {
 // together. A nested Begin would commit independently and reopen the
 // crash window the outer tx exists to close.
 func (r *TxRunner) RunInTx(ctx context.Context, fn func(ctx context.Context) error) error {
-	if _, ok := TxFromContext(ctx); ok {
+	if _, ok := port.TxFromContext(ctx); ok {
 		txCtx := ctx
 		if r.events != nil {
 			if _, bound := port.EventPublisherFromContext(ctx); !bound {
@@ -205,7 +213,7 @@ func (r *TxRunner) RunInTx(ctx context.Context, fn func(ctx context.Context) err
 		return wrapConnErr(fn(txCtx))
 	}
 	return wrapConnErr(pgcommon.RunInTxWithRetryOpts(ctx, r.pool, pgx.TxOptions{}, writeRetryOpts, func(ctx context.Context, tx pgx.Tx) error {
-		txCtx := WithTx(ctx, tx)
+		txCtx := port.WithTx(ctx, tx)
 		if r.events != nil {
 			txCtx = port.WithEventPublisher(txCtx, r.events)
 		}
@@ -213,18 +221,23 @@ func (r *TxRunner) RunInTx(ctx context.Context, fn func(ctx context.Context) err
 	}))
 }
 
-type txKey struct{}
-
-// WithTx stores the active pgx.Tx in ctx so repository withPool joins and
-// EventPublisher.Enqueue writes the outbox on the same transaction.
+// WithTx re-exports port.WithTx for existing call sites in this package's
+// tests. New code should call port.WithTx directly.
 func WithTx(ctx context.Context, tx pgx.Tx) context.Context {
-	return context.WithValue(ctx, txKey{}, tx)
+	return port.WithTx(ctx, tx)
 }
 
-// TxFromContext retrieves the active pgx.Tx set by RunInTx, if any.
+// TxFromContext re-exports port.TxFromContext for existing call sites in
+// this package's tests. New code should call port.TxFromContext directly.
+// port stores the tx as `any` (core imports no pgx); this is the one place
+// that owns the assertion back to the concrete type WithTx was given.
 func TxFromContext(ctx context.Context) (pgx.Tx, bool) {
-	tx, ok := ctx.Value(txKey{}).(pgx.Tx)
-	return tx, ok
+	tx, ok := port.TxFromContext(ctx)
+	if !ok {
+		return nil, false
+	}
+	pgxTx, ok := tx.(pgx.Tx)
+	return pgxTx, ok
 }
 
 // withPool runs fn against the tx already bound on ctx by TxRunner, or, when

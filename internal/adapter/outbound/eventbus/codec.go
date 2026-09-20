@@ -7,6 +7,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/BCBP-SOLUTIONS-FZC-LLC/iam-delegation/internal/core/port"
 	"github.com/BCBP-SOLUTIONS-FZC-LLC/platform-events/pkg/events"
 	"github.com/aws/aws-sdk-go-v2/service/glue"
 	gluetypes "github.com/aws/aws-sdk-go-v2/service/glue/types"
@@ -15,19 +16,19 @@ import (
 
 // GlueCodec implements platform-events' events.Codec for SNS-publish time.
 // Enqueue-time validation lives on ValidatingCodec (validating_codec.go),
-// wrapping the local enqueue NoopCodec — a different type from
-// events.NoopCodec, which is the SNS identity codec when GLUE_REGISTRY_NAME
-// is unset. The transactional outbox always stores plain, validated JSON;
-// wire-format encoding (the Glue header) is applied transiently by the SNS
-// publisher immediately before publish (LLD §10.3.1):
+// wrapping events.NoopCodec. The library ships no Glue implementation —
+// this is the service-side Codec injected via events.WithCodec. The
+// transactional outbox always stores plain, validated JSON; wire-format
+// encoding (the Glue header) is applied transiently by the SNS publisher
+// immediately before publish (LLD §10.3.1):
 //
 //	// Enqueue time (eventbus.Publisher) — plain JSON, ValidatingCodec, inside
-//	// the state-change tx (iam-realm-provisioner):
+//	// the state-change tx:
 //	pub := eventbus.New(domain.Source, validatingCodec)
 //	txRunner := postgres.NewTxRunner(pool, pub)
 //
 //	// Publish time (cmd/server/main.go) — Glue encoding happens here, not above:
-//	publisher := events.NewSNSPublisher(events.SNSConfig{...}, events.WithCodec(glueCodec))
+//	publisher := events.NewSNSPublisher(..., events.WithCodec(glueCodec))
 //
 // Registry name: "iam-delegation-events" (a new, dedicated Glue registry —
 // LLD §10.3.1; it does not share Core's registry).
@@ -47,15 +48,6 @@ const (
 // share Core's — Core drops these subjects entirely.
 const GlueRegistryName = "iam-delegation-events"
 
-// Logger is the structured logging port GlueCodec and Publisher share.
-// Matches platform-gincommon's ZapLogger so cmd/server can pass one value.
-type Logger interface {
-	Debug(msg string, fields map[string]interface{})
-	Info(msg string, fields map[string]interface{})
-	Warn(msg string, fields map[string]interface{})
-	Error(msg string, fields map[string]interface{})
-}
-
 // GlueCodec prepends the AWS Glue Schema Registry wire-format header to each payload:
 //
 //	[0x03][0x00][16-byte schema version UUID (big-endian)]
@@ -74,7 +66,7 @@ type GlueCodec struct {
 	registryName string
 	mu           sync.RWMutex
 	versionCache map[string]string // event type → schema version UUID string
-	log          Logger            // optional — see WithLogger
+	log          port.Logger       // optional — see WithLogger
 }
 
 var _ events.Codec = (*GlueCodec)(nil)
@@ -85,7 +77,7 @@ var _ events.Codec = (*GlueCodec)(nil)
 // always calls WithLogger with the gincommon Zap sink; tests that omit
 // it simply skip the refresh warning. No slog.Default() fallback —
 // matching iam-user-profile's GlueCodec.
-func (g *GlueCodec) WithLogger(log Logger) *GlueCodec {
+func (g *GlueCodec) WithLogger(log port.Logger) *GlueCodec {
 	g.log = log
 	return g
 }
@@ -283,7 +275,6 @@ func prependGlueHeader(schemaVersionID string, payload []byte) ([]byte, error) {
 	return out, nil
 }
 
-// SNS identity codec (events.NoopCodec) is chosen in cmd/server when
-// GLUE_REGISTRY_NAME is unset — Encode returns the payload unchanged with
-// an empty schemaID. The enqueue-time NoopCodec (enqueue_codec.go) is a
-// separate type wrapping the same pass-through idea for ValidatingCodec.
+// SNS identity codec is events.NoopCodec, chosen in cmd/server when
+// GLUE_REGISTRY_NAME is unset. The same type wraps ValidatingCodec at
+// enqueue time — there is no second, Encode-only NoopCodec.

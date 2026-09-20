@@ -69,6 +69,12 @@ jobs:
       - name: Reject non-transaction-local SET app.tenant_id
         run: bash .github/scripts/check-forbidden-set-guc.sh
 
+      # Events/outbox/dedup must pass through platform-events only — see
+      # .github/scripts/check-forbidden-events-bypass.sh for the full
+      # rationale.
+      - name: Reject SNS/SQS/envelope bypass of platform-events
+        run: bash .github/scripts/check-forbidden-events-bypass.sh
+
       - name: Format check
         run: |
           unformatted=$(gofmt -l cmd/ internal/ pkg/ 2>/dev/null || true)

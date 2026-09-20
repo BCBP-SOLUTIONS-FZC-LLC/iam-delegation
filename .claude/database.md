@@ -2,9 +2,10 @@
 
 **Database:** `delegation` on shared RDS PostgreSQL Multi-AZ (LLD §7). Connection,
 pool sizing, PgBouncer mode, transactions, and health all go through
-`platform-pgcommon` (DLG-D23/D32/D37, matching `iam-realm-provisioner` /
+`platform-pgcommon` (DLG-D23/D32/D37/D43, matching `iam-user-profile` /
 `iam-org-membership`): `pgcommon.ConfigFromEnv` / `pgcommon.NewPool` /
-`pgcommon.RunInTxWithRetryOpts` / `pgcommon.Pool.Health` / `DrainAndClose`.
+`pgcommon.RunInTxWithRetryOpts` / `pgcommon.Pool.WithConn` (read-only gauge
+snapshot) / `pgcommon.Pool.Health` / `DrainAndClose`.
 `PG_BOUNCER_MODE` is a standard `ConfigFromEnv` var (app pool);
 `SystemPoolConfig` forces `PGBouncerMode: true` unconditionally so the
 BYPASSRLS pool still works under transaction pooling. `wrapConnErr` maps

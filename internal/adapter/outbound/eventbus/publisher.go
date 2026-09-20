@@ -6,9 +6,9 @@ import (
 	"errors"
 	"fmt"
 
+	"github.com/jackc/pgx/v5"
 	"go.opentelemetry.io/otel/trace"
 
-	pgadapter "github.com/BCBP-SOLUTIONS-FZC-LLC/iam-delegation/internal/adapter/outbound/postgres"
 	"github.com/BCBP-SOLUTIONS-FZC-LLC/iam-delegation/internal/core/domain"
 	"github.com/BCBP-SOLUTIONS-FZC-LLC/iam-delegation/internal/core/port"
 	"github.com/BCBP-SOLUTIONS-FZC-LLC/platform-events/pkg/events"
@@ -24,22 +24,23 @@ import (
 // Glue/wire encoding is NOT performed here. It is deferred to the SNS
 // publisher (outbox runner publish path) via events.WithCodec so the
 // outbox stores human-readable plain JSON for observability and replay.
-// Matching iam-realm-provisioner.
+// Matching iam-user-profile / iam-org-membership.
 type Publisher struct {
 	source string
-	codec  Codec
-	log    Logger
+	codec  events.Codec
+	log    port.Logger
 }
 
 // New builds a Publisher that stamps source on every enqueued envelope and
-// validates payloads via codec.
-func New(source string, codec Codec) *Publisher {
+// validates payloads via codec (an events.Codec — ValidatingCodec wrapping
+// events.NoopCodec in production).
+func New(source string, codec events.Codec) *Publisher {
 	return &Publisher{source: source, codec: codec}
 }
 
 // WithLogger attaches a logger for enqueue diagnostics and returns the
 // publisher for chaining.
-func (p *Publisher) WithLogger(log Logger) *Publisher {
+func (p *Publisher) WithLogger(log port.Logger) *Publisher {
 	p.log = log
 	return p
 }
@@ -55,7 +56,7 @@ func (p *Publisher) EnqueueCtx(ctx context.Context, evt *domain.DomainEvent) err
 	if err != nil {
 		return fmt.Errorf("marshal event payload: %w", err)
 	}
-	if _, _, err := p.codec.Encode(ctx, evt.Type, raw); err != nil {
+	if _, _, err := p.codec.Encode(ctx, evt.Type, json.RawMessage(raw)); err != nil {
 		return fmt.Errorf("validate event %s: %w", evt.Type, err)
 	}
 	opts := []events.EnvelopeOpt{
@@ -77,9 +78,17 @@ func (p *Publisher) EnqueueCtx(ctx context.Context, evt *domain.DomainEvent) err
 		)
 	}
 	env := events.NewEnvelope(evt.Type, p.source, json.RawMessage(raw), opts...)
-	tx, ok := pgadapter.TxFromContext(ctx)
+	rawTx, ok := port.TxFromContext(ctx)
 	if !ok {
 		return errors.New("event enqueue requires an open RunInTx transaction")
+	}
+	// port.TxFromContext returns the tx as `any` — core/port imports no pgx
+	// (internal/core/*'s own dependency rule). This is the one place on the
+	// getter side that asserts it back to the concrete type the postgres
+	// adapter's TxRunner set via port.WithTx.
+	tx, ok := rawTx.(pgx.Tx)
+	if !ok {
+		return errors.New("event enqueue: context tx is not a pgx.Tx")
 	}
 	if err := outbox.Enqueue(ctx, tx, env); err != nil {
 		if p.log != nil {

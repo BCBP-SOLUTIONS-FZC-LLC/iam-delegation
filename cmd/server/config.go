@@ -33,30 +33,18 @@ type config struct {
 	CascadeQueueURL       string
 	CascadeSQSConcurrency int
 
-	// Outbox runner tunables (outbox.Config) — env-configurable to match
-	// iam-org-membership's/iam-user-profile's identical OUTBOX_* surface;
-	// defaults match platform-events' own library defaults where iam-org-
-	// membership's are the same, and iam-org-membership's otherwise (the
-	// fuller of the two sibling configs, and this service's original
-	// source).
-	OutboxPollInterval       time.Duration
-	OutboxBatchSize          int
-	OutboxMaxAttempts        int
-	OutboxDrainTimeout       time.Duration
-	OutboxPublishConcurrency int
-	OutboxPublishTimeout     time.Duration
-	OutboxStartupJitter      time.Duration
-	OutboxClaimLeaseDuration time.Duration
+	// Outbox runner tunables come from platform-events config.LoadOutbox
+	// (OUTBOX_*), mapped via RunnerConfigFromEnv — matching iam-user-profile
+	// / iam-org-membership. Helm / .env.example keep the historical 500ms /
+	// concurrency-4 / 2s jitter / 10m claim-lease values; library defaults
+	// apply only when those env vars are unset.
 
 	// Outbox prune sweep — platform-events' own outbox.Runner.PrunePublished
 	// is never called without this: published outbox_events rows are never
 	// deleted automatically (per pkg/outbox's own doc comment) and the table
 	// grows unbounded otherwise. Mirrors iam-user-profile's runMaintenanceSweep
-	// (daily ticker, 7-day retention, 1000-row batches) — iam-org-membership
-	// instead hand-rolls the equivalent DELETE in a reconciler job rather than
-	// calling PrunePublished; this service calls the library method directly,
-	// matching user-profile and every other "pass through platform-events"
-	// fix made this session.
+	// (daily ticker, 7-day retention, 1000-row batches). LoadOutbox does not
+	// cover prune, so these stay local.
 	OutboxPruneInterval  time.Duration
 	OutboxPruneRetention time.Duration
 	OutboxPruneLimit     int
@@ -109,30 +97,6 @@ func loadConfig() (config, error) {
 		return cfg, err
 	}
 	if cfg.PolicyDefaultReviewWindowDays, err = getEnvInt("POLICY_DEFAULT_REVIEW_WINDOW_DAYS", 90); err != nil {
-		return cfg, err
-	}
-	if cfg.OutboxPollInterval, err = getEnvDurationStr("OUTBOX_POLL_INTERVAL", 500*time.Millisecond); err != nil {
-		return cfg, err
-	}
-	if cfg.OutboxBatchSize, err = getEnvInt("OUTBOX_BATCH_SIZE", 50); err != nil {
-		return cfg, err
-	}
-	if cfg.OutboxMaxAttempts, err = getEnvInt("OUTBOX_MAX_ATTEMPTS", 5); err != nil {
-		return cfg, err
-	}
-	if cfg.OutboxDrainTimeout, err = getEnvDurationStr("OUTBOX_DRAIN_TIMEOUT", 30*time.Second); err != nil {
-		return cfg, err
-	}
-	if cfg.OutboxPublishConcurrency, err = getEnvInt("OUTBOX_PUBLISH_CONCURRENCY", 4); err != nil {
-		return cfg, err
-	}
-	if cfg.OutboxPublishTimeout, err = getEnvDurationStr("OUTBOX_PUBLISH_TIMEOUT", 10*time.Second); err != nil {
-		return cfg, err
-	}
-	if cfg.OutboxStartupJitter, err = getEnvDurationStr("OUTBOX_STARTUP_JITTER", 2*time.Second); err != nil {
-		return cfg, err
-	}
-	if cfg.OutboxClaimLeaseDuration, err = getEnvDurationStr("OUTBOX_CLAIM_LEASE_DURATION", 10*time.Minute); err != nil {
 		return cfg, err
 	}
 	if cfg.OutboxPruneInterval, err = getEnvDurationStr("OUTBOX_PRUNE_INTERVAL", 24*time.Hour); err != nil {
@@ -197,6 +161,15 @@ func loadConfig() (config, error) {
 	if !isDevLikeEnvironment(appEnv) && os.Getenv("SYSTEM_DATABASE_URL") == "" {
 		return cfg, fmt.Errorf("SYSTEM_DATABASE_URL is required outside local/dev environments (APP_ENV=%q; must be the BYPASSRLS delegation_migrator role, see .claude/database.md)", appEnv)
 	}
+
+	// registerDocsRoutes (internal/adapter/inbound/http/router.go) only puts
+	// docsAuthMiddleware in front of /swagger and /asyncapi when
+	// Environment=="production" AND AuthToken!="" — so DOCS_ENABLED=true
+	// with DOCS_AUTH_TOKEN unset in production serves both with zero auth.
+	// Fail fast here instead of letting that combination reach the router.
+	if cfg.Environment == "production" && cfg.DocsEnabled && cfg.DocsAuthToken == "" {
+		return cfg, fmt.Errorf("DOCS_AUTH_TOKEN is required when DOCS_ENABLED=true in production")
+	}
 	return cfg, nil
 }
 
@@ -255,6 +228,32 @@ func ensureGincommonEnv(version string) {
 	}
 }
 
+// ensureOutboxEnv backfills this service's historical outbox tunables
+// (500ms poll / concurrency-4 / 2s jitter / 10m claim-lease) whenever the
+// corresponding OUTBOX_* var is unset, before eventcfg.LoadOutbox() reads
+// them. platform-events' own library defaults for these four (5s poll /
+// concurrency-1 / 0 jitter / 0 claim-lease) differ from this service's
+// original hardcoded Go defaults; Helm's values.yaml and .env.example both
+// set the historical values explicitly, but any other invocation path
+// (a bare `go run`, a test binary, a manual container run) would otherwise
+// silently regress to the library's slower/less-concurrent defaults with
+// no error — the same class of silent-degrade risk SYSTEM_DATABASE_URL's
+// fail-fast above exists to avoid. Mirrors ensureGincommonEnv's pattern.
+func ensureOutboxEnv() {
+	defaults := map[string]string{
+		"OUTBOX_POLL_INTERVAL":        "500ms",
+		"OUTBOX_STARTUP_JITTER":       "2s",
+		"OUTBOX_PUBLISH_CONCURRENCY":  "4",
+		"OUTBOX_CLAIM_LEASE_DURATION": "10m",
+	}
+	for key, val := range defaults {
+		if os.Getenv(key) == "" {
+			//nolint:errcheck // os.Setenv on the current process's own env cannot fail
+			_ = os.Setenv(key, val)
+		}
+	}
+}
+
 func getEnvDuration(key string, fallback time.Duration) (time.Duration, error) {
 	v := os.Getenv(key)
 	if v == "" {
@@ -269,9 +268,8 @@ func getEnvDuration(key string, fallback time.Duration) (time.Duration, error) {
 
 // getEnvDurationStr parses key as a Go duration string (e.g. "500ms", "5s",
 // "10m") — distinct from getEnvDuration, which treats its env var as a bare
-// millisecond integer. Used for the OUTBOX_* tunables, matching
-// iam-org-membership's/iam-user-profile's identical env-var format for
-// those same names.
+// millisecond integer. Used for OUTBOX_PRUNE_* (LoadOutbox does not cover
+// prune); runner tunables go through platform-events config.LoadOutbox.
 func getEnvDurationStr(key string, fallback time.Duration) (time.Duration, error) {
 	v := os.Getenv(key)
 	if v == "" {

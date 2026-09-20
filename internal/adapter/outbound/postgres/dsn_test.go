@@ -86,6 +86,14 @@ func TestApplyStatementTimeout_Idempotent(t *testing.T) {
 	assert.Equal(t, once, ApplyStatementTimeout(once))
 }
 
+func TestApplyStatementTimeout_BareDSNUsesQuestionMark(t *testing.T) {
+	t.Setenv("PG_STATEMENT_TIMEOUT", "5s")
+	got := ApplyStatementTimeout("postgres://sys@host/db")
+	assert.Contains(t, got, "?options=", "DSN with no query string must use ? not &")
+	assert.NotContains(t, got, "db&options", "must not produce an invalid URL")
+	assert.Contains(t, got, "statement_timeout%3D5000")
+}
+
 func TestSystemPoolConfig_ForcesPGBouncerMode(t *testing.T) {
 	t.Setenv("PG_BOUNCER_MODE", "false")
 	t.Setenv("PG_MAX_CONNS", "20")

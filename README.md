@@ -128,6 +128,7 @@ internal/
 | Inbound adapters depend on `service`+`port`+`domain` — never an outbound adapter directly | `go-arch-lint` |
 | Outbound adapters depend on `port`+`domain`+`eventschema` — never `service`, never inbound | `go-arch-lint` |
 | No session-scoped `SET app.tenant_id` — only `SET LOCAL` via `pgcommon.GUCSetFromContext` | `.github/scripts/check-forbidden-set-guc.sh` |
+| Events/outbox pass through `platform-events` only — no direct SNS/SQS client calls or hand-built `events.Envelope` literals outside it | `.github/scripts/check-forbidden-events-bypass.sh` |
 
 ### Storage and messaging
 
@@ -226,8 +227,10 @@ delegate-side by construction.
 
 Wire format: AWS Glue Schema Registry (`iam-delegation-events`), 18-byte header
 (`0x03` version, `0x00` no compression, 16-byte schema-version UUID) when `GLUE_REGISTRY_NAME` is
-set; falls back to plain JSON (`NoopCodec`) when it's empty (local dev default — LocalStack
-Community has no Glue).
+set; falls back to plain JSON (`NoopCodec`) when it's empty. `GLUE_REGISTRY_NAME` is set by
+default in `.env.example` — floci includes Glue Schema Registry in its free tier (unlike
+LocalStack Community, which gated it behind Pro), so local dev runs the real Glue codec end to
+end.
 
 ### 5. What this service consumes — `delegation-cascade-q`
 
@@ -272,7 +275,7 @@ Four CronJobs, all sharing the reconciler binary (`--job=<name>`):
 git clone git@github.com:BCBP-SOLUTIONS-FZC-LLC/iam-delegation.git
 cd iam-delegation
 make setup          # copies .env.example -> .env, installs .githooks/pre-commit
-make docker-up      # Postgres (5537) + Valkey (6383) + LocalStack (4570)
+make docker-up      # Postgres (5537) + Valkey (6383) + floci (4570) + floci-ui (4501)
 make run            # go run cmd/server, sourcing .env
 ```
 
@@ -315,39 +318,120 @@ is no separate `test/` tree, and `go test ./...` alone runs the complete suite.
 
 ### Testing domain events locally
 
-`make docker-up` starts LocalStack Community (SQS + SNS only — no Glue). `scripts/init-localstack.sh`
-provisions, on container start:
+Every mutating write publishes a domain event through a **transactional outbox → SNS → SQS**
+pipeline. `make docker-up` starts **floci** — an open-source (MIT), always-free LocalStack-compatible
+emulator — instead of LocalStack; unlike LocalStack Community, floci includes Glue Schema Registry
+in its free tier, so `scripts/init-floci.sh` provisions the real Glue wire format alongside SNS/SQS,
+with no Pro tier / auth token needed. On container start it provisions:
 
+- The Glue registry `iam-delegation-events` + all 4 event schemas (`DelegationStarted`,
+  `DelegationEnded`, `DelegationReviewRequested`, `DelegationEscalationRequested`).
 - The outbound `iam-delegation-events` SNS topic.
 - The inbound `delegation-cascade-q` (+ DLQ).
 - Three downstream fan-out subscriber queues (+ DLQs) representing Workflow/Notification/Audit,
   each with the SNS filter policy those services actually apply — useful for confirming a new
   event type reaches the queues it should before a downstream team consumes it for real.
 
-Send a test cascade message directly (no SNS involved on the inbound side):
+Tender's OOO/delegate-status screens read `iam-user-profile`'s `GET /users/:id` directly
+(CF-1, resolved to Option A) rather than subscribing to `iam.delegation.events` — no delegation
+event queue is provisioned for Tender.
+
+#### Step 1 — Start infrastructure
 
 ```bash
-awslocal --endpoint-url http://localhost:4570 sqs send-message \
-  --queue-url http://localhost:4570/000000000000/delegation-cascade-q \
+make docker-up
+```
+
+#### Step 2 — Verify SNS/SQS/Glue exist
+
+```bash
+docker compose exec floci aws --region ap-south-1 sns list-topics
+docker compose exec floci aws --region ap-south-1 sqs list-queues
+docker compose exec floci aws --region ap-south-1 glue list-schemas --registry-id RegistryName=iam-delegation-events
+```
+
+#### Step 2b — Verify event delivery in the browser (floci-ui)
+
+`make docker-up` also starts **floci-ui**, a web console for floci, at **http://localhost:4501**.
+It's a faster way to confirm an event landed on the right queue than shelling into the CLI each
+time:
+
+1. Open **http://localhost:4501** → sidebar → **Integration → SQS**. You'll see all 8 queues
+   `init-floci.sh` provisioned (`delegation-cascade-q`, `delegation-workflow-q`,
+   `delegation-notification-q`, `delegation-audit-q` — each with its `-dlq`), each with a
+   **Messages** column.
+2. Trigger an event — either exercise a real endpoint (`make run` + a DLG-2 create call, per
+   the API examples above) or publish one directly to skip the app entirely:
+   ```bash
+   docker compose exec floci aws --region ap-south-1 sns publish \
+     --topic-arn arn:aws:sns:ap-south-1:000000000000:iam-delegation-events \
+     --message '{"id":"demo-1","type":"DelegationStarted","tenant_id":"t1"}' \
+     --message-attributes 'EventType={DataType=String,StringValue=DelegationStarted}'
+   ```
+3. Refresh the SQS list. The **Messages** count should have gone to `1` on the queues whose
+   filter policy matches that `EventType` — for `DelegationStarted` that's `delegation-audit-q`
+   (catch-all), `delegation-workflow-q`, and `delegation-notification-q`. A wrong or missing
+   count on a queue you expected to receive the event means the filter policy or the event's
+   `EventType` attribute is wrong.
+
+Two things the UI does **not** do (yet):
+- **Read a message's payload.** The UI shows queue metadata (message counts, ARN, retention)
+  only, no message browser — see Step 2c below for the CLI equivalent.
+- **Browse SNS topics/subscriptions.** floci-ui has no SNS adapter yet, so the topic → queue
+  fan-out wiring itself (subscriptions, filter policies) isn't visible there — see Step 2d below.
+
+#### Step 2c — Retrieve the event body (CLI)
+
+```bash
+# Peek without deleting — the message stays and becomes visible again after
+# the queue's VisibilityTimeout (30s by default).
+docker compose exec floci aws --region ap-south-1 sqs receive-message \
+  --queue-url http://floci:4566/000000000000/delegation-workflow-q \
+  --max-number-of-messages 10 --message-attribute-names All
+```
+
+Every subscription `init-floci.sh` creates sets `RawMessageDelivery=true`, so `Body` is already
+the plain event JSON — no SNS envelope to unwrap. Pretty-print it with `jq`:
+
+```bash
+docker compose exec floci aws --region ap-south-1 sqs receive-message \
+  --queue-url http://floci:4566/000000000000/delegation-workflow-q \
+  --max-number-of-messages 10 --message-attribute-names All \
+  | jq -r '.Messages[] | .Body | fromjson'
+```
+
+Or read the outbox table directly — fastest during dev, and shows the plain-JSON payload before
+any Glue/Noop wire-format encoding is applied at publish time:
+
+```bash
+docker compose exec postgres psql -U delegation -d delegation -c \
+  "SELECT event_type, jsonb_pretty(payload::jsonb) FROM outbox_events ORDER BY created_at DESC LIMIT 3;"
+```
+
+#### Step 2d — Inspect SNS topics and subscriptions (CLI, no floci-ui equivalent)
+
+```bash
+docker compose exec floci aws --region ap-south-1 sns list-subscriptions
+
+docker compose exec floci aws --region ap-south-1 sns get-subscription-attributes \
+  --subscription-arn <SubscriptionArn> \
+  --query 'Attributes.{FilterPolicy:FilterPolicy,RawMessageDelivery:RawMessageDelivery}'
+```
+
+A missing `FilterPolicy` means the subscription is a catch-all (`delegation-audit-q`) — it
+receives every event on the topic.
+
+#### Sending a test cascade message directly (inbound side, no SNS involved)
+
+```bash
+docker compose exec floci aws --region ap-south-1 sqs send-message \
+  --queue-url http://floci:4566/000000000000/delegation-cascade-q \
   --message-body '{
     "id": "b6a1...", "type": "MembershipRevoked", "source": "iam-org-membership",
     "specversion": "1", "tenant_id": "...", "time": "2026-09-04T00:00:00Z",
     "data": {"user_id": "..."}
   }'
 ```
-
-Verify a publish reached SNS/downstream:
-
-```bash
-awslocal --endpoint-url http://localhost:4570 sns list-topics
-awslocal --endpoint-url http://localhost:4570 sqs receive-message \
-  --queue-url http://localhost:4570/000000000000/delegation-notification-q
-```
-
-To exercise the real `GlueCodec` (not `NoopCodec`) locally, use `docker-compose.pro.yml`, which
-requires a `LOCALSTACK_AUTH_TOKEN` (get one at
-[app.localstack.cloud](https://app.localstack.cloud/workspace/auth-token) — never commit a real
-token to this repo).
 
 ## Testing
 
@@ -369,8 +453,7 @@ table covers only the ones most likely to trip someone up.
 | `USER_PROFILE_BASE_URL` / `ORG_MEMBERSHIP_BASE_URL` | Yes | — | Client constructors fail fast at startup if empty; neither service is part of this repo's compose stack |
 | `SNS_TOPIC_ARN` / `CASCADE_QUEUE_URL` | **Yes** | — | `loadConfig` returns an error and the process never starts if either is empty |
 | `AWS_REGION` | No | `ap-south-1` | |
-| `GLUE_REGISTRY_NAME` | No | `""` → `NoopCodec` | Set to `iam-delegation-events` to activate the real Glue codec |
-| `LOCALSTACK_AUTH_TOKEN` | No | `""` | LocalStack Pro only (`docker-compose.pro.yml`) — never commit a real value |
+| `GLUE_REGISTRY_NAME` | No | `iam-delegation-events` | Set by default — floci provisions Glue for free; leave blank to force `NoopCodec` |
 | `IDEMPOTENCY_TTL_SECONDS` / `LIST_CACHE_TTL_SECONDS` | No | `86400` / `60` | |
 | `POLICY_DEFAULT_MAX_DURATION_DAYS` / `POLICY_DEFAULT_REVIEW_WINDOW_DAYS` | No | `90` / `90` | Fallback tenant policy when no `delegation_tenant_settings` row exists |
 | `DOCS_ENABLED` / `DOCS_AUTH_TOKEN` | No | `true` outside production | Gates `/swagger`, `/asyncapi` |
@@ -417,11 +500,23 @@ server binary self-migrates at startup.
 
 ```bash
 make docker-build    # build the image
-make compose-up       # Postgres + Valkey + LocalStack + the app itself
+make compose-up      # Postgres + Valkey + floci + floci-ui + the app itself
 ```
 
-To exercise the real Glue codec instead of `NoopCodec`, use `docker-compose.pro.yml` (requires
-`LOCALSTACK_AUTH_TOKEN` — see Testing domain events locally above).
+### What the bundled `docker-compose.yml` starts
+
+| Container | Image | Host port(s) | Purpose |
+|---|---|---|---|
+| `iam-delegation` | built from local `Dockerfile` | `8080`, `9090` | This service itself, when run via `docker compose up` rather than `make run` |
+| `postgres` | `postgres:16-alpine` | `5537 → 5432` | Primary store |
+| `valkey` | `valkey/valkey:8-alpine` | `6383 → 6379` | List cache + idempotency store |
+| `floci` | `floci/floci:2.1.0-compat` | `4570 → 4566` | SNS/SQS/Glue Schema Registry — real `GlueCodec` locally, no Pro tier needed |
+| `floci-ui` | `floci/floci-ui:0.5.0` | `4501 → 4500` | Web console for `floci` — http://localhost:4501 |
+
+`make docker-up` starts `postgres`/`valkey`/`floci`/`floci-ui` — not `iam-delegation` — so local
+dev typically still runs the service via `make run` for fast rebuilds. Host ports are deliberately
+offset from the sibling IAM services' own stacks so multiple can run side-by-side (see
+`docker-compose.yml`'s header comment).
 
 ### Health and readiness
 

@@ -9,8 +9,8 @@
 | Parent decision | **ADR-0008** (`02-hld-delta-delegation.md`, v2 / Option C) — the fourth O&M extraction, authorised by ADR-0007's explicit deferral of `delegations` |
 | Subsystem | Identity & Access Management |
 | Wave | 4 of 4 (the deferred hot-path table; resolved by removing delegations from I-8 entirely) |
-| Version | 2.13 |
-| Date | 2026-09-09 |
+| Version | 2.15 |
+| Date | 2026-09-18 |
 | Status | Approved for implementation |
 | Audience | IAM platform engineering (owner), Core Org & Membership engineering (drops `delegations`; membership-existence + dept-delegate callee; removal-signal producer), Workflow Service (delegation-event consumer), User Profile (availability callee), AuthZ Enrichment (drops `active_delegations[]`), SRE |
 | Owner database | RDS PostgreSQL `delegation` (Multi-AZ, PgBouncer transaction pooling) |
@@ -35,6 +35,11 @@
 | 2.9 | 2026-09-03 | **Cross-service bug fix (DLG-D29), pre-existing and unrelated to rev 2.5–2.8, found during the rev 2.8 sweep: open-ended delegations could never actually be created.** §11.1 Create sent `OOOUntil: req.EndsAt` to User Profile — `nil` for an open-ended delegation (§7.1's `EndsAt == nil`, DEL-8; a first-class case, not an edge case — DLG-4 Extend and §11.4's review-cron exist only to serve open-ended delegations, and Extend itself rejects any row with `EndsAt != nil`). User Profile's `ValidateOOOWindow` unconditionally requires `ooo_until` whenever `status="ooo"`, on both its public and internal `PUT .../availability` routes (one shared handler) — every open-ended create was rejected with 422, mapped by Create's own error handling to the confusing `invalid_delegate`. **Confirmed live before fixing**, per explicit instruction to verify rather than assume: a new test in `iam-user-profile` drives the real `PutAvailability` handler — not a fake — shaped exactly like this service's HTTP client output, and observed the real 422. Root cause is a genuine model mismatch: User Profile's OOO is always bounded (≤180 days, actively swept); this service's open-ended delegations are genuinely indefinite, governed by a rolling `review_due_at`/extend cycle instead. Fixed by reusing the review deadline as User Profile's required bound: §11.1's `reviewDueAt` computation moved before the User Profile call (previously computed only for the DB row, inside the transaction) and is now sent as `OOOUntil` whenever `EndsAt` is nil — always within User Profile's 180-day cap, since `review_window_days` is itself tenant-bounded to 1..180. §11.7's DLG-4 Extend, which previously never called User Profile at all, now re-syncs `SetAvailability` with the new `review_due_at` after every successful extend (fail-open, mirroring Cancel's §11.2 pattern) — without this, an extended open-ended delegation's `ooo_until` in User Profile would go stale and User Profile's own expiry sweep would eventually reset the delegator to `available` regardless of the extension. DLG-5 Reassign needed no separate fix — its create leg already calls Create. No schema/API *request* shape changed. §11.1's sequence diagram and §11.7's Extend narrative were not re-drawn in this pass — treat this revision as covering the OOOUntil-computation and Extend-resync content only. **Update, found in a subsequent audit pass: §11.1a's Activation job (DLG-D25) had the identical bug** at its own independent `SetAvailability` call — fixed the same way (falls back to `d.ReviewDueAt`). Without this second fix, an open-ended scheduled delegation would have deferred activation forever, resending the same rejected payload every cron tick. See ARCHITECTURE.md's DLG-D29 entry for the full account, including confirmation that a repo-wide grep found no third affected call site. |
 | 2.12 | 2026-09-05 | **Production-readiness sweep (DLG-D35)**, prompted by a direct "is this production ready" review with a follow-up "fix all." One genuinely LLD-visible fix, three implementation-hardening fixes with no LLD-visible design content. **LLD-visible:** §9.2's idempotency store always specified `SETNX` as DLG-2's create guard, but the as-built store only ever did a plain `GET`-then-`SET` — a real conformance gap, not a design change: two concurrent requests sharing one `Idempotency-Key` could both miss the `GET` and both insert a delegation. Closed by adding `Reserve`/`Release` to the idempotency store (atomic `SET NX` claim before any write, released on failure so a retry isn't stuck for the 24h TTL); a losing concurrent caller now gets a new `409 idempotency_key_in_flight` (§12.2/§20) instead of racing to a duplicate row. **Also LLD-visible:** §15's `SYSTEM_DATABASE_URL` fail-fast (DLG-D34) was gated on a literal `ENVIRONMENT=="production"` string compare; widened to fail fast outside any recognized local/dev environment name, since staging/uat/etc. would otherwise silently hit the identical degrade-with-no-alert failure mode DLG-D34 was written to prevent. **Implementation-hardening only (documented in `ARCHITECTURE.md`'s decision register and `CHANGELOG.md`, per this doc's existing convention, cf. 2.1/2.4's precedent):** the Swagger/AsyncAPI docs bearer-token comparison switched from a plain `!=` string compare to `crypto/subtle.ConstantTimeCompare`, closing a timing side-channel; the two outbound HTTP clients (User Profile, Org Membership) now cap response-body decoding at 1 MiB via a shared `io.LimitReader`, bounding worst-case memory use against a misbehaving mesh peer. No schema, API route, or published-event *content* changed in this revision; global statement coverage remains ≥95% (the CI gate, DLG-D34) after the new regression tests this pass added. |
 | 2.13 | 2026-09-09 | **Documentation/implementation-conformance sweep (DLG-D36 through DLG-D38) plus a new SLO burn-rate alerting layer.** DLG-D36 (logging/metrics/traces re-checked against `iam-realm-provisioner`/`iam-org-membership`: shutdown order corrected to pool drain → TracerProvider flush → `gincommon.Shutdown`; unhandled HTTP 500s now log through the gincommon logger instead of staying silent) has no LLD-visible design content, per this doc's existing convention (cf. 2.1/2.4/2.10's precedent) — documented only in `ARCHITECTURE.md`'s decision register and `CHANGELOG.md`. DLG-D38 (events/outbox/dedup re-checked) is likewise mostly implementation-conformance (`outbox_events.payload` is now `TEXT` with a PgBouncer-SimpleProtocol-decoding trigger; cascade PG writes and the `processed_events` insert now commit in one `TxRunner.RunInTx`), **except one LLD-visible correction:** §11.5a's sequence diagram and narrative previously said a filtered (non-`disabled`) `UserUpdated` delivery is "acked, no dispatch" — it is now also recorded in `processed_events` under the same `delegate_disable` bucket, so a redelivery does not re-decode the same no-op; the mermaid note is corrected to match. **DLG-D37 (database connection/configuration re-checked) has two LLD-visible refinements to §15's `SYSTEM_DATABASE_URL` fail-fast (DLG-D34/D35):** the environment name it gates on is now resolved via `resolveAppEnv()` (`APP_ENV` if set, else `ENVIRONMENT`) rather than reading `ENVIRONMENT` directly, and `test` was added as a fourth recognized dev-like alias (`development`/`dev`/`local`/`test`) so CI doesn't need the variable set — both matching `iam-org-membership`'s `isDevLikeEnv`; §15 also now states the (previously undocumented, always-true-in-practice) requirement that `DATABASE_URL` or the split `PG_*` vars be present, and that `MIGRATION_DATABASE_URL` is required whenever `PG_BOUNCER_MODE=true`. **New SLO burn-rate alerting (this revision, not a prior DLG-D):** §14.5 gains four multi-window burn-rate SLOs (write-path error rate, membership-check dependency success, reconciler-defer convergence, cascade convergence) as recording rules + fast/slow-burn alerts (`deploy/monitoring/slo-rules.yml`, also rendered by `templates/prometheusrule.yaml`) — a formalization of targets §14.1/§14.5 already stated, not a new design decision; the four SLO targets themselves are unchanged from what those sections already said. No schema, API route, or published-event *content* changed in this revision. |
+| 2.14 | 2026-09-11 | **Tender-scope liveness validation added (action item #8a; new DLG-D13).** A `scope='tender'` delegation now confirms its `scope_id` names a real, live tender before create: DLG-2/DLG-5 make one synchronous grant-time call, **only when `scope='tender'`**, to Tender's `GET /internal/tenants/:id/tenders/:scope_id/exists`, behind a new swappable `TenderScopeClient` (§6, §7.6.7) — the same shape and fail-closed posture as the membership check (§7.6.2). A dead/unknown tender is rejected `422 tender_scope_not_found`; a Tender outage is `503 tender_unavailable`, no write (§20). Department- and all-scoped delegations are unaffected. §7.6.4 ordering and the §11.1 create sequence updated. **Opens one cross-team task (DLG-D13):** Tender owns and must expose the endpoint; until it ships, `TenderScopeClient`'s HTTP adapter is built and unit-tested but not wired into the composition root at all (no construction call, no config, no feature flag) — tender-scoped delegations fall back to the presence-only `chk_scope_id` check — documented, not silent. No schema or frozen-name change (the check is cross-service, not a new column/event). |
+| 2.15 | 2026-09-18 | **CF-1 (tender item #8b) local-dev scaffolding only — NOT a design decision.** §10.4's outbound fan-out table gains a `delegation-tender-q` row, and `scripts/init-floci.sh` provisions it locally, so Tender-as-a-delegation-event-subscriber (Option B of the open CF-1 confirmation, `tender-integration-tracker.md` §3) can be exercised in local dev if that's the direction CF-1 resolves toward. This is explicitly **not** a resolution of CF-1: the already-working, zero-new-code alternative (Option A — Tender reads `iam-user-profile`'s `GET /users/:id`, which already returns `user_availability.delegate_id` and OOO state) remains the default until IAM and Tender actually confirm one path. No production wiring, no Tender-side consumer, no Terraform change; the queue and filter policy (`DelegationStarted`/`DelegationEnded` only) exist solely so the push option isn't blocked on infrastructure if chosen. No schema, API, or published-event *content* changed. |
+| 2.16 | 2026-09-18 | **CF-1 resolved to Option A — Option B scaffolding removed.** IAM and Tender confirmed Tender's OOO/delegate-status screens read `iam-user-profile`'s `GET /users/:id` directly (Option A, §7.6.7-adjacent, zero new IAM code); Tender will not subscribe to `iam.delegation.events`. The rev 2.15 local-dev-only scaffolding for Option B is removed: §10.4's outbound fan-out table drops the `delegation-tender-q` row, and `scripts/init-floci.sh` no longer provisions `delegation-tender-q`/`-dlq` or its SNS subscription. No schema, API, or published-event *content* changed — this revision only removes now-unneeded local-dev infrastructure and closes CF-1. |
+| 2.17 | 2026-09-20 | **Production-readiness sweep (DLG-D40), prompted by a direct "is this production ready" review with a follow-up "fix all."** One genuinely LLD-visible fix, one implementation-hardening-only fix. **LLD-visible (DLG-D40):** `registerDocsRoutes` only puts `docsAuthMiddleware` in front of `/swagger` and `/asyncapi` when `Environment=="production"` AND `AuthToken!=""` — `loadConfig` had no corresponding fail-fast, so a deploy with `DOCS_ENABLED=true` and `DOCS_AUTH_TOKEN` left unset in production would silently serve both docs surfaces with no auth check at all. §15 updated with the new startup guard. **Implementation-hardening only (documented in `ARCHITECTURE.md`'s decision register and `CHANGELOG.md`, per this doc's existing convention, cf. 2.1/2.4's precedent):** removed `Metrics.SetActiveGauge`, a public method with no call site outside its own unit test — `ReplaceActiveGauges` (the real call site, wired to the active-gauge exporter) already sets the same gauge inline. No schema, API route, or published-event *content* changed in this revision; the rest of the production-readiness review (full `make ci`, real coverage at 99.0%, RLS/config fail-fast re-verification, security spot-check) found no other code-level gaps — the two remaining open items (DLG-D26's `iam.user.events` subscription still unprovisioned; DLG-D13's `TenderScopeClient` still unwired pending Tender's endpoint) are cross-team/infra actions outside this repo, already tracked as such, not new findings. |
+| 2.18 | 2026-09-20 | **§17.4 E2E suite implemented (DLG-D41) — closes the gap where `make test-e2e` silently re-ran the untagged unit suite (no file anywhere declared `//go:build e2e`).** `cmd/server/e2e_test.go` now boots the real composition root (`run`, refactored to take a caller-supplied `context.Context` so a test can drive its exact graceful-shutdown path deterministically instead of only via an OS signal) against real Postgres, real Valkey, and a real SNS/SQS-compatible emulator (floci, matching `docker-compose.yml`'s image and topology) — User Profile and Org Membership are faked with local `httptest.Server`s, since those are this service's own outbound dependencies, not infrastructure this repo owns. Covers §17.4 verbatim as four subtests: create → Workflow/Notification fan-out (`DelegationStarted`) → cancel → fan-out (`DelegationEnded{cancelled}`) plus the User Profile set/clear calls; expiry (seeded past-`ends_at` row → `POST /internal/delegations/expire` → `ended`/fan-out/UP-clear); the review daily cascade (days_remaining 3→2→1 → `review_expired` auto-end), driven by mutating `review_due_at` directly between `POST /internal/delegations/review-sweep` calls; and the user-removal cascade (a raw `MembershipRevoked` sent straight to `delegation-cascade-q`, asserting the delegate-side row ends with a fan-out event and the delegator-side row ends silently, DLG-EVT-4). `.github/workflows/validate-test.yml`'s existing "End-to-end tests" step (`make test-e2e`) needed no change — it already called the right target; only the missing test file was the gap. `make test-unit`/`test-ci` (no `-tags=e2e`) are unaffected — confirmed the coverage gate stays at the same 99.0% this revision measured for 2.17. No schema, API, or published-event *content* changed. |
 
 ---
 
@@ -176,6 +181,7 @@ iam-delegation/
 │   │   │   ├── settings_repository.go       -- delegation_tenant_settings
 │   │   │   ├── user_profile_client.go       -- UserProfileClient (DEL-6)
 │   │   │   ├── membership_check_client.go   -- MembershipCheckClient (§7.6.2, swappable)
+│   │   │   ├── tender_scope_client.go        -- TenderScopeClient (§7.6.7, swappable, scope='tender' only)
 │   │   │   ├── idempotency_store.go         -- create-dedup (DLG-Q3)
 │   │   │   ├── event_publisher.go
 │   │   │   ├── cache.go
@@ -192,6 +198,7 @@ iam-delegation/
 │           ├── postgres/                    -- repositories, migrations, processed_events
 │           ├── userprofile/                 -- UserProfileClient HTTP impl
 │           ├── orgmembership/               -- MembershipCheckClient HTTP impl
+│           ├── tender/                      -- TenderScopeClient HTTP impl (§7.6.7)
 │           ├── eventbus/                    -- SNS publisher (iam-delegation-events) + Glue codec
 │           ├── valkey/                      -- del: cache + idempotency store
 │           └── metrics/                     -- iam_delegation_* Prometheus instruments
@@ -502,7 +509,7 @@ The two `*_membership_id` columns are `NOT NULL`, so Core's `GET /internal/tenan
 
 #### 7.6.4 Ordering
 
-Local pre-flight → both membership checks → User Profile availability → `RunInTx{ INSERT; outbox }`. No cross-service HTTP inside a transaction (WFI-7).
+Local pre-flight → both membership checks → **tender-scope liveness (only when `scope='tender'`, §7.6.7)** → User Profile availability → `RunInTx{ INSERT; outbox }`. No cross-service HTTP inside a transaction (WFI-7).
 
 #### 7.6.5 Why the FK loss (and Option C) does not weaken authorization
 
@@ -511,6 +518,21 @@ The FKs were a grant-time safety net, never a routing/authorization input. Under
 #### 7.6.6 The third FK loss — `fk_del_tenant` cascade
 
 Replaced by the async tenant-offboarding consumer (§11.6), the same pattern the sibling services use. Not a live gap (§7.6.5). Decision **DLG-D4**.
+
+#### 7.6.7 Tender-scope liveness validation (DLG-D13)
+
+A delegation with `scope='tender'` names a single tender by its `scope_id`. Tender owns that identifier space exclusively, and nothing in this service can confirm the id names a real, live tender — the DB CHECK (`chk_scope_id`, DEL-2) enforces only that `scope_id` is *present* for a tender-scoped row, never that it resolves. So a tender-scoped `Create`/`Reassign` (DLG-2/DLG-5) makes one synchronous grant-time call, **only when `scope='tender'`**, to confirm liveness:
+
+```
+Delegation to Tender: GET /internal/tenants/:id/tenders/:scope_id/exists
+  { "exists": true,  "live": true  }  → proceed
+  { "exists": true,  "live": false }  → 422 tender_scope_not_found  (tender archived/closed)
+  { "exists": false } | HTTP 404       → 422 tender_scope_not_found  (unknown id)
+```
+
+**Call path:** Delegation to Tender, one internal `GET`, `scope='tender'` on DLG-2/DLG-5 only — department- and all-scoped delegations make no such call. **Latency:** ≤50 ms p99. **Availability (fail-closed, matching §7.6.2):** Tender down means `503 tender_unavailable`, **no write**; existing delegations, DLG-1, and the crons are unaffected. **Behind a swappable `TenderScopeClient`** (§6), the same shape as `MembershipCheckClient`, so a future co-location can delete it. Ordering (§7.6.4): the check runs after the membership checks and before the User Profile availability write, so no cross-service HTTP ever sits inside the transaction (WFI-7).
+
+**Provider-side contract (Tender-owned — cross-team task, DLG-D13).** Tender is the only service able to answer this and takes the validation obligation; it must expose `GET /internal/tenants/:id/tenders/:tender_id/exists` (mesh-only, reserved system principal, tenant-scoped) returning `{ exists, live }`, where `live` excludes archived/closed/deleted tenders. Until Tender ships it, `TenderScopeClient`'s HTTP adapter exists (built and unit-tested against this contract) but **no construction call for it exists in `cmd/server`** — no config var, no service-constructor param, no feature flag, nothing calling `CheckLive` — and a tender-scoped delegation falls back to the presence-only `chk_scope_id` check (the pre-extraction behaviour) — documented, not silent. This is the one open cross-team task reopened by this revision (§23).
 
 ---
 
@@ -762,6 +784,8 @@ A single SNS topic, `events.NewSNSPublisher` (no RoutingPublisher — one topic,
 | Notification | `delegation-notification-q` | `delegation-notification-q-dlq` | `DelegationStarted`, `DelegationEnded`, `DelegationReviewRequested`, `DelegationEscalationRequested` | User-facing notices; review warnings fan out to delegator + delegate + tenant_admins/owners (delegate/owner notify-only); escalation requests fan out to tenant_admins/owners only (§11.5b) |
 | Audit Log | `delegation-audit-q` | `delegation-audit-q-dlq` | all four (no filter) | Immutable audit of every delegation lifecycle transition |
 
+**CF-1 (`tender-integration-tracker.md` §3, tender item #8b) is resolved as of rev 2.16: Option A.** Tender's OOO/delegate-status screens read `iam-user-profile`'s `GET /users/:id` directly, which already returns `user_availability.delegate_id` and OOO state (verified in that service's `UserHandler.GetUser`) — zero new IAM code. Tender does not subscribe to `iam.delegation.events`; there is no `delegation-tender-q` consumer, in local dev or otherwise.
+
 ### 10.5 Published events (HLD §9.4)
 
 | Event Type | Emitted when | Payload (key fields) | Consumers |
@@ -835,6 +859,7 @@ sequenceDiagram
     actor DR as Delegator (or admin)
     participant DLG as Delegation Service
     participant Core as Core (Org and Membership)
+    participant TN as Tender
     participant UP as User Profile
     participant PG as Delegation Postgres
 
@@ -843,6 +868,14 @@ sequenceDiagram
     par membership checks (both parties)
         DLG->>Core: GET /internal/tenants/:id/members/:delegator_id/exists
         DLG->>Core: GET /internal/tenants/:id/members/:delegate_id/exists
+    end
+    opt scope = 'tender' (§7.6.7)
+        DLG->>TN: GET /internal/tenants/:id/tenders/:scope_id/exists
+        alt Tender unreachable
+            DLG-->>DR: 503 tender_unavailable
+        else scope_id not a live tender in this tenant
+            DLG-->>DR: 422 tender_scope_not_found
+        end
     end
     alt either Core unreachable
         DLG-->>DR: 503 org_membership_unavailable
@@ -861,7 +894,7 @@ sequenceDiagram
             else RunInTx ok
                 DLG->>DLG: SET del:idem, INVALIDATE del:list cache
                 DLG-->>DR: 201 Created
-                Note over DLG,PG: DelegationStarted → iam.delegation.events; Notification Service notifies A (confirmation) and B (assigned as delegate); Workflow reroutes
+                Note over DLG,PG: DelegationStarted → iam.delegation.events — Notification Service notifies A (confirmation) and B (assigned as delegate), Workflow reroutes
             end
         end
     else both active, starts_at genuinely in the future (DLG-D25)
@@ -1029,10 +1062,10 @@ sequenceDiagram
     Core->>Core: RunInTx { remove membership }, then emit MembershipRevoked
     Core-->>DLG: MembershipRevoked (SQS delegation-cascade-q)
     DLG->>PG: UPDATE delegations SET status='ended', deleted_at=now() WHERE tenant_id=$1 AND (delegator_id=$2 OR delegate_id=$2) AND status IN ('active','scheduled') AND deleted_at IS NULL
-    Note over DLG,PG: status filter is mandatory — prevents re-ending terminal rows and corrupting deleted_at on historical records (GAP-02); 'scheduled' included (DLG-D25) so a not-yet-activated delegation for a departed member is ended too, rather than stranded and later failing to activate against a member who no longer exists
+    Note over DLG,PG: status filter is mandatory — prevents re-ending terminal rows and corrupting deleted_at on historical records (GAP-02) — 'scheduled' included (DLG-D25) so a not-yet-activated delegation for a departed member is ended too, rather than stranded and later failing to activate against a member who no longer exists
     loop per ended delegation
         alt d.delegator_id == removedUser (delegator-side row)
-            DLG->>DLG: silent — no UP call, no event (delegator's OOO state is on their own UP record, handled by UP's user-removal flow); DLG-EVT-4 asymmetry
+            DLG->>DLG: silent — no UP call, no event (delegator's OOO state is on their own UP record, handled by UP's user-removal flow) — DLG-EVT-4 asymmetry
         else d.delegate_id == removedUser (delegate-side row)
             DLG->>UP: PUT /internal/users/:delegator_id/availability {delegate_id null} (DEL-6 — clear delegator's OOO pointer)
             DLG->>PG: RunInTx { outbox DelegationEnded{delegate_removed} }
@@ -1057,7 +1090,7 @@ sequenceDiagram
 
     Note over UP: PatchIdentity(status=disabled): clears the delegate pointer on every<br/>delegator's user_availability row (ClearInboundDelegates) AND publishes<br/>UserUpdated{status:disabled} atomically in the same transaction (LLD §8.8.16 K1, iam-user-profile)
     UP-->>DLG: UserUpdated{user_id, changed_fields:[status], status:"disabled"} (iam.user.events)
-    DLG->>DLG: decode payload; status != "disabled" → ack + record processed_events, no dispatch (most deliveries)
+    DLG->>DLG: decode payload — status != "disabled" → ack + record processed_events, no dispatch (most deliveries)
     DLG->>PG: UPDATE delegations SET status='ended' WHERE tenant_id=$1 AND delegate_id=$2<br/>AND status IN ('active','scheduled') AND deleted_at IS NULL<br/>RETURNING *
     Note over DLG,PG: deleted_at is NOT set (disabled ≠ removed) — unlike EndForUser's hard soft-delete
     loop per ended delegation (every row is delegate-side by construction)
@@ -1197,7 +1230,7 @@ Public behind Envoy; `/internal/*` (DLG-I1…I4) mesh-only mTLS via the internal
 
 ### 13.3 Input validation
 
-Mirrors the DB CHECKs and DEL invariants: scope in enum; scope↔scope_id; `reason ≤ 500 Unicode characters` (rune count — **not** byte length; a Japanese or emoji-heavy note of 500 characters is accepted regardless of byte size, BUG-03); `starts_at` within `(now()−5s skew, now()+1yr]` where **`now` is captured once at request entry and reused for all time comparisons** (GAP-03 — two separate `time.Now()` calls would break the deterministic 5-second skew contract); `ends_at > starts_at`; span ≤ tenant `max_duration_days` (error response includes `details.max_duration_days` — BUG-01); `extend_days` in `[1,180]`; policy days in `[1,180]`; `Idempotency-Key` header must be non-empty and ≤ 256 characters.
+Mirrors the DB CHECKs and DEL invariants: scope in enum; scope↔scope_id; `reason ≤ 500 Unicode characters` (rune count — **not** byte length; a Japanese or emoji-heavy note of 500 characters is accepted regardless of byte size, BUG-03); `starts_at` within `(now()−5s skew, now()+1yr]` where **`now` is captured once at request entry and reused for all time comparisons** (GAP-03 — two separate `time.Now()` calls would break the deterministic 5-second skew contract); `ends_at > starts_at`; span ≤ tenant `max_duration_days` (error response includes `details.max_duration_days` — BUG-01); `extend_days` in `[1,180]`; policy days in `[1,180]`; `Idempotency-Key` header must be non-empty and ≤ 256 characters. Tender-scope **liveness** (that a `scope='tender'` `scope_id` names a real, live tender) is **not** a local check — it is the cross-service validation in §7.6.7; local input validation covers only the `scope`↔`scope_id` presence rule.
 
 ### 13.4 Authorization rules
 
@@ -1288,7 +1321,7 @@ delegation:
     batchLimit: 50
 ```
 
-The O&M `DELEGATION_REVIEW_WINDOW_DAYS` env var is gone entirely — the window is per-tenant in `delegation_tenant_settings`, defaulting to `policyDefaults` only when a tenant has no row. No cross-service config URL or TTL exists any more (DLG-Q2). Secrets via the platform store; base URLs required (fail-fast on empty for the data-bearing clients). `DATABASE_URL` (or the split `PG_HOST`/`PG_USER`/`PG_PASSWORD` form) is required at startup, and `MIGRATION_DATABASE_URL` is additionally required whenever `PG_BOUNCER_MODE=true` — migrations take a session-scoped `pg_advisory_lock` and must bypass PgBouncer's transaction pooling (DLG-D37). `SYSTEM_DATABASE_URL` (the BYPASSRLS pool backing DLG-I3/I4, the four CronJobs' cross-tenant sweeps, and the active-gauge exporter) is required in Helm always, and both binaries now fail fast at startup if it is unset outside a recognized local/dev environment (`development`/`dev`/`local`/`test`, DLG-D34; widened from a literal `ENVIRONMENT=="production"` check to every other environment name in DLG-D35; the environment name itself is now resolved via `resolveAppEnv()` — `APP_ENV` if set, else `ENVIRONMENT` — and `test` was added as a fourth dev-like alias so CI doesn't need `SYSTEM_DATABASE_URL` set, matching `iam-org-membership`'s `isDevLikeEnv`, DLG-D37) — in a recognized local/dev environment it falls back to the app pool's DSN with a startup warning, degrading cross-tenant reads to RLS-filtered zero rows rather than erroring.
+The O&M `DELEGATION_REVIEW_WINDOW_DAYS` env var is gone entirely — the window is per-tenant in `delegation_tenant_settings`, defaulting to `policyDefaults` only when a tenant has no row. No cross-service config URL or TTL exists any more (DLG-Q2). Secrets via the platform store; base URLs required (fail-fast on empty for the data-bearing clients). `DATABASE_URL` (or the split `PG_HOST`/`PG_USER`/`PG_PASSWORD` form) is required at startup, and `MIGRATION_DATABASE_URL` is additionally required whenever `PG_BOUNCER_MODE=true` — migrations take a session-scoped `pg_advisory_lock` and must bypass PgBouncer's transaction pooling (DLG-D37). `SYSTEM_DATABASE_URL` (the BYPASSRLS pool backing DLG-I3/I4, the four CronJobs' cross-tenant sweeps, and the active-gauge exporter) is required in Helm always, and both binaries now fail fast at startup if it is unset outside a recognized local/dev environment (`development`/`dev`/`local`/`test`, DLG-D34; widened from a literal `ENVIRONMENT=="production"` check to every other environment name in DLG-D35; the environment name itself is now resolved via `resolveAppEnv()` — `APP_ENV` if set, else `ENVIRONMENT` — and `test` was added as a fourth dev-like alias so CI doesn't need `SYSTEM_DATABASE_URL` set, matching `iam-org-membership`'s `isDevLikeEnv`, DLG-D37) — in a recognized local/dev environment it falls back to the app pool's DSN with a startup warning, degrading cross-tenant reads to RLS-filtered zero rows rather than erroring. `server` also fails fast at startup if `DOCS_ENABLED=true` and `ENVIRONMENT=="production"` (the literal value `registerDocsRoutes` itself gates its bearer-token check on) while `DOCS_AUTH_TOKEN` is unset, DLG-D40 — without this, that combination previously mounted `/swagger` and `/asyncapi` in production with no auth check at all.
 
 ---
 
@@ -1312,7 +1345,7 @@ The O&M `DELEGATION_REVIEW_WINDOW_DAYS` env var is gone entirely — the window 
 
 **17.3 Contract.** Membership-check mock: two calls issued **concurrently** (verify with barrier, not just ordering), both `tenant_membership_id`s stored, `{active:false}` gives `422`, response must carry `tenant_membership_id` (DLG-D3). DLG-I4 returns all six LLD-specified fields (`delegation_id`, `delegator_id`, `delegate_id`, `scope`, `scope_id`, `ends_at`) including nil variants. DLG-4 extend response includes `record_version`. DLG-7 partial body (zero-valued field) → 400. **Core-side regression:** assert I-8's response **no longer contains** `active_delegations[]` and its SQL joins four tables (the Option-C removal). AsyncAPI: validate the three payloads incl. `review_expired`; `days_remaining ∈ {1,2,3}`.
 
-**17.4 E2E.** Create → Workflow reroute event → A and B both notified (DelegationStarted) → cancel → restore event; expiry ends past-`ends_at` + re-clears availability; review daily cascade (warns at days_remaining=3, 2, 1 then auto-ends `review_expired`); user removal → Core gate `409` → P-26 → removal → async cascade ends **active-only** rows + emits `delegate_removed`.
+**17.4 E2E.** Create → Workflow reroute event → A and B both notified (DelegationStarted) → cancel → restore event; expiry ends past-`ends_at` + re-clears availability; review daily cascade (warns at days_remaining=3, 2, 1 then auto-ends `review_expired`); user removal → Core gate `409` → P-26 → removal → async cascade ends **active-only** rows + emits `delegate_removed`. Implemented in `cmd/server/e2e_test.go` (`//go:build e2e`, DLG-D41, rev 2.18) against real Postgres/Valkey/floci containers, run via `make test-e2e`.
 
 ### 17.5 RLS test cases (canonical)
 
@@ -1395,6 +1428,7 @@ DLG-Q4's Core-side `MembershipRevoked`/`TenantMembershipsPurged` emission was th
 | `invalid_delegation_review_window_days` | 400 | DLG-7 `review_window_days` outside `[1,180]` |
 | `scope_id_required` | 422 | `scope_id` missing for `department`/`tender` |
 | `invalid_scope_id` | 422 | `scope_id` present when `scope='all'` |
+| `tender_scope_not_found` | 422 | `scope='tender'`: `scope_id` does not name a live tender in this tenant (§7.6.7) | — |
 | `self_delegation` | 422 | `delegator_id == delegate_id` |
 | `invalid_delegate` | 422 | Delegate (or delegator) not an active member (§7.6.2, or a UP 4xx race) |
 | `delegate_unavailable` | 422 | Delegate is themselves OOO (from User Profile) |
@@ -1410,6 +1444,7 @@ DLG-Q4's Core-side `MembershipRevoked`/`TenantMembershipsPurged` emission was th
 | `idempotency_key_in_flight` | 409 | DLG-2 `Idempotency-Key` already claimed by another in-flight (or, rarely, stale-`FindByID`) request (§9.2/§12.2, DLG-D35) | — |
 | `org_membership_unavailable` | 503 | §7.6.2 membership check 5xx/timeout; no write; retryable |
 | `user_profile_unavailable` | 503 | DEL-6 availability call 5xx/timeout on create; no write; retryable |
+| `tender_unavailable` | 503 | §7.6.7 tender-scope liveness check 5xx/timeout on a `scope='tender'` create; no write; retryable | — |
 
 The removal-gate errors (`409 workflow_resolution_required`, `503 workflow_service_unavailable`) remain **Core's** (P-8/I-5/P-26).
 
@@ -1455,5 +1490,6 @@ The removal-gate errors (`409 workflow_resolution_required`, `503 workflow_servi
 | DLG-D10 | **`port.UserProfileClient` + DEL-6 availability-first / pointer-clear-only move here intact**; cancel is fail-open, scheduled ends defer-and-retry (§11.2/§11.3). |
 | DLG-D11 | **Reassign takes the fuller body** (`new_delegate_id?/scope?/scope_id?/ends_at?/reason?`) and the error taxonomy is canonicalised (§8.4/§20, DLG-Q7/Q8). |
 | DLG-D12 | **v1 scope is active-at-create** (no future-dating); future-dated activation is a v2 feature needing a start-scheduler (§22, DLG-Q10). **Superseded by rev 2.5/DLG-D25:** a `scheduled` status and the `delegation-activation` CronJob (§7.1/§11.1a) deliver exactly this, ahead of any "v2" timeline — see §22 for the note on why this was pulled forward. |
+| DLG-D13 | **Tender-scope liveness validation** (§7.6.7, action item #8a). A `scope='tender'` delegation makes one synchronous grant-time call to Tender — `GET /internal/tenants/:id/tenders/:scope_id/exists` — behind a swappable `TenderScopeClient`, fail-closed (`503 tender_unavailable`) and rejecting a dead/unknown tender with `422 tender_scope_not_found` (§20). Department- and all-scoped delegations are unaffected. **Cross-team task:** Tender owns and must expose the endpoint; until then the client's HTTP adapter is built and tested but left entirely unwired (no construction, no config, no flag), with a documented fallback to the presence-only `chk_scope_id` check. |
 
-*End of document. This v2 resolves all ten open questions as decisions for the development-stage build; the DLG-Q4 cross-team task (Core adding the `MembershipRevoked`/`TenantMembershipsPurged` emission this service's cascade consumes) is confirmed shipped as of v2.3 — no open cross-team tasks remain.*
+*End of document. This v2 resolves all ten open questions as decisions for the development-stage build; the DLG-Q4 cross-team task (Core adding the `MembershipRevoked`/`TenantMembershipsPurged` emission this service's cascade consumes) is confirmed shipped as of v2.3. **v2.14 opens one new cross-team task (DLG-D13): Tender must expose `GET /internal/tenants/:id/tenders/:tender_id/exists` for the tender-scope liveness check (§7.6.7); until it ships, `TenderScopeClient`'s adapter is built and tested but not wired into the composition root (no flag exists) with a documented presence-only fallback.***
