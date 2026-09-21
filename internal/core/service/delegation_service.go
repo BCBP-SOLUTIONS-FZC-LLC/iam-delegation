@@ -10,7 +10,6 @@ package service
 import (
 	"context"
 	"errors"
-	"strings"
 	"time"
 	"unicode/utf8"
 
@@ -195,6 +194,25 @@ func (s *DelegationService) Create(ctx context.Context, tenantID, delegatorID uu
 	// activate immediately with no behavior change.
 	isScheduled := starts.After(now)
 
+	// GAP-DEL-2: delegate OOO pre-flight. UP never performed this check on
+	// SetAvailability — the prior strings.Contains path was permanently dead
+	// code. DEL owns the check here because it is the only party that knows
+	// starts_at: a delegate who is OOO until Sep 20 must not block a
+	// delegation that starts Sep 22.
+	snap, err := s.userProfile.GetAvailability(ctx, tenantID, req.DelegateID)
+	if err != nil {
+		if s.metrics != nil {
+			s.metrics.RecordUPAvailabilityFailure("create")
+		}
+		if errors.Is(err, port.ErrDependencyUnavailable) {
+			return nil, domain.NewError(domain.ErrUserProfileUnavailable, "user profile unavailable")
+		}
+		return nil, domain.NewError(domain.ErrUserProfileUnavailable, "user profile unavailable")
+	}
+	if snap.Status == "ooo" && (!isScheduled || (snap.OOOUntil != nil && snap.OOOUntil.After(starts))) {
+		return nil, domain.NewError(domain.ErrDelegateUnavailable, "delegate is currently unavailable (OOO)")
+	}
+
 	// reviewDueAt applies only to open-ended delegations (EndsAt == nil,
 	// DEL-8) and is computed here — before the UP call below, not inside
 	// RunInTx as previously — because it now doubles as the bound sent to
@@ -242,9 +260,6 @@ func (s *DelegationService) Create(ctx context.Context, tenantID, delegatorID uu
 			}
 			if errors.Is(err, port.ErrDependencyUnavailable) {
 				return nil, domain.NewError(domain.ErrUserProfileUnavailable, "user profile unavailable")
-			}
-			if strings.Contains(err.Error(), "delegate_unavailable") {
-				return nil, domain.NewError(domain.ErrDelegateUnavailable, "delegate is currently unavailable (OOO)")
 			}
 			return nil, domain.NewError(domain.ErrInvalidDelegate, "delegate validation failed via user profile")
 		}

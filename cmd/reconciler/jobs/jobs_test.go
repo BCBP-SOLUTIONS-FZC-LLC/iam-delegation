@@ -34,6 +34,10 @@ func (f *fakeUserProfile) SetAvailability(_ context.Context, req port.SetAvailab
 	return nil
 }
 
+func (f *fakeUserProfile) GetAvailability(_ context.Context, _, _ uuid.UUID) (*port.AvailabilitySnapshot, error) {
+	return &port.AvailabilitySnapshot{Status: "available"}, nil
+}
+
 func (f *fakeUserProfile) ClearDelegatePointer(_ context.Context, _, userID uuid.UUID) error {
 	f.clearCalls = append(f.clearCalls, userID)
 	if f.failFor != nil && f.failFor[userID] {

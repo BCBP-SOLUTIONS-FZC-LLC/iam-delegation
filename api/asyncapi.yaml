@@ -159,10 +159,11 @@ servers:
       specifically to avoid colliding with Realm Provisioner's own,
       differently-scoped TenantOffboarded event on iam.tenant.events, which
       this service does NOT consume. UserUpdated's filter policy can only
-      match on EventType (dot-notation — User Profile's own convention,
-      unlike Core's PascalCase above), not payload content, so most
-      deliveries are unrelated field changes this service acks without
-      dispatching; only a decoded payload with status="disabled" reaches
+      match on EventType (PascalCase — filter value is "UserUpdated", not
+      "user.updated"; migrated from dot-notation while UP was still
+      undeployed, LLD rev 0.46), not payload content, so most deliveries
+      are unrelated field changes this service acks without dispatching;
+      only a decoded payload with status="disabled" reaches
       CascadeService.EndForDisabledDelegate.
       Drives the delegate-side removal cascade (§11.5), tenant-lifecycle
       cleanup (§11.6), and the delegate-disabled cascade (§11.5a, Bug 2/2a).

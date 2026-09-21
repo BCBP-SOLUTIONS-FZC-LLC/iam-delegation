@@ -51,7 +51,7 @@ make swag-check       # fail if Swagger regeneration would change docs/swagger/ 
 make ci               # tidy + fmt-check + vet + lint + arch-lint + test-ci + build
 make docker-build     # build the container image (carries both binaries)
 make docker-push      # push the container image
-make docker-up        # start local Postgres + Valkey + LocalStack
+make docker-up        # start local Postgres + Valkey + Floci (SNS+SQS+Glue, port 4570; UI at 4501)
 make docker-down      # stop containers started by docker-up/compose-up
 make compose-up       # start the full local dev stack, including the service itself (self-migrates at startup)
 make compose-down     # stop and remove the local dev stack, including volumes
@@ -63,7 +63,7 @@ make clean            # remove build artifacts and coverage output
 make schema-pull      # pull the schema-gov Docker image
 make schema-validate  # validate AsyncAPI + event schemas — 8 passes (no AWS required)
 make schema-diff      # diff two schema files: CURRENT=<path> PROPOSED=<path>
-make schema-register  # register event schemas to Glue (requires AWS/LocalStack)
+make schema-register  # register event schemas to Glue (requires AWS/Floci)
 make schema-verify    # pre-deploy check: fail if PascalCase schemas are missing (requires AWS)
 make schema-prune     # dry-run: list orphaned Glue schemas (requires AWS)
 ```
@@ -127,7 +127,7 @@ iam-delegation/
 │       │   └── consumer/              # cascade_consumer.go · wiring.go — delegation-cascade-q
 │       └── outbound/
 │           ├── postgres/              # db.go (TxRunner, WithTenantGUC) · delegation_repository.go · settings_repository.go · processed_events.go · gauge_repository.go · otel_tracer.go · migrate.go · migrations_fs.go · migrations/ (000001_schema only, as of this build)
-│           ├── userprofile/           # http_client.go (UserProfileClient impl, DEL-6) + propagate.go
+│           ├── userprofile/           # http_client.go (UserProfileClient impl, DEL-6): GetAvailability (GAP-DEL-2 pre-flight) · SetAvailability · ClearDelegatePointer (Gap 3, DELETE /internal/users/:id/availability/delegate) + propagate.go
 │           ├── orgmembership/         # http_client.go (MembershipCheckClient impl, DLG-D3) + propagate.go
 │           ├── eventbus/              # publisher.go + validating_codec.go (enqueue) · codec.go (GlueCodec encode + GlueDecodeCodec consume-side decode, DLG-D21) · validator.go (SchemaValidator, tests)
 │           ├── valkey/                # cache.go · client.go · idempotency.go — del: cache + idempotency store
@@ -145,7 +145,7 @@ iam-delegation/
 │   └── monitoring/                    # app-alerts.yml (threshold alerts) + slo-rules.yml (SLO-1..4 burn-rate, DLG-D39) — both also rendered by templates/prometheusrule.yaml — + prometheus-adapter-rule.yaml + schema-registry-alerts.yml (CI schema pipeline)
 ├── .github/workflows/                 # ci.yml · validate-quality.yml · validate-test.yml · release.yml · changelog-check.yml · schema-registry.yml · schema-prune.yml · schema-health-quarterly.yml · freeze-watchdog.yml
 ├── .githooks/pre-commit               # tidy + fmt-check + lint + swag-check
-├── Dockerfile  docker-compose.yml  docker-compose.pro.yml  Makefile  go.mod  .golangci.yml  .go-arch-lint.yml
+├── Dockerfile  docker-compose.yml  Makefile  go.mod  .golangci.yml  .go-arch-lint.yml
 ├── ARCHITECTURE.md                    # detailed architecture narrative with Mermaid diagrams; includes the DLG-D13+ as-built decision register
 ├── CONTRIBUTING.md                    # dev setup, extension playbooks, PR checklist
 ├── VERSIONING.md                      # SemVer policy, runtime-contract scope, release process, compatibility matrix
@@ -182,7 +182,7 @@ Also notable: `github.com/aws/aws-sdk-go-v2/service/glue` (GlueCodec's schema-ve
 - **`cmd/server/main.go`** — composition root. **Six** real background goroutines run under one `errgroup`: the outbox runner, the `delegation-cascade-q` SQS consumer, the `iam_delegation_active_gauge` exporter (`runActiveGaugeExporter` in `cmd/server/exporters.go` — a 5-minute BYPASSRLS `sysPool` snapshot via `pgadapter.NewGaugeRepository`, since no request or reconciler path can otherwise keep a point-in-time gauge current), a daily outbox-prune sweep (`outboxRunner.PrunePublished`, DLG-D24 — matching `iam-user-profile`'s `runMaintenanceSweep`; without it `outbox_events` grows unbounded, since published rows are never deleted automatically), the HTTP API server, and a dedicated `:METRICS_PORT` metrics server (split from the API listener so a NetworkPolicy can grant scrape access without also granting API access) — plus a graceful-shutdown goroutine and `GlueCodec.StartRefresher`'s internal ticker. DLG-D19's observability gap is closed: every registered `iam_delegation_*` instrument now has a real call site — the deferred/warned/expired reconciler counters (GAP-27/DLG-D25) via `cmd/reconciler/jobs.Context.Metrics`, the service-layer counters via `internal/core/service/metrics.go`'s injected `Metrics` port, and the previously-dead `active_gauge` via the exporter above.
 - **`cmd/server/adapters.go`** — two adapters unique to this service's topology: `gucBoundReader` binds `app.tenant_id` per-call for the mesh-only DLG-I3/I4 reads (no per-request middleware on that route group); `reconcilerRunner` adapts `cmd/reconciler/jobs`' `Expiry`/`ReviewSweep` functions to the HTTP handler's injected runner interfaces so DLG-I1/I2's on-demand HTTP endpoints and the CronJob binary share one implementation (DLG-D17).
 - **`internal/core/domain/event.go`** — `EventDelegationStarted`/`EventDelegationEnded`/`EventDelegationReviewRequested`/`EventDelegationEscalationRequested` (DLG-D27 — fired by `CascadeService.EndForDisabledDelegate` alongside `DelegationEnded`, notify-only, escalates to `tenant_admin`/`tenant_owner`) constants. Unlike `iam-user-profile`'s `domain.GlueSchemaName` translation switch, **these constants ARE the PascalCase Glue schema names directly** — no dot-notation-to-PascalCase mapping exists or is needed here.
-- **`internal/core/service/delegation_service.go`** — DLG-1..5 orchestration: the availability-first create ordering (membership checks → User Profile → `RunInTx`), fail-open cancel, self-retrying expiry, 3-day daily-cascade review warnings.
+- **`internal/core/service/delegation_service.go`** — DLG-1..5 orchestration. Create ordering (DLG-D43): membership checks → `GetAvailability` delegate OOO pre-flight (GAP-DEL-2) → `SetAvailability` (with `ooo_until=review_due_at` for open-ended rows) → `RunInTx`. Cancel: `ClearDelegatePointer` fail-open then `RunInTx`. Extend: `ExtendReview` then `SetAvailability` re-sync fail-open. Self-retrying expiry; 3-day daily-cascade review warnings.
 - **`internal/core/service/cascade_service.go`** — `EndForUser` (MembershipRevoked → end every delegation where the user is delegator or delegate; delegate-side only emits an event, delegator-side is silent per DLG-EVT-4) and `ScrubTenant` (TenantMembershipsPurged → soft-delete the tenant's rows).
 - **`internal/adapter/inbound/http/router.go`** — route registration; `tenantGUCMiddleware` on the public group (right after `ContextMiddleware`); `requireIdempotencyKey()` gates `POST /delegations` with a 400, not a service-layer check.
 - **`internal/adapter/inbound/http/errors.go`** — `errorStatusByCode`, the map from every `domain.Err*` sentinel to its HTTP status (LLD §20 verbatim). A code missing from this map falls back to 500.
@@ -205,4 +205,4 @@ Supplementary docs in the repo root and `docs/`:
 - **`ARCHITECTURE.md`** — detailed architecture narrative with Mermaid diagrams; its "Session-specific decisions" section is the DLG-D13+ as-built decision register
 - **`CONTRIBUTING.md`** — dev setup, extension playbooks, PR checklist
 - **`VERSIONING.md`** — SemVer policy, runtime-contract scope, release process, compatibility matrix
-- **`docs/lld/iam-lld-delegation-service.md`** — the full Low-Level Design (v2.13) this service implements
+- **`docs/lld/iam-lld-delegation-service.md`** — the full Low-Level Design (v2.15) this service implements

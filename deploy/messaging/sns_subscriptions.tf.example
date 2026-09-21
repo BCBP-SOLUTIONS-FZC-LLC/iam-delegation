@@ -63,11 +63,15 @@ resource "aws_sns_topic_subscription" "delegation_cascade_user_updated" {
     EventType = ["UserUpdated"]
   })
 
-  # Raw message delivery OFF — delegation-cascade-q consumer expects the full
-  # SNS notification envelope (with MessageAttributes for filter-policy
-  # evaluation), not a raw message body. The consumer strips the Glue header
-  # from env.Payload internally (Gap-15 fix).
-  raw_message_delivery = false
+  # Raw message delivery MUST be true — platform-events SQS consumer calls
+  # json.Unmarshal directly on msg.Body and expects the platform-events
+  # CloudEvents JSON envelope, not an SNS notification wrapper. Without
+  # RawMessageDelivery=true, SNS wraps each message in a JSON notification
+  # envelope that json.Unmarshal cannot parse — the consumer permanently
+  # deletes every message as malformed with no retry (platform-events
+  # internal/adapter/outbound/sqs/consumer.go Config doc comment).
+  # Matches init-localstack.sh lines 114 and 160 (RawMessageDelivery=true).
+  raw_message_delivery = true
 }
 
 # ── SQS queue policy update ───────────────────────────────────────────────

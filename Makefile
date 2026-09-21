@@ -86,7 +86,7 @@ MIGRATE_IMAGE  := migrate/migrate:v4.17.1
         race _race-unit _race-integration _race-rls _race-e2e \
         test-ci _test-unit-cov _test-integration-cov _test-rls-cov _merge-coverage \
         cover cover-func \
-        docker-build docker-push docker-up docker-up-pro docker-down compose-up compose-down \
+        docker-build docker-push docker-up docker-down compose-up compose-down \
         migrate-up migrate-down migrate-create \
         swag swag-check arch-lint generate ci
 
@@ -159,10 +159,9 @@ help:
 	@echo "  make ci               - tidy + fmt-check + vet + lint + arch-lint + test-ci + build (matches 'make ci' in CI docs)"
 	@echo "  make docker-build     - build the container image (IMAGE to override, carries both binaries)"
 	@echo "  make docker-push      - push the container image"
-	@echo "  make docker-up        - start local Postgres + Valkey + LocalStack community (no token needed)"
-	@echo "  make docker-up-pro    - start local Postgres + Valkey + LocalStack Pro (Glue Schema Registry; requires LOCALSTACK_AUTH_TOKEN in .env)"
+	@echo "  make docker-up        - start local Postgres + Valkey + Floci (SNS+SQS+Glue, port 4570; UI at http://localhost:4501)"
 	@echo "  make docker-down      - stop containers started by docker-up/compose-up"
-	@echo "  make compose-up       - start the full local dev stack (postgres, valkey, localstack, server — self-migrates at startup)"
+	@echo "  make compose-up       - start the full local dev stack (postgres, valkey, floci, server — self-migrates at startup)"
 	@echo "  make compose-down     - stop and remove the local dev stack, including volumes"
 	@echo "  make migrate-up       - apply all pending migrations against DATABASE_MIGRATION_URL (manual/CI use; the server binary also self-migrates at startup)"
 	@echo "  make migrate-down     - roll back one migration against DATABASE_MIGRATION_URL"
@@ -176,7 +175,7 @@ help:
 	@echo "  make schema-pull      - pull the schema-gov Docker image"
 	@echo "  make schema-validate  - validate AsyncAPI + event schemas — 8 passes (no AWS required)"
 	@echo "  make schema-diff      - diff two schema files: CURRENT=<path> PROPOSED=<path>"
-	@echo "  make schema-register  - register event schemas to Glue (requires AWS/LocalStack)"
+	@echo "  make schema-register  - register event schemas to Glue (requires AWS/Floci)"
 	@echo "  make schema-verify    - pre-deploy check: fail if PascalCase schemas are missing (requires AWS)"
 	@echo "  make schema-prune     - dry-run: list orphaned Glue schemas (requires AWS)"
 
@@ -342,13 +341,8 @@ docker-push: docker-build
 	docker push $(IMAGE)
 
 docker-up:
-	@echo "Starting local PostgreSQL + Valkey + LocalStack (community)..."
-	docker compose up -d postgres valkey localstack
-
-docker-up-pro:
-	@echo "Starting local PostgreSQL + Valkey + LocalStack Pro (Glue Schema Registry)..."
-	@grep -q '^LOCALSTACK_AUTH_TOKEN=.\+' .env 2>/dev/null || { echo "ERROR: LOCALSTACK_AUTH_TOKEN not set in .env"; exit 1; }
-	docker compose -f docker-compose.yml -f docker-compose.pro.yml up -d postgres valkey localstack
+	@echo "Starting local PostgreSQL + Valkey + Floci (SNS+SQS+Glue)..."
+	docker compose up -d postgres valkey floci floci-ui
 
 docker-down:
 	docker compose down
@@ -465,8 +459,8 @@ schema-prune:
 	  --registry   "$(GLUE_REGISTRY_NAME)" \
 	  $(if $(filter true,$(EXECUTE)),--execute,)
 
-# schema-register: register event schemas to Glue (requires AWS credentials or LocalStack).
-# Set AWS_ENDPOINT_URL=http://localhost:4566 in .env for LocalStack.
+# schema-register: register event schemas to Glue (requires AWS credentials or Floci).
+# Set AWS_ENDPOINT_URL=http://localhost:4570 in .env for Floci.
 .PHONY: schema-register
 schema-register:
 	@test -n "$(GLUE_REGISTRY_NAME)" || { \

@@ -8,8 +8,8 @@
 # Host ports are chosen to avoid colliding with the sibling IAM services'
 # own docker-compose.yml stacks (iam-user-profile: 5433/5434/6379/4566,
 # iam-org-membership: 5533/5534/6380/4567, iam-group-mapping: 5432/6379/4568,
-# iam-catalog-admin: 5535/6381, iam-tender-acl: 5536/6382/4569) so all can
-# run side-by-side on one host.
+# iam-catalog-admin: 5535/6381, iam-tender-acl: 5536/6382/4569,
+# iam-delegation: 5537/6383/4570/4501) so all can run side-by-side on one host.
 
 services:
   postgres:
@@ -41,32 +41,62 @@ services:
       retries: 10
       start_period: 5s
 
-  localstack:
-    # Community edition — SQS only. This service both publishes
-    # (iam-delegation-events via the outbox → SNS, LLD §10.4) and consumes
-    # (delegation-cascade-q, §11.5/§11.6), unlike iam-tender-acl which is
-    # SQS-only. Glue Schema Registry (Pro-only) is unused locally — the
-    # eventbus adapter falls back to plain-JSON (NoopCodec) when no registry
-    # is reachable (see internal/adapter/outbound/eventbus). To exercise the
-    # real GlueCodec locally, use docker-compose.pro.yml instead (requires a
-    # LOCALSTACK_AUTH_TOKEN).
-    image: localstack/localstack:4.4.0
+  floci:
+    # Floci — open-source (MIT), always-free AWS emulator; drop-in LocalStack
+    # replacement. Unlike LocalStack Community, Glue Schema Registry ships in
+    # the free tier, so this single service covers SNS + SQS + Glue with no
+    # Pro tier / auth token needed — scripts/init-floci.sh provisions the Glue
+    # registry and all 4 schemas alongside the SNS/SQS topology so the real
+    # GlueCodec wire format runs locally instead of falling back to NoopCodec.
+    image: floci/floci:2.1.0-compat
     ports:
       # Host 4570 → container 4566.
       - "4570:4566"
     environment:
-      SERVICES: sqs,sns
-      DEBUG: 0
-      AWS_DEFAULT_REGION: ap-south-1
+      FLOCI_DEFAULT_REGION: ap-south-1
+      FLOCI_DEFAULT_ACCOUNT_ID: "000000000000"
+      # Rewrites the host in SQS QueueUrl / SNS TopicArn responses so the
+      # floci-ui container — which resolves those URLs directly — can reach
+      # them from inside its own container. Without this, queue attribute
+      # fetches (message counts etc.) silently come back empty.
+      FLOCI_HOSTNAME: floci
+      # init-floci.sh makes sequential aws CLI round-trips; give real headroom
+      # beyond the default 30s ready-hook timeout on busy hosts.
+      FLOCI_INIT_HOOKS_TIMEOUT_SECONDS: "90"
     volumes:
-      - localstack-data:/var/lib/localstack
-      - ./scripts/init-localstack.sh:/etc/localstack/init/ready.d/init-localstack.sh
+      - floci_data:/app/data
+      - ./scripts/init-floci.sh:/etc/floci/init/ready.d/init-floci.sh
+      - ./internal/eventschema:/etc/floci/init/schemas:ro
     healthcheck:
-      test: ["CMD", "awslocal", "sqs", "list-queues"]
+      # The compat image's AWS CLI defaults to region us-east-1 regardless of
+      # FLOCI_DEFAULT_REGION — pin --region explicitly. Checks for the LAST
+      # resource init-floci.sh creates (DelegationEscalationRequested Glue
+      # schema) so the app's depends_on isn't satisfied until Glue is fully
+      # provisioned (GlueCodec startup prefetch would crash otherwise).
+      test: ["CMD", "aws", "--region", "ap-south-1", "glue", "get-schema",
+             "--schema-id", "RegistryName=iam-delegation-events,SchemaName=DelegationEscalationRequested"]
       interval: 5s
       timeout: 5s
-      retries: 10
-      start_period: 5s
+      retries: 20
+
+  floci-ui:
+    # Web console for floci — browse SNS/SQS/Glue resources at
+    # http://localhost:4501 instead of the aws CLI.
+    image: floci/floci-ui:0.5.0
+    ports:
+      # Host 4501 → container 4500. 4500 is claimed by iam-org-membership's
+      # floci-ui so both services can run side-by-side.
+      - "4501:4500"
+    environment:
+      AWS_REGION: ap-south-1
+      AWS_ACCESS_KEY_ID: test
+      FLOCI_ENDPOINT: http://floci:4566
+      AWS_SECRET_ACCESS_KEY: test
+      AWS_ENDPOINT_URL: http://floci:4566
+      PORT: "4500"
+    depends_on:
+      floci:
+        condition: service_healthy
 
   iam-delegation:
     build:
@@ -77,7 +107,7 @@ services:
         condition: service_healthy
       valkey:
         condition: service_healthy
-      localstack:
+      floci:
         condition: service_healthy
     ports:
       - "8080:8080"
@@ -132,26 +162,28 @@ services:
 
       # SNS_TOPIC_ARN/CASCADE_QUEUE_URL are required (cmd/server/config.go
       # fails fast if either is empty). Names/topic match
-      # scripts/init-localstack.sh and api/asyncapi.yaml.
+      # scripts/init-floci.sh and api/asyncapi.yaml.
       SNS_TOPIC_ARN: arn:aws:sns:ap-south-1:000000000000:iam-delegation-events
 
-      # LocalStack — container-internal port is always 4566 regardless of
-      # the host-side mapping above. AWS_ENDPOINT_URL is honored
-      # automatically by aws-sdk-go-v2's default config loader; no code
-      # change is needed to redirect SNS/SQS calls here instead of real AWS.
-      CASCADE_QUEUE_URL: http://localstack:4566/000000000000/delegation-cascade-q
+      # Floci — container-internal port is always 4566 regardless of the
+      # host-side mapping above. AWS_ENDPOINT_URL is honored automatically
+      # by aws-sdk-go-v2's default config loader; no code change is needed
+      # to redirect SNS/SQS/Glue calls here instead of real AWS.
+      CASCADE_QUEUE_URL: http://floci:4566/000000000000/delegation-cascade-q
       AWS_REGION: ap-south-1
-      # Empty → NoopCodec (LocalStack Community has no Glue). Set only when
-      # running against docker-compose.pro.yml.
-      GLUE_REGISTRY_NAME: ""
-      AWS_ENDPOINT_URL: http://localstack:4566
+      # Floci includes Glue Schema Registry in its free tier — set the
+      # registry name/ARN so GlueCodec runs locally with the real wire format
+      # (18-byte header) instead of falling back to NoopCodec.
+      GLUE_REGISTRY_NAME: iam-delegation-events
+      GLUE_REGISTRY_ARN: arn:aws:glue:ap-south-1:000000000000:registry/iam-delegation-events
+      AWS_ENDPOINT_URL: http://floci:4566
       # Dummy static credentials — required so the SDK's credential chain
       # resolves from these env vars instead of falling through to the
       # EC2 IMDS provider, which would otherwise retry against
       # 169.254.169.254 (unreachable outside EC2) and fail with
       # "no EC2 IMDS role found ... host is down".
-      AWS_ACCESS_KEY_ID: localstack
-      AWS_SECRET_ACCESS_KEY: localstack
+      AWS_ACCESS_KEY_ID: test
+      AWS_SECRET_ACCESS_KEY: test
 
       # OTLP/gRPC (platform-gincommon's ObservabilityMiddlewares) — not the
       # legacy OTLP/HTTP port 4318 some sibling services' compose files use.
@@ -162,4 +194,4 @@ services:
 
 volumes:
   postgres-data:
-  localstack-data:
+  floci_data:

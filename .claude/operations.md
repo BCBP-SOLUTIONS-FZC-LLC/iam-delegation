@@ -149,8 +149,9 @@ IAM permission failures, and the `schema-gov` CLI (written this session, DLG-D20
 | `CASCADE_QUEUE_URL` | **Yes** | — | Same — fail-fast, not a soft default |
 | `CASCADE_SQS_CONCURRENCY` | No | `4` | `events.WithConcurrency` on the cascade SQS consumer (iam-realm-provisioner) |
 | `AWS_REGION` | No | `ap-south-1` | |
-| `AWS_ENDPOINT_URL` | No | — | LocalStack endpoint override, dev only |
-| `GLUE_REGISTRY_NAME` | No | `""` → `NoopCodec` | Set to `iam-delegation-events` to activate `GlueCodec` (added this session, DLG-D20) |
+| `AWS_ENDPOINT_URL` | No | — | AWS emulator endpoint override; set to `http://floci:4566` in the local dev compose stack |
+| `GLUE_REGISTRY_NAME` | No | `""` → `NoopCodec` | Set to `iam-delegation-events` to activate `GlueCodec`; always set in the local dev compose stack (Floci includes Glue Schema Registry for free — no Pro token) |
+| `GLUE_REGISTRY_ARN` | No | — | Full ARN of the Glue registry; set alongside `GLUE_REGISTRY_NAME` for IAM policy scoping in non-local environments |
 | `OUTBOX_POLL_INTERVAL` / `OUTBOX_BATCH_SIZE` / `OUTBOX_MAX_ATTEMPTS` / `OUTBOX_DRAIN_TIMEOUT` / `OUTBOX_PUBLISH_CONCURRENCY` / `OUTBOX_PUBLISH_TIMEOUT` / `OUTBOX_STARTUP_JITTER` / `OUTBOX_CLAIM_LEASE_DURATION` | No | `500ms`/`50`/`5`/`30s`/`4`/`10s`/`2s`/`10m` | `outbox.Config` tunables — matches `iam-org-membership`'s identical env-var surface (DLG-D24) |
 | `OUTBOX_PRUNE_INTERVAL` / `OUTBOX_PRUNE_RETENTION` / `OUTBOX_PRUNE_LIMIT` | No | `24h` / `168h` (7d) / `1000` | Daily sweep calling `outbox.Runner.PrunePublished` — matches `iam-user-profile`'s `runMaintenanceSweep`; without it `outbox_events` grows unbounded (DLG-D24) |
 | `PROCESSED_EVENTS_TTL_DAYS` | No | `30` | Monthly `delegation-cleanup` prune window for `processed_events` (LLD §18.4, DLG-D38). Realm-provisioner defaults to 8 with a dedicated CronJob; this service keeps the LLD's 30-day window bundled into cleanup. |
@@ -233,7 +234,7 @@ equivalents (don't assume symmetry with `iam-user-profile`'s `scripts/` contents
 
 | File | Purpose |
 |---|---|
-| `scripts/init-localstack.sh` | Local dev: SNS topic + `delegation-cascade-q`/DLQ bootstrap, plus best-effort Glue registry + 3-schema registration (`docker-compose.pro.yml` only — Community LocalStack has no Glue) |
+| `scripts/init-floci.sh` | Local dev Floci ready-hook: creates the `iam-delegation-events` Glue registry + 4 schemas, the outbound SNS topic, the inbound `delegation-cascade-q`/DLQ (+ `iam-user-events` subscription), and 4 downstream fan-out subscriber queues. Uses `aws` CLI (not `awslocal`). Replaces `init-localstack.sh` — Floci includes Glue in its free tier so GlueCodec runs locally without a Pro token. |
 
 Do not add any new governance-related file to `scripts/`.
 

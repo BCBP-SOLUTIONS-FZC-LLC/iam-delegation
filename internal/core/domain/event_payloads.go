@@ -40,7 +40,7 @@ type DelegationEndedPayload struct {
 	DelegateID   uuid.UUID       `json:"delegate_id"`
 	Scope        DelegationScope `json:"scope"`
 	ScopeID      *uuid.UUID      `json:"scope_id,omitempty"`
-	EndedReason  EndReason       `json:"ended_reason"` // expired | cancelled | delegate_removed | review_expired
+	EndedReason  EndReason       `json:"ended_reason"` // expired | cancelled | reassigned | delegate_removed | review_expired | delegate_disabled
 	ActorID      uuid.UUID       `json:"actor_id"`
 }
 

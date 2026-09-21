@@ -83,6 +83,53 @@ func buildBody(req port.SetAvailabilityRequest) map[string]any {
 	return body
 }
 
+// GetAvailability calls GET /api/v1/users/:id/availability on iam-user-profile
+// and returns the delegate's current status and OOO end time.
+// 404 → user not provisioned in UP, treated as available (no OOO).
+// 5xx and network failures are wrapped with port.ErrDependencyUnavailable.
+func (c *HTTPClient) GetAvailability(ctx context.Context, tenantID, userID uuid.UUID) (*port.AvailabilitySnapshot, error) {
+	url := fmt.Sprintf("%s/api/v1/users/%s/availability", c.baseURL, userID)
+	httpReq, err := http.NewRequestWithContext(ctx, http.MethodGet, url, http.NoBody)
+	if err != nil {
+		return nil, fmt.Errorf("userprofile: build request: %w", err)
+	}
+	setInternalHeaders(httpReq, tenantID)
+	propagate(ctx, httpReq)
+
+	resp, err := c.httpClient.Do(httpReq)
+	if err != nil {
+		return nil, fmt.Errorf("userprofile: request failed: %w: %w", err, port.ErrDependencyUnavailable)
+	}
+	defer func() { _ = resp.Body.Close() }() //nolint:errcheck // best-effort close, nothing actionable on failure
+
+	if resp.StatusCode == http.StatusNotFound {
+		return &port.AvailabilitySnapshot{Status: "available"}, nil
+	}
+	if resp.StatusCode >= http.StatusInternalServerError {
+		return nil, fmt.Errorf("userprofile: unexpected status %d: %w", resp.StatusCode, port.ErrDependencyUnavailable)
+	}
+	if resp.StatusCode < http.StatusOK || resp.StatusCode >= http.StatusMultipleChoices {
+		return nil, fmt.Errorf("userprofile: unexpected status %d", resp.StatusCode)
+	}
+
+	var body struct {
+		Status   string  `json:"status"`
+		OOOUntil *string `json:"ooo_until"`
+	}
+	if err := json.NewDecoder(httpx.LimitBody(resp.Body)).Decode(&body); err != nil {
+		return nil, fmt.Errorf("userprofile: decode response: %w", err)
+	}
+	snap := &port.AvailabilitySnapshot{Status: body.Status}
+	if body.OOOUntil != nil {
+		t, parseErr := time.Parse(time.RFC3339, *body.OOOUntil)
+		if parseErr != nil {
+			return nil, fmt.Errorf("userprofile: parse ooo_until: %w", parseErr)
+		}
+		snap.OOOUntil = &t
+	}
+	return snap, nil
+}
+
 // ClearDelegatePointer calls iam-user-profile's dedicated pointer-clear
 // endpoint (DELETE /api/v1/internal/users/:id/availability/delegate).
 // Unlike SetAvailability, this never touches the user's status — UP preserves

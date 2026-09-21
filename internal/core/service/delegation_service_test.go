@@ -273,17 +273,12 @@ func TestDelegationService_Create_UserProfileErrorMapping(t *testing.T) {
 		wantCode string
 	}{
 		{
-			name:     "dependency unavailable",
+			name:     "dependency unavailable on SetAvailability",
 			upErr:    errors.Join(port.ErrDependencyUnavailable, errors.New("timeout")),
 			wantCode: domain.ErrUserProfileUnavailable.Error(),
 		},
 		{
-			name:     "delegate_unavailable business rejection",
-			upErr:    errors.New("422: delegate_unavailable: delegate is OOO"),
-			wantCode: domain.ErrDelegateUnavailable.Error(),
-		},
-		{
-			name:     "other plain error",
+			name:     "other plain error from SetAvailability",
 			upErr:    errors.New("some other rejection"),
 			wantCode: domain.ErrInvalidDelegate.Error(),
 		},
@@ -301,6 +296,97 @@ func TestDelegationService_Create_UserProfileErrorMapping(t *testing.T) {
 			assert.Empty(t, h.repo.insertCalls, "no write should happen when User Profile rejects availability")
 		})
 	}
+}
+
+// TestDelegationService_Create_DelegateOOO covers the GAP-DEL-2 pre-flight:
+// DEL queries UP for the delegate's current OOO status and rejects based on
+// starts_at overlap, not just "is the delegate OOO right now?"
+func TestDelegationService_Create_DelegateOOO(t *testing.T) {
+	oooNoEnd := &port.AvailabilitySnapshot{Status: "ooo", OOOUntil: nil}
+	future48h := time.Now().UTC().Add(48 * time.Hour)
+	oooUntilTomorrow := &port.AvailabilitySnapshot{Status: "ooo", OOOUntil: ptrTime(time.Now().UTC().Add(24 * time.Hour))}
+	oooUntilNextWeek := &port.AvailabilitySnapshot{Status: "ooo", OOOUntil: ptrTime(time.Now().UTC().Add(7 * 24 * time.Hour))}
+
+	tests := []struct {
+		name      string
+		snap      *port.AvailabilitySnapshot
+		startsAt  *time.Time // nil = immediate
+		wantCode  string
+		wantAllow bool
+	}{
+		{
+			name:     "delegate OOO now, immediate create → rejected",
+			snap:     oooNoEnd,
+			wantCode: domain.ErrDelegateUnavailable.Error(),
+		},
+		{
+			name:     "delegate OOO now with no ooo_until, immediate → rejected",
+			snap:     oooUntilTomorrow,
+			wantCode: domain.ErrDelegateUnavailable.Error(),
+		},
+		{
+			name:      "delegate OOO until tomorrow, starts in 48h → allowed (OOO ends before starts)",
+			snap:      oooUntilTomorrow,
+			startsAt:  &future48h,
+			wantAllow: true,
+		},
+		{
+			name:     "delegate OOO until next week, starts in 48h → rejected (OOO extends past starts)",
+			snap:     oooUntilNextWeek,
+			startsAt: &future48h,
+			wantCode: domain.ErrDelegateUnavailable.Error(),
+		},
+		{
+			name:      "delegate available → allowed",
+			snap:      &port.AvailabilitySnapshot{Status: "available"},
+			wantAllow: true,
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			h := newDelegationHarness()
+			tenantID, delegatorID := uuid.New(), uuid.New()
+			req := validCreateInput()
+			req.StartsAt = tc.startsAt
+			if tc.startsAt != nil {
+				// set ends_at so the scheduled delegation is not open-ended
+				endsAt := tc.startsAt.Add(24 * time.Hour)
+				req.EndsAt = &endsAt
+			}
+			h.activeBoth(delegatorID, req.DelegateID)
+			snap := tc.snap
+			h.up.getAvailabilityFn = func(_ context.Context, _, userID uuid.UUID) (*port.AvailabilitySnapshot, error) {
+				if userID == req.DelegateID {
+					return snap, nil
+				}
+				return &port.AvailabilitySnapshot{Status: "available"}, nil
+			}
+
+			_, err := h.svc.Create(context.Background(), tenantID, delegatorID, "", req)
+			if tc.wantAllow {
+				require.NoError(t, err)
+			} else {
+				requireDomainCode(t, err, tc.wantCode)
+				assert.Empty(t, h.repo.insertCalls)
+			}
+		})
+	}
+}
+
+// TestDelegationService_Create_GetAvailabilityUnavailable ensures a UP
+// outage on the pre-flight GetAvailability call maps to ErrUserProfileUnavailable.
+func TestDelegationService_Create_GetAvailabilityUnavailable(t *testing.T) {
+	h := newDelegationHarness()
+	tenantID, delegatorID := uuid.New(), uuid.New()
+	req := validCreateInput()
+	h.activeBoth(delegatorID, req.DelegateID)
+	h.up.getAvailabilityFn = func(_ context.Context, _, _ uuid.UUID) (*port.AvailabilitySnapshot, error) {
+		return nil, errors.Join(port.ErrDependencyUnavailable, errors.New("timeout"))
+	}
+
+	_, err := h.svc.Create(context.Background(), tenantID, delegatorID, "", req)
+	requireDomainCode(t, err, domain.ErrUserProfileUnavailable.Error())
+	assert.Empty(t, h.repo.insertCalls)
 }
 
 // ── Create: deferred/scheduled creation (DLG-D25) ───────────────────────
