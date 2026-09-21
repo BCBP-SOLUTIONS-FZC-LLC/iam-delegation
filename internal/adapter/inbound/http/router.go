@@ -65,18 +65,6 @@ type Router struct {
 	engine *gin.Engine
 }
 
-// Logger is the map[string]interface{}-based logging interface both
-// platform-gincommon's and platform-events' Config structs expect
-// (identical method shape in both libraries, structurally satisfied by the
-// Zap-backed logger platform-gincommon/pkg/logger.NewLogger returns without
-// any adapter — cmd/server passes that value straight through here).
-type Logger interface {
-	Debug(msg string, fields map[string]interface{})
-	Info(msg string, fields map[string]interface{})
-	Warn(msg string, fields map[string]interface{})
-	Error(msg string, fields map[string]interface{})
-}
-
 // NewRouter wires every route: the public delegation API (DLG-1…7,
 // gateway-fronted, auth via gincommon.ProtectedMiddlewares), the internal
 // mesh-only cron/query API (DLG-I1…I4, no RBAC — mTLS trust boundary per

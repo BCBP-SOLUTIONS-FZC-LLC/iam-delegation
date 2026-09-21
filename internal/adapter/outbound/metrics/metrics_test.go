@@ -67,7 +67,7 @@ func TestRegister_RecordsIncrementCounters(t *testing.T) {
 	m.RecordProcessedEventsDuplicate("cascade")
 	m.RecordUnknownEventAcknowledged("cascade", "SomeOtherEvent")
 	m.ObserveMembershipCheckDuration(0.01)
-	m.SetActiveGauge("tenant-1", 3)
+	m.ReplaceActiveGauges(map[string]int64{"tenant-1": 3})
 
 	metricFamilies, err := reg.Gather()
 	require.NoError(t, err)

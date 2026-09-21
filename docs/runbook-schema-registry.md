@@ -77,12 +77,11 @@ and permanently corrupts the audit trail for the duration.
 
 ## Local development
 
-`scripts/init-floci.sh` registers the four schemas under the same
-names into Floci's Glue Schema Registry on `make docker-up`. Floci includes
-Glue in its free tier (unlike LocalStack Community), so the schemas are always
-registered and `GLUE_REGISTRY_NAME=iam-delegation-events` is set by default in
-`docker-compose.yml` — `GlueCodec` runs locally by default with the real 18-byte
-wire format. No Pro token or separate compose file is required.
+`scripts/init-floci.sh` registers the four schemas under the same names into
+floci's real Glue Schema Registry — floci includes it in the free tier
+(unlike LocalStack Community, which gated it behind Pro), so `docker-compose.yml`'s
+default stack always runs the real Glue codec locally; `GLUE_REGISTRY_NAME=""`
+(NoopCodec) is only needed if you deliberately want to bypass it.
 
 ## Adding a new event type
 
@@ -136,13 +135,15 @@ pod's own IRSA role.
 ## Required env vars
 
 Set in `deploy/helm/iam-delegation/values.yaml` (per environment) or `.env`
-(dev, via `docker-compose.yml` — `GLUE_REGISTRY_NAME` is set automatically):
+(dev, via `docker-compose.yml`'s `floci` service — Floci includes Glue
+Schema Registry in its free tier, so no separate Pro-tier compose stack is
+needed):
 
 | Variable | Purpose | Notes |
 |---|---|---|
-| `GLUE_REGISTRY_NAME` | Glue registry name | Set to `iam-delegation-events` in production/staging and local dev (Floci). |
+| `GLUE_REGISTRY_NAME` | Glue registry name | Set to `iam-delegation-events` in production/staging, and by default in local dev too (floci provisions it for free). Leave empty to force NoopCodec. |
 | `GLUE_REGISTRY_ARN` | Full registry ARN | For IAM policy scoping; used by `schema-gov register` and `deploy/iam/policy.tf.example`. Not read by the Go runtime. |
-| `AWS_REGION` | Primary region | `ap-south-1` everywhere — production, local dev, and CI (see `deploy/helm/iam-delegation/values.yaml`; local dev/CI additionally point `AWS_ENDPOINT_URL` at Floci on port 4570). |
+| `AWS_REGION` | Primary region | `ap-south-1` everywhere — production, local dev, and CI (see `deploy/helm/iam-delegation/values.yaml`; local dev/CI additionally point `AWS_ENDPOINT_URL` at floci). |
 
 ## CI governance pipeline
 

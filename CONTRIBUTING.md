@@ -5,7 +5,7 @@ This is an internal IAM microservice for the XpertPMS platform. This guide cover
 ## Prerequisites
 
 - Go 1.26.6 (pinned exactly — matches `go.mod`'s `go 1.26.6`; DLG-D16 — intentionally newer than the LLD's stated "Go 1.23", which is stale relative to the platform's real toolchain)
-- Docker (required for the Postgres/Valkey/Floci-backed integration and RLS tests via `testcontainers-go`)
+- Docker (required for the Postgres/Valkey/SQS-backed integration and RLS tests via `testcontainers-go`)
 - `GOPRIVATE=github.com/BCBP-SOLUTIONS-FZC-LLC/*` (private module access)
 
 ## Development setup
@@ -15,7 +15,7 @@ git clone https://github.com/BCBP-SOLUTIONS-FZC-LLC/iam-delegation
 cd iam-delegation
 make setup      # copies .env.example → .env
 make tidy       # go mod tidy
-make docker-up  # start Postgres + Valkey + Floci
+make docker-up  # start Postgres + Valkey + floci + floci-ui
 make lint       # verify linter passes
 make test       # unit + integration + rls, in parallel (requires Docker)
 make run        # start cmd/server on :8080
@@ -47,7 +47,7 @@ internal/
     postgres/            ← Repository implementations + golang-migrate migrations
     userprofile/         ← UserProfileClient HTTP impl (DEL-6)
     orgmembership/       ← MembershipCheckClient HTTP impl (DLG-D3)
-    eventbus/            ← SchemaValidator (jsonschema/v6) + GlueCodec/NoopCodec
+    eventbus/            ← ValidatingCodec + GlueCodec/GlueDecodeCodec (events.Codec; events.NoopCodec from the library)
     valkey/               ← del: cache + idempotency store
     metrics/              ← Prometheus instruments
 internal/eventschema/    ← Hand-maintained JSON Schemas for the four published events

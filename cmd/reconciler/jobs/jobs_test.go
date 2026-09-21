@@ -15,8 +15,10 @@ import (
 
 type fakeLogger struct{}
 
-func (fakeLogger) Info(string, map[string]interface{}) {}
-func (fakeLogger) Warn(string, map[string]interface{}) {}
+func (fakeLogger) Debug(string, map[string]interface{}) {}
+func (fakeLogger) Info(string, map[string]interface{})  {}
+func (fakeLogger) Warn(string, map[string]interface{})  {}
+func (fakeLogger) Error(string, map[string]interface{}) {}
 
 type fakeUserProfile struct {
 	failFor    map[uuid.UUID]bool            // userID -> fail any UP call

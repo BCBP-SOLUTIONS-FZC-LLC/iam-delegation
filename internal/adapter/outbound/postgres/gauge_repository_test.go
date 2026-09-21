@@ -57,9 +57,9 @@ func TestGaugeRepository_CountActiveByTenant_AppPoolWithoutGUCSeesNothing(t *tes
 	assert.Empty(t, counts)
 }
 
-// TestGaugeRepository_CountActiveByTenant_CancelledContext covers lines
-// 52–54 (query error) and 68–70 (withPool error return): a pre-cancelled
-// context causes the query to fail immediately.
+// TestGaugeRepository_CountActiveByTenant_CancelledContext covers the
+// WithConn query-error return: a pre-cancelled context causes the acquire
+// or query to fail immediately.
 func TestGaugeRepository_CountActiveByTenant_CancelledContext(t *testing.T) {
 	db := setupTestDB(t)
 	gauges := NewGaugeRepository(db.Bypass)

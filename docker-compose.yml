@@ -7,9 +7,10 @@
 #
 # Host ports are chosen to avoid colliding with the sibling IAM services'
 # own docker-compose.yml stacks (iam-user-profile: 5433/5434/6379/4566,
-# iam-org-membership: 5533/5534/6380/4567, iam-group-mapping: 5432/6379/4568,
-# iam-catalog-admin: 5535/6381, iam-tender-acl: 5536/6382/4569,
-# iam-delegation: 5537/6383/4570/4501) so all can run side-by-side on one host.
+# iam-org-membership: 5533/5534/6380/4567/4500 [floci/floci-ui],
+# iam-group-mapping: 5432/6379/4568, iam-catalog-admin: 5535/6381,
+# iam-tender-acl: 5536/6382/4569) so all can run side-by-side on one host.
+# This service: 5537/6383/4570/4501.
 
 services:
   postgres:
@@ -42,54 +43,72 @@ services:
       start_period: 5s
 
   floci:
-    # Floci — open-source (MIT), always-free AWS emulator; drop-in LocalStack
-    # replacement. Unlike LocalStack Community, Glue Schema Registry ships in
-    # the free tier, so this single service covers SNS + SQS + Glue with no
-    # Pro tier / auth token needed — scripts/init-floci.sh provisions the Glue
-    # registry and all 4 schemas alongside the SNS/SQS topology so the real
-    # GlueCodec wire format runs locally instead of falling back to NoopCodec.
+    # Floci — open-source (MIT), always-free AWS emulator; drop-in
+    # LocalStack replacement (iam-org-membership uses the same image).
+    # Unlike LocalStack Community, Glue Schema Registry ships in floci's
+    # free tier, so this single service covers SNS + SQS + Glue with no Pro
+    # tier / auth token needed — scripts/init-floci.sh provisions the
+    # iam-delegation-events topic, delegation-cascade-q, the three
+    # downstream fan-out queues, and the Glue registry + all 4 schemas.
+    # This service both publishes (iam-delegation-events via the outbox →
+    # SNS, LLD §10.4) and consumes (delegation-cascade-q, §11.5/§11.6),
+    # unlike iam-tender-acl which is SQS-only.
     image: floci/floci:2.1.0-compat
     ports:
-      # Host 4570 → container 4566.
+      # Host 4570 → container 4566. 4566/4567 are claimed by
+      # iam-user-profile's/iam-org-membership's own emulator instances so
+      # all three can run side-by-side.
       - "4570:4566"
     environment:
       FLOCI_DEFAULT_REGION: ap-south-1
       FLOCI_DEFAULT_ACCOUNT_ID: "000000000000"
-      # Rewrites the host in SQS QueueUrl / SNS TopicArn responses so the
-      # floci-ui container — which resolves those URLs directly — can reach
-      # them from inside its own container. Without this, queue attribute
-      # fetches (message counts etc.) silently come back empty.
+      # Rewrites the host in SQS QueueUrl / SNS TopicArn responses (e.g.
+      # http://floci:4566/... instead of http://localhost:4566/...) so the
+      # floci-ui container below — which resolves those URLs directly,
+      # AWS-SDK-console fashion — can actually reach them from inside its
+      # own container. Without this, floci-ui's queue list loads fine but
+      # every per-queue attribute (message counts included) silently comes
+      # back empty.
       FLOCI_HOSTNAME: floci
-      # init-floci.sh makes sequential aws CLI round-trips; give real headroom
-      # beyond the default 30s ready-hook timeout on busy hosts.
-      FLOCI_INIT_HOOKS_TIMEOUT_SECONDS: "90"
     volumes:
-      - floci_data:/app/data
+      - floci-data:/app/data
       - ./scripts/init-floci.sh:/etc/floci/init/ready.d/init-floci.sh
       - ./internal/eventschema:/etc/floci/init/schemas:ro
     healthcheck:
-      # The compat image's AWS CLI defaults to region us-east-1 regardless of
-      # FLOCI_DEFAULT_REGION — pin --region explicitly. Checks for the LAST
-      # resource init-floci.sh creates (DelegationEscalationRequested Glue
-      # schema) so the app's depends_on isn't satisfied until Glue is fully
-      # provisioned (GlueCodec startup prefetch would crash otherwise).
+      # The compat image's AWS CLI defaults to region us-east-1 regardless
+      # of FLOCI_DEFAULT_REGION — floci treats region as an isolation
+      # boundary, so --region must be explicit here. Checks for the LAST
+      # resource init-floci.sh creates (the DelegationEscalationRequested
+      # Glue schema), not just SNS reachability — the SNS topic exists
+      # seconds into the script while Glue registration is still running,
+      # so a shallow `sns list-topics` check would report "healthy" (and
+      # unblock iam-delegation's depends_on) before GLUE_REGISTRY_NAME's
+      # schema actually exists, crashing GlueCodec's startup prefetch.
       test: ["CMD", "aws", "--region", "ap-south-1", "glue", "get-schema",
              "--schema-id", "RegistryName=iam-delegation-events,SchemaName=DelegationEscalationRequested"]
       interval: 5s
       timeout: 5s
       retries: 20
+      start_period: 5s
 
   floci-ui:
     # Web console for floci — browse SNS/SQS/Glue resources at
-    # http://localhost:4501 instead of the aws CLI.
+    # http://localhost:4501 instead of the aws CLI. Talks to `floci` over
+    # the compose network. Shows queue/topic metadata including live
+    # message counts, but not message bodies or SNS topics/subscriptions —
+    # see README.md's "Testing domain events locally" for the CLI cookbook.
     image: floci/floci-ui:0.5.0
     ports:
-      # Host 4501 → container 4500. 4500 is claimed by iam-org-membership's
-      # floci-ui so both services can run side-by-side.
+      # Host 4501 → container 4500. 4500 is claimed by
+      # iam-org-membership's own floci-ui instance.
       - "4501:4500"
     environment:
       AWS_REGION: ap-south-1
       AWS_ACCESS_KEY_ID: test
+      # NOT the same as AWS_ENDPOINT_URL below — floci-ui's own
+      # connectivity probe reads this separate, floci-ui-specific var
+      # (upstream default: http://localhost:4566, which from *inside its
+      # own container* means itself, not `floci`).
       FLOCI_ENDPOINT: http://floci:4566
       AWS_SECRET_ACCESS_KEY: test
       AWS_ENDPOINT_URL: http://floci:4566
@@ -165,18 +184,30 @@ services:
       # scripts/init-floci.sh and api/asyncapi.yaml.
       SNS_TOPIC_ARN: arn:aws:sns:ap-south-1:000000000000:iam-delegation-events
 
-      # Floci — container-internal port is always 4566 regardless of the
+      # floci — container-internal port is always 4566 regardless of the
       # host-side mapping above. AWS_ENDPOINT_URL is honored automatically
       # by aws-sdk-go-v2's default config loader; no code change is needed
       # to redirect SNS/SQS/Glue calls here instead of real AWS.
       CASCADE_QUEUE_URL: http://floci:4566/000000000000/delegation-cascade-q
       AWS_REGION: ap-south-1
-      # Floci includes Glue Schema Registry in its free tier — set the
-      # registry name/ARN so GlueCodec runs locally with the real wire format
-      # (18-byte header) instead of falling back to NoopCodec.
+      # Non-empty by default — floci includes Glue Schema Registry in its
+      # free tier (unlike LocalStack Community, which gates it behind Pro),
+      # so the real GlueCodec wire format runs locally instead of falling
+      # back to NoopCodec. scripts/init-floci.sh registers this registry +
+      # all 4 schemas on floci startup.
       GLUE_REGISTRY_NAME: iam-delegation-events
-      GLUE_REGISTRY_ARN: arn:aws:glue:ap-south-1:000000000000:registry/iam-delegation-events
       AWS_ENDPOINT_URL: http://floci:4566
+
+      # Outbox runner — platform-events LoadOutbox. Keep historical values
+      # so compose does not fall through to library defaults (5s poll / concurrency 1).
+      OUTBOX_POLL_INTERVAL: 500ms
+      OUTBOX_BATCH_SIZE: "50"
+      OUTBOX_MAX_ATTEMPTS: "5"
+      OUTBOX_DRAIN_TIMEOUT: 30s
+      OUTBOX_PUBLISH_CONCURRENCY: "4"
+      OUTBOX_PUBLISH_TIMEOUT: 10s
+      OUTBOX_STARTUP_JITTER: 2s
+      OUTBOX_CLAIM_LEASE_DURATION: 10m
       # Dummy static credentials — required so the SDK's credential chain
       # resolves from these env vars instead of falling through to the
       # EC2 IMDS provider, which would otherwise retry against
@@ -194,4 +225,4 @@ services:
 
 volumes:
   postgres-data:
-  floci_data:
+  floci-data:

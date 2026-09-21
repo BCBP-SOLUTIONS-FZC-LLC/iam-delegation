@@ -24,6 +24,7 @@ import (
 	"github.com/aws/aws-sdk-go-v2/service/glue"
 	"github.com/aws/aws-sdk-go-v2/service/sqs"
 
+	eventcfg "github.com/BCBP-SOLUTIONS-FZC-LLC/platform-events/pkg/config"
 	events "github.com/BCBP-SOLUTIONS-FZC-LLC/platform-events/pkg/events"
 	"github.com/BCBP-SOLUTIONS-FZC-LLC/platform-events/pkg/outbox"
 	gincommon "github.com/BCBP-SOLUTIONS-FZC-LLC/platform-gincommon/pkg/gincommon"
@@ -47,6 +48,7 @@ import (
 	"github.com/BCBP-SOLUTIONS-FZC-LLC/iam-delegation/internal/adapter/outbound/userprofile"
 	"github.com/BCBP-SOLUTIONS-FZC-LLC/iam-delegation/internal/adapter/outbound/valkey"
 	"github.com/BCBP-SOLUTIONS-FZC-LLC/iam-delegation/internal/core/domain"
+	"github.com/BCBP-SOLUTIONS-FZC-LLC/iam-delegation/internal/core/port"
 	"github.com/BCBP-SOLUTIONS-FZC-LLC/iam-delegation/internal/core/service"
 )
 
@@ -61,23 +63,29 @@ func main() {
 	if appEnv != "dev" {
 		gin.SetMode(gin.ReleaseMode)
 	}
-	logger, err := gclogger.NewLogger(appEnv)
+	log, err := gclogger.NewLogger(appEnv)
 	if err != nil {
 		panic("init logger: " + err.Error())
 	}
-	if err := run(logger); err != nil {
-		logger.Error("iam-delegation-server exited with error", map[string]interface{}{"error": err.Error()})
+	if err := run(context.Background(), log); err != nil {
+		log.Error("iam-delegation-server exited with error", map[string]interface{}{"error": err.Error()})
 		os.Exit(1)
 	}
 }
 
-func run(logger Logger) error {
+// run wires and starts every background worker and both HTTP listeners,
+// blocking until ctx is done and the graceful-shutdown sequence completes.
+// ctx is normally context.Background() (main only ever cancels via the
+// OS-signal NotifyContext derived below) but a test may pass its own
+// cancelable context to drive that same shutdown path deterministically
+// instead of sending a real signal.
+func run(ctx context.Context, logger port.Logger) error {
 	cfg, err := loadConfig()
 	if err != nil {
 		return fmt.Errorf("load config: %w", err)
 	}
 
-	baseCtx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	baseCtx, stop := signal.NotifyContext(ctx, os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
 	// Tracing + metrics init through platform-gincommon, matching
@@ -160,6 +168,11 @@ func run(logger Logger) error {
 	// defers are LIFO so DrainAndClose runs first, then Close (idempotent
 	// after DrainAndClose). Matching iam-realm-provisioner.
 	defer pool.Close()
+	// drainCtx is deliberately not derived from ctx/baseCtx: by the time this
+	// defer runs, ctx is already Done() (this is the shutdown path), so a
+	// context.WithTimeout(ctx, ...) would be pre-cancelled and give
+	// DrainAndClose zero time to run.
+	//nolint:contextcheck // see the comment above
 	defer func() {
 		drainCtx, cancelDrain := context.WithTimeout(context.Background(), 30*time.Second)
 		defer cancelDrain()
@@ -185,6 +198,8 @@ func run(logger Logger) error {
 		logger.Warn("SYSTEM_DATABASE_URL not set — sysPool reuses app DSN; cross-tenant cron/internal sweeps will be RLS-filtered", nil)
 	}
 	defer sysPool.Close()
+	// See the app pool's identical drainCtx comment above.
+	//nolint:contextcheck // see the comment above
 	defer func() {
 		drainCtx, cancelDrain := context.WithTimeout(context.Background(), 30*time.Second)
 		defer cancelDrain()
@@ -197,7 +212,7 @@ func run(logger Logger) error {
 	// Glue codec (publish-time) — the enqueue-vs-publish split, LLD §10.3.1,
 	// matching iam-realm-provisioner. postgres.TxRunner injects the publisher;
 	// it does not import platform-events.
-	enqueueCodec, err := eventbus.NewValidatingCodec(eventbus.NoopCodec{})
+	enqueueCodec, err := eventbus.NewValidatingCodec(events.NoopCodec{})
 	if err != nil {
 		return fmt.Errorf("build enqueue codec: %w", err)
 	}
@@ -225,24 +240,23 @@ func run(logger Logger) error {
 		gc.WithLogger(logger).StartRefresher(baseCtx, 5*time.Minute)
 		codec = gc
 	}
-	snsPublisher, err := events.NewSNSPublisher(events.SNSConfig{
-		TopicARN: cfg.SNSTopicARN, Region: cfg.AWSRegion, EndpointURL: cfg.AWSEndpointURL, Logger: logger,
-	}, events.WithCodec(codec))
+	snsPublisher, err := buildSNSPublisher(codec, logger, cfg.AWSRegion, cfg.AWSEndpointURL)
 	if err != nil {
 		return fmt.Errorf("build SNS publisher: %w", err)
 	}
 
-	outboxRunner, err := outbox.NewRunner(outbox.Config{
-		Pool: pool, Publisher: snsPublisher, Logger: logger,
-		PollInterval:       cfg.OutboxPollInterval,
-		BatchSize:          cfg.OutboxBatchSize,
-		MaxAttempts:        cfg.OutboxMaxAttempts,
-		DrainTimeout:       cfg.OutboxDrainTimeout,
-		PublishConcurrency: cfg.OutboxPublishConcurrency,
-		PublishTimeout:     cfg.OutboxPublishTimeout,
-		StartupJitter:      cfg.OutboxStartupJitter,
-		ClaimLeaseDuration: cfg.OutboxClaimLeaseDuration,
-	})
+	// LoadOutbox + RunnerConfigFromEnv is the platform-events composition
+	// contract (same as iam-user-profile / iam-org-membership). ensureOutboxEnv
+	// backfills the historical 500ms/concurrency-4/2s-jitter/10m-claim-lease
+	// values whenever OUTBOX_* is unset, so behavior doesn't silently regress
+	// to the library's own (different) defaults on any invocation path that
+	// doesn't happen to set them — Helm's values.yaml and .env.example also
+	// set them explicitly, but this is the safety net that doesn't depend on
+	// either file staying in sync.
+	ensureOutboxEnv()
+	outboxEnv := eventcfg.LoadOutbox()
+	eventcfg.LogWarningsTo(logger, outboxEnv.Warnings)
+	outboxRunner, err := outbox.NewRunner(eventcfg.RunnerConfigFromEnv(outboxEnv, pool, snsPublisher, logger))
 	if err != nil {
 		return fmt.Errorf("build outbox runner: %w", err)
 	}
@@ -308,6 +322,12 @@ func run(logger Logger) error {
 		}
 		return pgadapter.WithTenantGUC(ctx, tid, userID)
 	}
+	// contextcheck flags this call because bindTenantGUC's own ctx parameter
+	// (a fresh per-request context tenantGUCMiddleware supplies via
+	// c.Request.Context(), not run's ctx) is invisible to its static
+	// analysis across the function-value boundary — a false positive, not
+	// a dropped context.
+	//nolint:contextcheck // see the comment above
 	router := httpadapter.NewRouter(
 		delegationHandler, settingsHandler, internalHandler,
 		pool, sysPool, redisPinger{client: redisClient}, outboxPinger{runner: outboxRunner},
@@ -352,9 +372,17 @@ func run(logger Logger) error {
 	// is set — independently of this service's outbound publish-side Glue
 	// config — so the inbound consumer needs decode support regardless of
 	// whether this service's own events are Glue-encoded (LLD §10.1, DLG-D21).
-	sqsConsumer, err := consumer.NewCascadeSQSConsumer(sqsClient, cfg.CascadeQueueURL, cfg.AWSRegion, cfg.AWSEndpointURL, logger, cascadeConsumer,
+	// LoadSQS + SQSConsumerOptions is the platform-events composition
+	// contract (iam-user-profile / iam-org-membership); CASCADE_* overlays
+	// SQS_QUEUE_URL / SQS_CONCURRENCY which this service cannot use as-is.
+	sqsEnv := eventcfg.LoadSQS()
+	eventcfg.LogWarningsTo(logger, sqsEnv.Warnings)
+	sqsConsumer, err := consumer.NewCascadeSQSConsumer(
+		sqsClient,
+		cascadeSQSEnv(sqsEnv, cfg.CascadeQueueURL, cfg.CascadeSQSConcurrency, cfg.AWSRegion, cfg.AWSEndpointURL),
+		logger,
+		cascadeConsumer,
 		events.WithConsumerCodec(eventbus.GlueDecodeCodec{}),
-		events.WithConcurrency(cfg.CascadeSQSConcurrency),
 	)
 	if err != nil {
 		return fmt.Errorf("build cascade SQS consumer: %w", err)

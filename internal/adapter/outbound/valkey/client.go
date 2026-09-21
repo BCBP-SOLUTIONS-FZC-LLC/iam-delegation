@@ -11,15 +11,6 @@ import (
 	"github.com/redis/go-redis/v9"
 )
 
-// Logger is the minimal structured-logging capability this package needs —
-// satisfied structurally by platform-gincommon/pkg/logger's port.Logger (an
-// internal type there, so this package declares its own duck-typed
-// interface rather than importing it directly), or by any other logger
-// whose Warn method matches this shape.
-type Logger interface {
-	Warn(msg string, fields map[string]interface{})
-}
-
 // NewClient builds a *redis.Client from addr, shared by NewCache and
 // NewIdempotencyStore (both keyspaces — del:list: and del:idem: — live on
 // the same Valkey endpoint, LLD §9). addr may be a plain host:port or a

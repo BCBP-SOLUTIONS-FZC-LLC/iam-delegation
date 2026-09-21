@@ -91,15 +91,16 @@ Two layers, both sourced from the metrics table above and kept in sync across th
 ## Tracing and logging
 
 OTel via `platform-gincommon` (same shared lib as sibling services); structured logging via Zap,
-wired through `gincommon`. Both binaries call `gincommon.InitTracingFromEnv` then
+wired through `logger.NewLogger` as a single `internal/core/port.Logger` (DLG-D42, matching
+`iam-user-profile` / `iam-org-membership`). Both binaries call `gincommon.InitTracingFromEnv` then
 `ObservabilityMiddlewares` at startup **before** creating tracers or registering collectors
 (DLG-D31, matching `iam-realm-provisioner`), then share one `postgres.NewOTelTracer` across
 the app and sys pools so `db.query` spans share the HTTP OTLP pipeline. Outbound User Profile /
 Org Membership calls go through `internal/adapter/outbound/httpx` (`otelhttp`) so they emit
 client spans and inject `traceparent`. The reconciler wraps each job in a
-`reconciler.<job>` span. No custom TracerProvider/exporter. `/metrics` is served on
-`METRICS_PORT` (default 9090), not on the API listener. `metrics.Register()` is the no-arg
-gincommon API.
+`reconciler.<job>` span and also calls `events`/`pgmetrics` `InitWithRegisterer`. No custom
+TracerProvider/exporter. `/metrics` is served on `METRICS_PORT` (default 9090), not on the API
+listener. `metrics.Register()` is the no-arg gincommon API.
 
 ## Health checks — `internal/adapter/inbound/http/health.go`
 
@@ -147,13 +148,12 @@ IAM permission failures, and the `schema-gov` CLI (written this session, DLG-D20
 | `ORG_MEMBERSHIP_MEMBERSHIP_CHECK_TIMEOUT_MS` | No | `3000` | |
 | `SNS_TOPIC_ARN` | **Yes** | — | `loadConfig` returns an error if empty — the process never starts |
 | `CASCADE_QUEUE_URL` | **Yes** | — | Same — fail-fast, not a soft default |
-| `CASCADE_SQS_CONCURRENCY` | No | `4` | `events.WithConcurrency` on the cascade SQS consumer (iam-realm-provisioner) |
+| `CASCADE_SQS_CONCURRENCY` | No | `4` | Overlaid onto `config.LoadSQS` (which reads `SQS_CONCURRENCY`) then applied via `SQSConsumerOptions` / `WithConcurrency` (iam-user-profile / iam-org-membership) |
 | `AWS_REGION` | No | `ap-south-1` | |
-| `AWS_ENDPOINT_URL` | No | — | AWS emulator endpoint override; set to `http://floci:4566` in the local dev compose stack |
-| `GLUE_REGISTRY_NAME` | No | `""` → `NoopCodec` | Set to `iam-delegation-events` to activate `GlueCodec`; always set in the local dev compose stack (Floci includes Glue Schema Registry for free — no Pro token) |
-| `GLUE_REGISTRY_ARN` | No | — | Full ARN of the Glue registry; set alongside `GLUE_REGISTRY_NAME` for IAM policy scoping in non-local environments |
-| `OUTBOX_POLL_INTERVAL` / `OUTBOX_BATCH_SIZE` / `OUTBOX_MAX_ATTEMPTS` / `OUTBOX_DRAIN_TIMEOUT` / `OUTBOX_PUBLISH_CONCURRENCY` / `OUTBOX_PUBLISH_TIMEOUT` / `OUTBOX_STARTUP_JITTER` / `OUTBOX_CLAIM_LEASE_DURATION` | No | `500ms`/`50`/`5`/`30s`/`4`/`10s`/`2s`/`10m` | `outbox.Config` tunables — matches `iam-org-membership`'s identical env-var surface (DLG-D24) |
-| `OUTBOX_PRUNE_INTERVAL` / `OUTBOX_PRUNE_RETENTION` / `OUTBOX_PRUNE_LIMIT` | No | `24h` / `168h` (7d) / `1000` | Daily sweep calling `outbox.Runner.PrunePublished` — matches `iam-user-profile`'s `runMaintenanceSweep`; without it `outbox_events` grows unbounded (DLG-D24) |
+| `AWS_ENDPOINT_URL` | No | — | floci endpoint override, dev only |
+| `GLUE_REGISTRY_NAME` | No | `iam-delegation-events` (dev default) → `""` forces `NoopCodec` | floci provisions this registry for free, so `GlueCodec` runs by default in local dev (DLG-D20) |
+| `OUTBOX_POLL_INTERVAL` / `OUTBOX_BATCH_SIZE` / `OUTBOX_MAX_ATTEMPTS` / `OUTBOX_DRAIN_TIMEOUT` / `OUTBOX_PUBLISH_CONCURRENCY` / `OUTBOX_PUBLISH_TIMEOUT` / `OUTBOX_STARTUP_JITTER` / `OUTBOX_CLAIM_LEASE_DURATION` | No | `500ms`/`50`/`5`/`30s`/`4`/`10s`/`2s`/`10m` when set in Helm / `.env.example`; otherwise platform-events `LoadOutbox` library defaults (`5s`/`50`/`5`/`30s`/`1`/`10s`/`0`/`0`) | Passed through `config.LoadOutbox` → `RunnerConfigFromEnv` (iam-user-profile / iam-org-membership, DLG-D44). Helm keeps the historical values so production does not silently change poll/concurrency. |
+| `OUTBOX_PRUNE_INTERVAL` / `OUTBOX_PRUNE_RETENTION` / `OUTBOX_PRUNE_LIMIT` | No | `24h` / `168h` (7d) / `1000` | Daily sweep calling `outbox.Runner.PrunePublished` — matches `iam-user-profile`'s `runMaintenanceSweep`; `LoadOutbox` does not cover prune. |
 | `PROCESSED_EVENTS_TTL_DAYS` | No | `30` | Monthly `delegation-cleanup` prune window for `processed_events` (LLD §18.4, DLG-D38). Realm-provisioner defaults to 8 with a dedicated CronJob; this service keeps the LLD's 30-day window bundled into cleanup. |
 | `OTEL_EXPORTER_OTLP_ENDPOINT` | No | — | |
 | `DOCS_ENABLED` | No | `true` outside `production` | Gates `/swagger`, `/asyncapi` |
@@ -178,10 +178,16 @@ GitHub Actions (`.github/workflows/`), all names/steps verified against current 
    single global floor**, not a per-package gate — bumped from the original 70% during the
    DLG-D34 production-readiness sweep, global coverage sat at 95.2% as of that pass, 95.4% as of
    the DLG-D35 follow-up sweep) → upload coverage artifact → architecture lint (`go-arch-lint`) →
-   Swagger staleness check → end-to-end tests.
+   Swagger staleness check → end-to-end tests (`make test-e2e`, `-tags=e2e` — genuinely exercises
+   `cmd/server/e2e_test.go` against real Postgres/Valkey/floci containers as of DLG-D41; this step
+   pre-dates that file and was previously a silent no-op re-run of the unit suite).
 2. **`validate-quality.yml`** (`Validate / Quality`) — on push/PR: a repo-specific check rejecting
    HTML-escaped operators in workflow files, a repo-specific check rejecting non-transaction-local
-   `SET app.tenant_id` (RLS-6 enforcement, `.github/scripts/check-forbidden-set-guc.sh`), gofmt
+   `SET app.tenant_id` (RLS-6 enforcement, `.github/scripts/check-forbidden-set-guc.sh`), a
+   repo-specific check rejecting AWS SDK SNS/SQS bypass of `platform-events`
+   (`.github/scripts/check-forbidden-events-bypass.sh`, DLG-D45/D46), a repo-specific check
+   rejecting hand-rolled SQL against `outbox_events`
+   (`.github/scripts/check-outbox-access.sh`, DLG-D47), gofmt
    check, `go mod tidy` drift check, `go vet`, `golangci-lint`, `govulncheck`, `go mod verify`,
    Dockerfile base-image digest check.
 3. **`ci.yml`** (`CI`) — `build-image` job: Hadolint + `.dockerignore` check → Buildx build
@@ -234,7 +240,7 @@ equivalents (don't assume symmetry with `iam-user-profile`'s `scripts/` contents
 
 | File | Purpose |
 |---|---|
-| `scripts/init-floci.sh` | Local dev Floci ready-hook: creates the `iam-delegation-events` Glue registry + 4 schemas, the outbound SNS topic, the inbound `delegation-cascade-q`/DLQ (+ `iam-user-events` subscription), and 4 downstream fan-out subscriber queues. Uses `aws` CLI (not `awslocal`). Replaces `init-localstack.sh` — Floci includes Glue in its free tier so GlueCodec runs locally without a Pro token. |
+| `scripts/init-floci.sh` | Local dev: Glue registry + 4-schema registration, SNS topic, `delegation-cascade-q`/DLQ bootstrap, and the three downstream fan-out queues (Workflow/Notification/Audit, see LLD §10.4) — always runs (floci includes Glue Schema Registry free, unlike LocalStack Community which gated it behind Pro) |
 
 Do not add any new governance-related file to `scripts/`.
 

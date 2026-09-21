@@ -159,9 +159,9 @@ help:
 	@echo "  make ci               - tidy + fmt-check + vet + lint + arch-lint + test-ci + build (matches 'make ci' in CI docs)"
 	@echo "  make docker-build     - build the container image (IMAGE to override, carries both binaries)"
 	@echo "  make docker-push      - push the container image"
-	@echo "  make docker-up        - start local Postgres + Valkey + Floci (SNS+SQS+Glue, port 4570; UI at http://localhost:4501)"
+	@echo "  make docker-up        - start local Postgres + Valkey + floci (SNS/SQS/Glue, no token needed) + floci-ui (http://localhost:4501)"
 	@echo "  make docker-down      - stop containers started by docker-up/compose-up"
-	@echo "  make compose-up       - start the full local dev stack (postgres, valkey, floci, server — self-migrates at startup)"
+	@echo "  make compose-up       - start the full local dev stack (postgres, valkey, floci, floci-ui, server — self-migrates at startup)"
 	@echo "  make compose-down     - stop and remove the local dev stack, including volumes"
 	@echo "  make migrate-up       - apply all pending migrations against DATABASE_MIGRATION_URL (manual/CI use; the server binary also self-migrates at startup)"
 	@echo "  make migrate-down     - roll back one migration against DATABASE_MIGRATION_URL"
@@ -175,7 +175,7 @@ help:
 	@echo "  make schema-pull      - pull the schema-gov Docker image"
 	@echo "  make schema-validate  - validate AsyncAPI + event schemas — 8 passes (no AWS required)"
 	@echo "  make schema-diff      - diff two schema files: CURRENT=<path> PROPOSED=<path>"
-	@echo "  make schema-register  - register event schemas to Glue (requires AWS/Floci)"
+	@echo "  make schema-register  - register event schemas to Glue (requires AWS/floci)"
 	@echo "  make schema-verify    - pre-deploy check: fail if PascalCase schemas are missing (requires AWS)"
 	@echo "  make schema-prune     - dry-run: list orphaned Glue schemas (requires AWS)"
 
@@ -341,7 +341,7 @@ docker-push: docker-build
 	docker push $(IMAGE)
 
 docker-up:
-	@echo "Starting local PostgreSQL + Valkey + Floci (SNS+SQS+Glue)..."
+	@echo "Starting local PostgreSQL + Valkey + floci (SNS/SQS/Glue) + floci-ui (http://localhost:4501)..."
 	docker compose up -d postgres valkey floci floci-ui
 
 docker-down:
@@ -459,8 +459,8 @@ schema-prune:
 	  --registry   "$(GLUE_REGISTRY_NAME)" \
 	  $(if $(filter true,$(EXECUTE)),--execute,)
 
-# schema-register: register event schemas to Glue (requires AWS credentials or Floci).
-# Set AWS_ENDPOINT_URL=http://localhost:4570 in .env for Floci.
+# schema-register: register event schemas to Glue (requires AWS credentials or floci).
+# Set AWS_ENDPOINT_URL=http://localhost:4570 in .env for floci.
 .PHONY: schema-register
 schema-register:
 	@test -n "$(GLUE_REGISTRY_NAME)" || { \

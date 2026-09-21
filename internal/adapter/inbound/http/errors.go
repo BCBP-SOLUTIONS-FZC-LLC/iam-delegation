@@ -9,6 +9,7 @@ import (
 	"github.com/gin-gonic/gin"
 
 	"github.com/BCBP-SOLUTIONS-FZC-LLC/iam-delegation/internal/core/domain"
+	"github.com/BCBP-SOLUTIONS-FZC-LLC/iam-delegation/internal/core/port"
 	gincommon "github.com/BCBP-SOLUTIONS-FZC-LLC/platform-gincommon/pkg/gincommon"
 	"github.com/BCBP-SOLUTIONS-FZC-LLC/platform-pgcommon/pkg/pgcommon"
 )
@@ -56,11 +57,11 @@ var errorStatusByCode = map[string]int{
 	domain.ErrDBUnavailable.Error():            http.StatusServiceUnavailable,
 }
 
-// errorLogger is the shared gincommon-backed Logger, set once by NewRouter
-// from ginCfg.Logger — the same Zap sink ObservabilityMiddlewares uses.
+// errorLogger is the shared gincommon Zap sink, set once by NewRouter from
+// ginCfg.Logger — the same port.Logger ObservabilityMiddlewares uses.
 // Unhandled 500s log through it so they never bypass platform-gincommon
-// (iam-realm-provisioner HandleError).
-var errorLogger Logger
+// (iam-org-membership / iam-realm-provisioner HandleError).
+var errorLogger port.Logger
 
 // errorResponseWithDetails extends gincommon.ErrorResponse with a free-form
 // details map. Used instead of gincommon.ErrorResponse when domain.Error
@@ -126,10 +127,20 @@ func HandleError(c *gin.Context, err error) {
 		return
 	}
 	if errorLogger != nil {
-		errorLogger.Error("unhandled 500 error", map[string]interface{}{
+		fields := map[string]interface{}{
 			"error_type": fmt.Sprintf("%T", err),
 			"error":      err.Error(),
-		})
+			"trace_id":   gincommon.TraceIDFromContext(c),
+			"request_id": gincommon.RequestIDFromContext(c),
+		}
+		if c.Request != nil {
+			fields["path"] = c.FullPath()
+			if fields["path"] == "" {
+				fields["path"] = c.Request.URL.Path
+			}
+			fields["method"] = c.Request.Method
+		}
+		errorLogger.Error("unhandled 500 error", fields)
 	}
 	writeError(c, http.StatusInternalServerError, "internal_server_error")
 }

@@ -13,6 +13,7 @@ import (
 
 	"github.com/BCBP-SOLUTIONS-FZC-LLC/iam-delegation/internal/adapter/outbound/metrics"
 	pgadapter "github.com/BCBP-SOLUTIONS-FZC-LLC/iam-delegation/internal/adapter/outbound/postgres"
+	"github.com/BCBP-SOLUTIONS-FZC-LLC/iam-delegation/internal/core/port"
 )
 
 const exporterInterval = 5 * time.Minute
@@ -24,7 +25,7 @@ const exporterInterval = 5 * time.Minute
 // every exporterInterval until ctx is canceled at shutdown. Query
 // failures are logged at WARN and the previous value is retained — a
 // stale gauge beats a crashed pod.
-func runActiveGaugeExporter(ctx context.Context, gauges *pgadapter.GaugeRepository, log Logger, pub *metrics.Metrics) {
+func runActiveGaugeExporter(ctx context.Context, gauges *pgadapter.GaugeRepository, log port.Logger, pub *metrics.Metrics) {
 	tick(ctx, "iam_delegation_active_gauge", log, func() error {
 		counts, err := gauges.CountActiveByTenant(ctx)
 		if err != nil {
@@ -36,7 +37,7 @@ func runActiveGaugeExporter(ctx context.Context, gauges *pgadapter.GaugeReposito
 }
 
 // tick runs emit once, then on exporterInterval until ctx is canceled.
-func tick(ctx context.Context, gauge string, log Logger, emit func() error) {
+func tick(ctx context.Context, gauge string, log port.Logger, emit func() error) {
 	run := func() {
 		if err := emit(); err != nil {
 			log.Warn("gauge exporter query failed", map[string]interface{}{

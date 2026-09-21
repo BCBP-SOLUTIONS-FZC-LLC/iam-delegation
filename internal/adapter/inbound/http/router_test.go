@@ -28,7 +28,7 @@ func (fakeLogger) Info(string, map[string]interface{})  {}
 func (fakeLogger) Warn(string, map[string]interface{})  {}
 func (fakeLogger) Error(string, map[string]interface{}) {}
 
-func testLogger() Logger {
+func testLogger() fakeLogger {
 	return fakeLogger{}
 }
 

@@ -159,11 +159,11 @@ servers:
       specifically to avoid colliding with Realm Provisioner's own,
       differently-scoped TenantOffboarded event on iam.tenant.events, which
       this service does NOT consume. UserUpdated's filter policy can only
-      match on EventType (PascalCase — filter value is "UserUpdated", not
-      "user.updated"; migrated from dot-notation while UP was still
-      undeployed, LLD rev 0.46), not payload content, so most deliveries
-      are unrelated field changes this service acks without dispatching;
-      only a decoded payload with status="disabled" reaches
+      match on EventType ("UserUpdated", PascalCase — User Profile migrated
+      from dot-notation while still undeployed, LLD rev 0.46; now consistent
+      with Core above), not payload content, so most
+      deliveries are unrelated field changes this service acks without
+      dispatching; only a decoded payload with status="disabled" reaches
       CascadeService.EndForDisabledDelegate.
       Drives the delegate-side removal cascade (§11.5), tenant-lifecycle
       cleanup (§11.6), and the delegate-disabled cascade (§11.5a, Bug 2/2a).
@@ -591,6 +591,7 @@ components:
           required: [delegation_id, delegator_id, delegate_id, scope, starts_at]
           properties:
             delegation_id: { type: string, format: uuid }
+            tenant_id:     { type: string, format: uuid, description: Self-contained snapshot (DLG-EVT-7) — repeated here even though it also appears at the envelope level. }
             delegator_id:  { type: string, format: uuid }
             delegate_id:   { type: string, format: uuid }
             scope:         { type: string, enum: [all, department, tender] }
@@ -606,6 +607,7 @@ components:
           required: [delegation_id, delegator_id, delegate_id, ended_reason]
           properties:
             delegation_id: { type: string, format: uuid }
+            tenant_id:     { type: string, format: uuid, description: Self-contained snapshot (DLG-EVT-7) — repeated here even though it also appears at the envelope level. }
             delegator_id:  { type: string, format: uuid }
             delegate_id:   { type: string, format: uuid }
             scope:         { type: string, enum: [all, department, tender] }
@@ -620,6 +622,7 @@ components:
           required: [delegation_id, delegator_id, delegate_id, days_remaining]
           properties:
             delegation_id: { type: string, format: uuid }
+            tenant_id:     { type: string, format: uuid, description: Self-contained snapshot (DLG-EVT-7) — repeated here even though it also appears at the envelope level. }
             delegator_id:  { type: string, format: uuid }
             delegate_id:   { type: string, format: uuid }
             scope:         { type: string, enum: [all, department, tender] }
@@ -634,6 +637,7 @@ components:
           required: [delegation_id, delegator_id, delegate_id, reason]
           properties:
             delegation_id: { type: string, format: uuid }
+            tenant_id:     { type: string, format: uuid, description: Self-contained snapshot (DLG-EVT-7) — repeated here even though it also appears at the envelope level. }
             delegator_id:  { type: string, format: uuid }
             delegate_id:   { type: string, format: uuid, description: The now-disabled delegate whose grant just ended. }
             scope:         { type: string, enum: [all, department, tender] }

@@ -31,7 +31,7 @@ func skipDuplicate(ctx context.Context, dedup idempotencyStore, consumer, eventI
 // ackUnknown is the O&M forward-compat path: an event type with no wired
 // handler is logged, counted, and recorded in processed_events inside a
 // RunInTx so redelivery does not storm the same unknown type.
-func ackUnknown(ctx context.Context, tx port.TxRunner, dedup idempotencyStore, log Logger, consumer string, env events.Envelope[json.RawMessage]) error {
+func ackUnknown(ctx context.Context, tx port.TxRunner, dedup idempotencyStore, log port.Logger, consumer string, env events.Envelope[json.RawMessage]) error {
 	if metrics.Live != nil {
 		metrics.Live.RecordUnknownEventAcknowledged(consumer, env.Type)
 	}

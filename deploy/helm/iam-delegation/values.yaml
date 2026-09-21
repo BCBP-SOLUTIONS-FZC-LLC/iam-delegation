@@ -109,6 +109,19 @@ env:
   # See docs/runbook-schema-registry.md.
   GLUE_REGISTRY_NAME: ""
 
+  # Outbox runner — platform-events config.LoadOutbox / RunnerConfigFromEnv
+  # (iam-user-profile / iam-org-membership). Historical 500ms / concurrency-4
+  # / 2s jitter / 10m claim-lease values; library defaults apply only when
+  # these are unset.
+  OUTBOX_POLL_INTERVAL: "500ms"
+  OUTBOX_BATCH_SIZE: "50"
+  OUTBOX_MAX_ATTEMPTS: "5"
+  OUTBOX_DRAIN_TIMEOUT: "30s"
+  OUTBOX_PUBLISH_CONCURRENCY: "4"
+  OUTBOX_PUBLISH_TIMEOUT: "10s"
+  OUTBOX_STARTUP_JITTER: "2s"
+  OUTBOX_CLAIM_LEASE_DURATION: "10m"
+
   # OpenTelemetry — OTLP/gRPC via platform-gincommon's
   # ObservabilityMiddlewares (port 4317, not the legacy OTLP/HTTP 4318).
   OTEL_EXPORTER_OTLP_ENDPOINT: "otel-collector.observability.svc.cluster.local:4317"

@@ -12,7 +12,7 @@ environment — no Git tag has ever been pushed (see [`VERSIONING.md`](VERSIONIN
 |---|---|
 | **Owns** | `delegations` / `delegation_tenant_settings` tables; the DLG-1..7 public API; the DLG-I1..I4 mesh-only internal API; the `iam.delegation.events` SNS topic |
 | **Does NOT own** | Tenant membership (Core / `iam-org-membership`), the synchronous user-removal gate (stays in Core), availability state itself (`iam-user-profile` — this service only sets/clears a pointer), Core's I-8 `active_delegations[]` embed (dropped entirely, ADR-0008 Option C) |
-| **Synchronous dependencies (outbound)** | `iam-org-membership` — grant-time membership-existence checks; `iam-user-profile` — delegate OOO pre-flight (`GetAvailability`), availability-first pointer set (`SetAvailability`), dedicated pointer-clear (`ClearDelegatePointer`) |
+| **Synchronous dependencies (outbound)** | `iam-org-membership` — grant-time membership-existence checks; `iam-user-profile` — availability-first pointer set/clear |
 | **Asynchronous dependency (inbound)** | `delegation-cascade-q` — `MembershipRevoked` / `TenantMembershipsPurged` (Core) and `UserUpdated{status:disabled}` (User Profile) |
 | **Structural highlight** | This service is **both a producer and a consumer** of domain events — the one difference from most of its O&M-extraction siblings |
 
@@ -87,7 +87,7 @@ not at the HTTP layer:
 | `ends_at` | Must be after `starts_at` when set | `delegation_window_inverted` | 422 |
 | `ends_at - starts_at` | ≤ tenant's `max_duration_days` (default 90) | `delegation_window_too_long` | 422 |
 | `delegator_id` / `delegate_id` | Both must resolve to an active membership (`iam-org-membership`, concurrent checks) | `invalid_delegate` | 422 |
-| Delegate availability | Delegate must not be OOO at `starts_at` — checked by DEL via `GET /api/v1/users/:id/availability` before calling UP (GAP-DEL-2) | `delegate_unavailable` | 422 |
+| Delegate availability | Delegate must not itself be OOO (`iam-user-profile`) | `delegate_unavailable` | 422 |
 | `extend_days` (DLG-4) | 1–180 | `extend_days_out_of_range` | 422 |
 | `Idempotency-Key` header (DLG-2 only) | Required, enforced by middleware before the handler runs | `validation_error` | 400 |
 | `Idempotency-Key` (DLG-2 only) | Must not already be claimed by another in-flight create for the same key | `idempotency_key_in_flight` | 409 |
@@ -103,22 +103,41 @@ Clean Architecture — dependencies point inward; outer layers never import inne
 in CI by `go-arch-lint` (`.go-arch-lint.yml`).
 
 ```
-internal/
-├── core/
-│   ├── domain/    # Delegation, enums, DomainEvent + event-type constants, domain.Err* sentinels
-│   ├── port/      # repository/client/cache/tx-runner/event-publisher interfaces
-│   └── service/   # delegation_service.go (DLG-1..5) · settings_service.go (DLG-6/7) · cascade_service.go
-└── adapter/
-    ├── inbound/
-    │   ├── http/      # router, handlers, middleware, error mapping
-    │   └── consumer/  # delegation-cascade-q SQS consumer
-    └── outbound/
-        ├── postgres/    # TxRunner, repositories, migrations, sysPool config
-        ├── userprofile/ # DEL-6 HTTP client: OOO pre-flight (GetAvailability, GAP-DEL-2) + availability-pointer set (SetAvailability) + pointer-clear (ClearDelegatePointer)
-        ├── orgmembership/ # DLG-D3 HTTP client — grant-time membership-existence checks against Core's I-15
-        ├── eventbus/    # enqueue-time validation, SNS-publish-time Glue codec
-        ├── valkey/      # cache + idempotency store
-        └── metrics/     # iam_delegation_* Prometheus instruments
+iam-delegation/
+├── cmd/
+│   ├── server/                        # HTTP composition root (DLG-1..7, DLG-I1..I4): pool+GUC wiring, migrations, outbox runner, delegation-cascade-q SQS consumer, active-gauge exporter; wiring.go factors out the platform-events config.LoadSNS/LoadSQS/LoadOutbox composition (DLG-D44); e2e_test.go (//go:build e2e) is the LLD §17.4 suite (DLG-D41)
+│   └── reconciler/                    # Single binary, --job=<name>; jobs/ holds the four CronJob entry points (activation/expiry/review/cleanup), shared with cmd/server's DLG-I1/I2 HTTP endpoints (DLG-D17)
+├── internal/
+│   ├── core/
+│   │   ├── domain/                    # Delegation, enums (Scope/Status/EndReason), DomainEvent + event-type constants, event_payloads.go, domain.Err* sentinels (LLD §20)
+│   │   ├── port/                      # logger.go (port.Logger, DLG-D42) + repository/client/cache/tx-runner/event-publisher interfaces, incl. TenderScopeClient (§7.6.7, DLG-D13 — unwired)
+│   │   └── service/                   # delegation_service.go (DLG-1..5) · settings_service.go (DLG-6/7) · cascade_service.go · metrics.go (DLG-D19)
+│   ├── adapter/
+│   │   ├── inbound/
+│   │   │   ├── http/                  # router, handlers (DLG-1..7, DLG-I1..I4), middleware, error mapping, docs UI
+│   │   │   └── consumer/              # delegation-cascade-q SQS consumer (§11.5/§11.5a/§11.6)
+│   │   └── outbound/
+│   │       ├── postgres/              # TxRunner, repositories, migrations, sysPool config
+│   │       ├── userprofile/           # UserProfileClient HTTP impl (DEL-6)
+│   │       ├── orgmembership/         # MembershipCheckClient HTTP impl (DLG-D3)
+│   │       ├── tender/                # TenderScopeClient HTTP impl (§7.6.7, DLG-D13) — built/tested, not yet wired in cmd/server
+│   │       ├── eventbus/              # enqueue-time validation (events.Codec) + SNS-publish-time Glue codec
+│   │       ├── httpx/                 # shared otelhttp-instrumented http.Client factory
+│   │       ├── valkey/                # cache + idempotency store (del: keyspace)
+│   │       └── metrics/               # iam_delegation_* Prometheus instruments
+│   └── eventschema/                   # embedded JSON Schemas for the four published events — hand-maintained, no extract-schemas step (DLG-D20)
+├── pkg/requestctx/                    # gateway-identity / tenant-actor extraction helpers
+├── api/
+│   ├── asyncapi.yaml                  # AsyncAPI 3.0 — iam.delegation.events (4 types) + delegation-cascade-q's 3 consumed types
+│   └── embed.go                       # //go:embed asyncapi.yaml
+├── docs/
+│   ├── lld/                           # LLD, current rev 2.18 — design-time source of truth
+│   ├── architecture/                  # index + 13 Mermaid diagrams
+│   ├── swagger/                       # generated by `make swag` — not hand-authored
+│   └── runbook-schema-registry.md     # Glue registry operator runbook (DLG-D20)
+├── deploy/                            # Helm chart, monitoring alerts (incl. SLO burn-rate, DLG-D39), IAM policy
+├── scripts/init-floci.sh              # local-dev SNS/SQS/Glue provisioning (floci, not LocalStack)
+└── .githooks/pre-commit               # tidy + fmt-check + lint + swag-check
 ```
 
 | Rule | Enforced by |
@@ -128,6 +147,8 @@ internal/
 | Inbound adapters depend on `service`+`port`+`domain` — never an outbound adapter directly | `go-arch-lint` |
 | Outbound adapters depend on `port`+`domain`+`eventschema` — never `service`, never inbound | `go-arch-lint` |
 | No session-scoped `SET app.tenant_id` — only `SET LOCAL` via `pgcommon.GUCSetFromContext` | `.github/scripts/check-forbidden-set-guc.sh` |
+| Events/outbox pass through `platform-events` only — no direct SNS/SQS client calls or hand-built `events.Envelope` literals outside it | `.github/scripts/check-forbidden-events-bypass.sh` |
+| `outbox_events` is never touched via hand-rolled SQL — only `outbox.Enqueue`/`outbox.Runner.PrunePublished` | `.github/scripts/check-outbox-access.sh` |
 
 ### Storage and messaging
 
@@ -225,9 +246,11 @@ silence rule does **not** apply to the delegate-disabled cascade, where every en
 delegate-side by construction.
 
 Wire format: AWS Glue Schema Registry (`iam-delegation-events`), 18-byte header
-(`0x03` version, `0x00` no compression, 16-byte schema-version UUID). The local dev stack
-uses Floci, which includes Glue Schema Registry in its free tier — `GLUE_REGISTRY_NAME` is
-set by default so `GlueCodec` runs locally with the real wire format (no `NoopCodec` fallback).
+(`0x03` version, `0x00` no compression, 16-byte schema-version UUID) when `GLUE_REGISTRY_NAME` is
+set; falls back to plain JSON (`NoopCodec`) when it's empty. `GLUE_REGISTRY_NAME` is set by
+default in `.env.example` — floci includes Glue Schema Registry in its free tier (unlike
+LocalStack Community, which gated it behind Pro), so local dev runs the real Glue codec end to
+end.
 
 ### 5. What this service consumes — `delegation-cascade-q`
 
@@ -242,15 +265,6 @@ One SQS queue, two upstream SNS topics, three event types:
 At-least-once delivery, deduped via `processed_events (event_id, consumer)` — three distinct
 consumer buckets (`cascade`, `offboarding`, `delegate_disable`). DLQ:
 `delegation-cascade-q-dlq`, `maxReceiveCount=5`.
-
-**Subscription requirements:** Both SNS subscriptions onto `delegation-cascade-q` must have
-`RawMessageDelivery=true` — `platform-events` unmarshals `msg.Body` directly as a CloudEvents
-envelope; an SNS wrapper envelope causes permanent silent message loss (DLG-D41, corrected in
-`deploy/messaging/sns_subscriptions.tf.example`). The `iam.membership.events` subscription is
-provisioned by `iam-org-membership`'s `scripts/init-floci.sh` (Gap OM-2); the `iam.user.events`
-subscription is provisioned by this service's own `scripts/init-floci.sh`.
-
-**Additionally**, when this service emits `DelegationEnded`, iam-user-profile's `DelegationEventConsumer` (`delegation-events-user-profile-q`) receives it and clears the stale `delegate_id` pointer as a self-healing fallback — regardless of whether the synchronous `ClearDelegatePointer` call above succeeded. This closes Gap 7 Option C.
 
 ### 6. Error handling
 
@@ -273,24 +287,15 @@ Four CronJobs, all sharing the reconciler binary (`--job=<name>`):
 | `delegation-review` | `0 * * * *` | 3-day daily-cascade review warning, then auto-end on the review deadline |
 | `delegation-cleanup` | `0 4 1 * *` | Hard-purge soft-deleted rows and prune `processed_events` |
 
-One additional **metric-exporter goroutine** runs inside `cmd/server` (not a CronJob):
-`runActiveGaugeExporter` refreshes `iam_delegation_active_gauge{tenant}` every 5 minutes from the BYPASSRLS `sysPool` — was wired but permanently empty until DLG-D31 populated it.
-
 ## Local development
-
-### Prerequisites
-
-- Go 1.26.6 (pinned exactly — matches `go.mod`'s `go 1.26.6`)
-- Docker (Postgres, Valkey, Floci — `make docker-up`)
-- `GOPRIVATE=github.com/BCBP-SOLUTIONS-FZC-LLC/*` (`GONOSUMDB` too) and an SSH key registered with the BCBP org
 
 ### Setup
 
 ```bash
 git clone git@github.com:BCBP-SOLUTIONS-FZC-LLC/iam-delegation.git
 cd iam-delegation
-make setup          # copies .env.example -> .env, installs git pre-commit hook
-make docker-up      # Postgres (5537) + Valkey (6383) + Floci (4570) + Floci UI (4501)
+make setup          # copies .env.example -> .env, installs .githooks/pre-commit
+make docker-up      # Postgres (5537) + Valkey (6383) + floci (4570) + floci-ui (4501)
 make run            # go run cmd/server, sourcing .env
 ```
 
@@ -303,186 +308,150 @@ make compose-down   # stop and remove, including volumes
 
 ### Common commands
 
-| Command | Description |
-|---|---|
-| `make setup` | Copy `.env.example` → `.env`, install git pre-commit hook |
-| `make tidy` / `make fmt` / `make fmt-check` / `make vet` | Go basics; `fmt-check` mirrors CI, does not modify files |
-| `make lint` | `golangci-lint` via `go tool` |
-| `make arch-lint` | Architecture dependency-direction check (`go-arch-lint`) |
-| `make mod-verify` | `go mod verify` |
-| `make vuln-check` | `govulncheck ./cmd/... ./internal/...` |
-| `make test` | Unit + integration + RLS in parallel (Docker required) |
-| `make test-ci` | Same, with `-race` + merged `coverage.out` (used in CI) |
-| `make test-unit` | Unit tests only, no Docker |
-| `make test-integration` | Integration tests (Postgres/Valkey/SQS via testcontainers) |
-| `make test-rls` | RLS tests (Postgres via testcontainers) |
-| `make test-e2e` | End-to-end tests |
-| `make race` | All suites with `-race`, no coverage merge |
-| `make run` | Run the server locally (sources `.env`) |
-| `make run-reconciler` | Run a reconciler job; pass `JOB=delegation-activation\|delegation-expiry\|delegation-review\|delegation-cleanup` |
-| `make build` | Compile both binaries to `bin/` |
-| `make cover` / `make cover-func` | Coverage HTML report / per-function summary |
-| `make swag` / `make swag-check` | Regenerate / verify freshness of `docs/swagger/` |
-| `make schema-validate` | AsyncAPI + event schema governance, 8 passes (no AWS needed) |
-| `make docker-up` / `make docker-down` | Start/stop Postgres + Valkey + Floci + Floci UI |
-| `make compose-up` / `make compose-down` | Start/stop the full stack including this service |
-| `make clean` | Remove `bin/` artefacts and coverage files |
+```bash
+make tidy fmt-check vet lint arch-lint    # static checks — mirrors CI's Validate/Quality job
+make test-unit                            # unit tests, no Docker required
+make test                                 # unit + integration + rls, in parallel (requires Docker)
+make race                                 # all four suites with -race (requires Docker)
+make test-ci                              # race + merged coverage.out (used in CI)
+make cover-func                           # coverage summary by function
+make build                                # compile both binaries to bin/
+make swag                                 # regenerate docs/swagger/ from handler annotations
+make schema-validate                      # AsyncAPI + event schema governance, 8 passes (no AWS needed)
+```
 
-### Running a single test
+Run a single test:
 
 ```bash
 go test ./internal/core/service/... -run TestDelegationService_Create -v
 go test -tags=rls ./internal/adapter/outbound/postgres/... -run TestRLS -v
 ```
 
-Every test in this repo is colocated white-box (`*_test.go` next to the source it covers) — there
-is no separate `test/` tree, and `go test ./...` alone runs the complete suite.
-
-### Running a reconciler job locally
+Run one reconciler job locally:
 
 ```bash
 JOB=delegation-activation make run-reconciler
 ```
 
----
+Every test in this repo is colocated white-box (`*_test.go` next to the source it covers) — there
+is no separate `test/` tree, and `go test ./...` alone runs the complete suite.
 
-## Testing domain events locally
+### Testing domain events locally
 
-Every mutating write publishes a domain event through a **transactional outbox → SNS → SQS** pipeline.
+Every mutating write publishes a domain event through a **transactional outbox → SNS → SQS**
+pipeline. `make docker-up` starts **floci** — an open-source (MIT), always-free LocalStack-compatible
+emulator — instead of LocalStack; unlike LocalStack Community, floci includes Glue Schema Registry
+in its free tier, so `scripts/init-floci.sh` provisions the real Glue wire format alongside SNS/SQS,
+with no Pro tier / auth token needed. On container start it provisions:
 
-### How the pipeline works
+- The Glue registry `iam-delegation-events` + all 4 event schemas (`DelegationStarted`,
+  `DelegationEnded`, `DelegationReviewRequested`, `DelegationEscalationRequested`).
+- The outbound `iam-delegation-events` SNS topic.
+- The inbound `delegation-cascade-q` (+ DLQ).
+- Three downstream fan-out subscriber queues (+ DLQs) representing Workflow/Notification/Audit,
+  each with the SNS filter policy those services actually apply — useful for confirming a new
+  event type reaches the queues it should before a downstream team consumes it for real.
 
-```
-HTTP write / reconciler job
-    │
-    ▼
-service layer  ──(same tx)──▶  outbox_events (Postgres)
-                                      │
-                               outbox runner (OUTBOX_POLL_INTERVAL, 500 ms)
-                                      │
-                                      ▼
-                          SNS: iam.delegation.events   (Floci)
-                                      │
-                    SNS fan-out to downstream SQS queues (local dev only)
-```
+Tender's OOO/delegate-status screens read `iam-user-profile`'s `GET /users/:id` directly
+(CF-1, resolved to Option A) rather than subscribing to `iam.delegation.events` — no delegation
+event queue is provisioned for Tender.
 
-An outbox insert is atomic with the business write — a `2xx` response guarantees an `outbox_events` row exists.
-
-### Step 1 — Start infrastructure
+#### Step 1 — Start infrastructure
 
 ```bash
 make docker-up
 ```
 
-`scripts/init-floci.sh` runs automatically inside the `floci` container and provisions:
-
-- The `iam-delegation-events` Glue registry with all four event schemas — Floci includes Glue Schema Registry in its free tier, so `GLUE_REGISTRY_NAME` is set in `docker-compose.yml` by default and the real `GlueCodec` wire format runs locally (no `NoopCodec` fallback, no Pro token).
-- The outbound `iam-delegation-events` SNS topic.
-- The inbound `delegation-cascade-q` (+ DLQ), subscribed to `iam-user-events` for `UserUpdated`.
-- Four downstream fan-out queues (+ DLQs) for Workflow / Notification / Audit / User Profile, each with the SNS filter policy those services actually apply.
-
-### Step 2 — Verify SNS/SQS/Glue exist
+#### Step 2 — Verify SNS/SQS/Glue exist
 
 ```bash
 docker compose exec floci aws --region ap-south-1 sns list-topics
 docker compose exec floci aws --region ap-south-1 sqs list-queues
-docker compose exec floci aws --region ap-south-1 glue list-schemas \
-  --registry-id RegistryName=iam-delegation-events
+docker compose exec floci aws --region ap-south-1 glue list-schemas --registry-id RegistryName=iam-delegation-events
 ```
 
-### Step 2b — Verify event delivery in the browser (Floci UI)
+#### Step 2b — Verify event delivery in the browser (floci-ui)
 
-`make docker-up` also starts **Floci UI** at **http://localhost:4501** — a faster way to confirm an event landed on the right queue than shelling into the CLI each time:
+`make docker-up` also starts **floci-ui**, a web console for floci, at **http://localhost:4501**.
+It's a faster way to confirm an event landed on the right queue than shelling into the CLI each
+time:
 
-1. Open **http://localhost:4501** → sidebar → **Integration → SQS**. You'll see all 10 queues `init-floci.sh` provisioned (`delegation-cascade-q`, `delegation-workflow-q`, `delegation-notification-q`, ...) each with a **Messages** column.
-2. Trigger an event — exercise a real endpoint (`make run` + a DLG-2 create call) or publish one directly:
+1. Open **http://localhost:4501** → sidebar → **Integration → SQS**. You'll see all 8 queues
+   `init-floci.sh` provisioned (`delegation-cascade-q`, `delegation-workflow-q`,
+   `delegation-notification-q`, `delegation-audit-q` — each with its `-dlq`), each with a
+   **Messages** column.
+2. Trigger an event — either exercise a real endpoint (`make run` + a DLG-2 create call, per
+   the API examples above) or publish one directly to skip the app entirely:
    ```bash
    docker compose exec floci aws --region ap-south-1 sns publish \
      --topic-arn arn:aws:sns:ap-south-1:000000000000:iam-delegation-events \
      --message '{"id":"demo-1","type":"DelegationStarted","tenant_id":"t1"}' \
      --message-attributes 'EventType={DataType=String,StringValue=DelegationStarted}'
    ```
-3. Refresh the SQS list. The **Messages** count should go to `1` on exactly the queues whose filter policy matches that `EventType` — for `DelegationStarted` that is `delegation-workflow-q`, `delegation-notification-q`, and `delegation-audit-q` (catch-all), but **not** `delegation-events-user-profile-q` (which only receives `DelegationEnded`). A wrong or missing count means the filter policy or the event's `EventType` attribute is wrong.
+3. Refresh the SQS list. The **Messages** count should have gone to `1` on the queues whose
+   filter policy matches that `EventType` — for `DelegationStarted` that's `delegation-audit-q`
+   (catch-all), `delegation-workflow-q`, and `delegation-notification-q`. A wrong or missing
+   count on a queue you expected to receive the event means the filter policy or the event's
+   `EventType` attribute is wrong.
 
-Two things the UI does **not** do yet:
-- **Read a message's payload** — the UI shows queue metadata only, no message browser. Use the CLI (Step 2c).
-- **Browse SNS topics/subscriptions** — no SNS adapter in the UI yet (Step 2d).
+Two things the UI does **not** do (yet):
+- **Read a message's payload.** The UI shows queue metadata (message counts, ARN, retention)
+  only, no message browser — see Step 2c below for the CLI equivalent.
+- **Browse SNS topics/subscriptions.** floci-ui has no SNS adapter yet, so the topic → queue
+  fan-out wiring itself (subscriptions, filter policies) isn't visible there — see Step 2d below.
 
-### Step 2c — Retrieve the event body (CLI)
+#### Step 2c — Retrieve the event body (CLI)
 
 ```bash
-# Peek without consuming — message becomes visible again after VisibilityTimeout (30 s)
+# Peek without deleting — the message stays and becomes visible again after
+# the queue's VisibilityTimeout (30s by default).
 docker compose exec floci aws --region ap-south-1 sqs receive-message \
-  --queue-url http://floci:4566/000000000000/delegation-notification-q \
+  --queue-url http://floci:4566/000000000000/delegation-workflow-q \
   --max-number-of-messages 10 --message-attribute-names All
 ```
 
-Every subscription sets `RawMessageDelivery=true`, so `Body` is already the plain event JSON — no SNS envelope to unwrap. Pretty-print with `jq`:
+Every subscription `init-floci.sh` creates sets `RawMessageDelivery=true`, so `Body` is already
+the plain event JSON — no SNS envelope to unwrap. Pretty-print it with `jq`:
 
 ```bash
 docker compose exec floci aws --region ap-south-1 sqs receive-message \
-  --queue-url http://floci:4566/000000000000/delegation-notification-q \
+  --queue-url http://floci:4566/000000000000/delegation-workflow-q \
   --max-number-of-messages 10 --message-attribute-names All \
   | jq -r '.Messages[] | .Body | fromjson'
 ```
 
-Or skip SQS and read the outbox directly — shows the plain-JSON payload before Glue wire-format encoding:
+Or read the outbox table directly — fastest during dev, and shows the plain-JSON payload before
+any Glue/Noop wire-format encoding is applied at publish time:
 
 ```bash
 docker compose exec postgres psql -U delegation -d delegation -c \
-  "SELECT event_type, jsonb_pretty(payload::jsonb) FROM outbox_events ORDER BY created_at DESC LIMIT 5;"
+  "SELECT event_type, jsonb_pretty(payload::jsonb) FROM outbox_events ORDER BY created_at DESC LIMIT 3;"
 ```
 
-### Step 2d — Inspect SNS topics and subscriptions (CLI)
+#### Step 2d — Inspect SNS topics and subscriptions (CLI, no floci-ui equivalent)
 
 ```bash
-# All subscriptions on iam-delegation-events
-docker compose exec floci aws --region ap-south-1 sns list-subscriptions-by-topic \
-  --topic-arn arn:aws:sns:ap-south-1:000000000000:iam-delegation-events \
-  --query 'Subscriptions[].{Queue:Endpoint,Arn:SubscriptionArn}' --output table
+docker compose exec floci aws --region ap-south-1 sns list-subscriptions
 
-# Filter policy on a specific subscription (grab SubscriptionArn from above)
 docker compose exec floci aws --region ap-south-1 sns get-subscription-attributes \
   --subscription-arn <SubscriptionArn> \
   --query 'Attributes.{FilterPolicy:FilterPolicy,RawMessageDelivery:RawMessageDelivery}'
 ```
 
-A missing `FilterPolicy` means the subscription is a catch-all (`delegation-audit-q` — receives all four event types). A queue you expected an event on but that showed `Messages: 0` in Floci UI almost always means the event's `EventType` message attribute isn't in that queue's filter list.
+A missing `FilterPolicy` means the subscription is a catch-all (`delegation-audit-q`) — it
+receives every event on the topic.
 
-### Step 3 — Send a cascade message and inspect the outbox
-
-Send a test `MembershipRevoked` directly to the inbound queue (no SNS involved):
+#### Sending a test cascade message directly (inbound side, no SNS involved)
 
 ```bash
 docker compose exec floci aws --region ap-south-1 sqs send-message \
   --queue-url http://floci:4566/000000000000/delegation-cascade-q \
   --message-body '{
-    "id": "b6a1e45f-0000-0000-0000-000000000001",
-    "type": "MembershipRevoked", "source": "iam-org-membership",
-    "specversion": "1", "tenant_id": "...", "time": "2026-09-19T00:00:00Z",
+    "id": "b6a1...", "type": "MembershipRevoked", "source": "iam-org-membership",
+    "specversion": "1", "tenant_id": "...", "time": "2026-09-04T00:00:00Z",
     "data": {"user_id": "..."}
   }'
 ```
-
-Inspect the outbox after triggering a normal write (`make run` + a DLG-2 create):
-
-```bash
-docker compose exec postgres psql -U delegation -d delegation -c \
-  "SELECT id, event_type, published_at IS NOT NULL AS published, attempts
-   FROM outbox_events ORDER BY created_at DESC LIMIT 10;"
-```
-
-### Troubleshooting events
-
-| Symptom | Likely cause | Fix |
-|---|---|---|
-| `outbox_events` row never gets `published_at` set | Topic ARN mismatch, or outbox runner not started | Re-check `.env`'s `SNS_TOPIC_ARN` against `docker compose exec floci aws --region ap-south-1 sns list-topics` (or Floci UI at http://localhost:4501) |
-| `outbox_events` empty after a write | Row was published and pruned, or write never committed | Re-check the HTTP response code — a `2xx` guarantees the row was committed |
-| Messages keep reappearing after `receive-message` | Normal — SQS visibility timeout, not deletion | Use `delete-message` to consume permanently |
-| Glue schema not found at startup | Init script hasn't finished yet | Wait for the `floci` container healthcheck (checks `DelegationEscalationRequested` schema) to pass before starting the app |
-| `delegation-cascade-q` receives no `MembershipRevoked` | iam-org-membership's subscription not provisioned locally | Send directly via `sqs send-message` (Step 3 above); the SNS→SQS subscription is owned by org-membership's `init-floci.sh` (Gap OM-2) |
-
----
 
 ## Testing
 
@@ -504,8 +473,7 @@ table covers only the ones most likely to trip someone up.
 | `USER_PROFILE_BASE_URL` / `ORG_MEMBERSHIP_BASE_URL` | Yes | — | Client constructors fail fast at startup if empty; neither service is part of this repo's compose stack |
 | `SNS_TOPIC_ARN` / `CASCADE_QUEUE_URL` | **Yes** | — | `loadConfig` returns an error and the process never starts if either is empty |
 | `AWS_REGION` | No | `ap-south-1` | |
-| `GLUE_REGISTRY_NAME` | No | `""` → `NoopCodec` | Set to `iam-delegation-events` to activate the real Glue codec (set automatically in the local dev compose stack via Floci) |
-| `GLUE_REGISTRY_ARN` | No | `""` | Full ARN of the Glue registry; set alongside `GLUE_REGISTRY_NAME` in non-local environments |
+| `GLUE_REGISTRY_NAME` | No | `iam-delegation-events` | Set by default — floci provisions Glue for free; leave blank to force `NoopCodec` |
 | `IDEMPOTENCY_TTL_SECONDS` / `LIST_CACHE_TTL_SECONDS` | No | `86400` / `60` | |
 | `POLICY_DEFAULT_MAX_DURATION_DAYS` / `POLICY_DEFAULT_REVIEW_WINDOW_DAYS` | No | `90` / `90` | Fallback tenant policy when no `delegation_tenant_settings` row exists |
 | `DOCS_ENABLED` / `DOCS_AUTH_TOKEN` | No | `true` outside production | Gates `/swagger`, `/asyncapi` |
@@ -546,28 +514,29 @@ GitHub Actions (`.github/workflows/`):
 
 ## Docker
 
-### What the bundled `docker-compose.yml` starts
-
-| Container | Image | Host port(s) | Purpose |
-|---|---|---|---|
-| `iam-delegation` | built from local `Dockerfile` | `8080`, `9090` | This service itself, when run via `make compose-up` |
-| `postgres` | `postgres:16-alpine` | `5537 → 5432` | Primary store |
-| `valkey` | `valkey/valkey:8-alpine` | `6383 → 6379` | Advisory cache + idempotency store |
-| `floci` | `floci/floci:2.1.0-compat` | `4570 → 4566` | SNS + SQS + Glue Schema Registry (all services free) |
-| `floci-ui` | `floci/floci-ui:0.5.0` | `4501 → 4500` | Web console for `floci` — http://localhost:4501 |
-
-`make docker-up` starts only `postgres`/`valkey`/`floci`/`floci-ui` — not `iam-delegation` — so local dev typically runs the service via `make run` for fast rebuilds. Host ports are deliberately offset from sibling services' stacks (iam-user-profile: 5433/6379/4566, iam-org-membership: 5533-5534/6380/4567) so all stacks can run side-by-side.
-
-### Building the service image
-
 One image, two binaries — `iam-delegation-server` and `iam-delegation-reconciler` — selected at
 runtime by overriding the container's `command`. There is no separate migrate image or Job; the
 server binary self-migrates at startup.
 
 ```bash
 make docker-build    # build the image
-make compose-up      # Postgres + Valkey + Floci + the app itself
+make compose-up      # Postgres + Valkey + floci + floci-ui + the app itself
 ```
+
+### What the bundled `docker-compose.yml` starts
+
+| Container | Image | Host port(s) | Purpose |
+|---|---|---|---|
+| `iam-delegation` | built from local `Dockerfile` | `8080`, `9090` | This service itself, when run via `docker compose up` rather than `make run` |
+| `postgres` | `postgres:16-alpine` | `5537 → 5432` | Primary store |
+| `valkey` | `valkey/valkey:8-alpine` | `6383 → 6379` | List cache + idempotency store |
+| `floci` | `floci/floci:2.1.0-compat` | `4570 → 4566` | SNS/SQS/Glue Schema Registry — real `GlueCodec` locally, no Pro tier needed |
+| `floci-ui` | `floci/floci-ui:0.5.0` | `4501 → 4500` | Web console for `floci` — http://localhost:4501 |
+
+`make docker-up` starts `postgres`/`valkey`/`floci`/`floci-ui` — not `iam-delegation` — so local
+dev typically still runs the service via `make run` for fast rebuilds. Host ports are deliberately
+offset from the sibling IAM services' own stacks so multiple can run side-by-side (see
+`docker-compose.yml`'s header comment).
 
 ### Health and readiness
 
@@ -582,28 +551,6 @@ make compose-up      # Postgres + Valkey + Floci + the app itself
 `CASCADE_QUEUE_URL` — the process fails fast at startup if any of these five is empty (the last
 two unconditionally; the dependency base URLs via their client constructors).
 
-## Cross-service dependencies
-
-Reads (DLG-1, DLG-6, DLG-I3, DLG-I4) and read-only reconciler sweeps (`delegation-review`, `delegation-cleanup`) have **no** synchronous cross-service dependency — Postgres + Valkey only.
-
-| Operation | Sync dependency | Posture | On failure |
-|---|---|---|---|
-| Create (DLG-2) — grant-time membership-existence check (delegator + delegate, concurrent) | `iam-org-membership` I-15 × 2 | fail-closed | `503 org_membership_unavailable`; no delegation written |
-| Create (DLG-2) — delegate OOO pre-flight (GAP-DEL-2): `GetAvailability` | `iam-user-profile` `GET /api/v1/users/:id/availability` | fail-closed | `422 delegate_unavailable` if OOO window overlaps `starts_at`; `503 user_profile_unavailable` if the call fails |
-| Create (DLG-2, immediate activation) — set availability pointer: `SetAvailability` | `iam-user-profile` `PUT /internal/users/:id/availability` | fail-closed | `503 user_profile_unavailable`; no delegation written |
-| Create (DLG-2, future-dated `scheduled`) — membership + OOO pre-flight only; User Profile `SetAvailability` deferred to activation flip | `iam-org-membership` I-15 × 2 + `iam-user-profile` `GetAvailability` | fail-closed | `503`; no delegation written; `SetAvailability` not called until `delegation-activation` promotes the row |
-| Cancel (DLG-3) — clear availability pointer: `ClearDelegatePointer` | `iam-user-profile` `DELETE /internal/users/:id/availability/delegate` (Gap 3) | fail-open | Cancel commits; pointer-clear omitted |
-| Extend (DLG-4) — re-sync `ooo_until` after review deadline extends: `SetAvailability` | `iam-user-profile` `PUT /internal/users/:id/availability` | fail-open | Extend commits; UP timestamp goes stale until next extend or expiry |
-| Reassign (DLG-5) — end-leg: clear old delegate's pointer: `ClearDelegatePointer` | `iam-user-profile` `DELETE /internal/users/:id/availability/delegate` (Gap 3) | fail-open | End-leg commits; pointer-clear omitted |
-| Reassign (DLG-5) — create-leg: membership check + OOO pre-flight + set new delegate's pointer | `iam-org-membership` I-15 × 2 + `iam-user-profile` `GetAvailability` + `SetAvailability` | fail-closed | `503`; full reassign rolled back |
-| `delegation-activation` CronJob (scheduled → active) — set availability pointer: `SetAvailability` | `iam-user-profile` `PUT /internal/users/:id/availability` | fail-closed | Row stays `scheduled`; retried at next `*/5` run |
-| `delegation-expiry` CronJob — clear availability pointer on expiry: `ClearDelegatePointer` | `iam-user-profile` `DELETE /internal/users/:id/availability/delegate` (Gap 3) | self-retrying | Pointer-clear deferred; row remains `active`; retried at next `*/5` run |
-| Cascade `MembershipRevoked` (inbound async, `delegation-cascade-q`) | — | at-least-once | Message requeued on processing failure; `delegation-cascade-q-dlq` after `maxReceiveCount=5` |
-| Cascade `TenantMembershipsPurged` (inbound async, `delegation-cascade-q`) | — | at-least-once | Message requeued on processing failure; `delegation-cascade-q-dlq` after `maxReceiveCount=5` |
-| Cascade `UserUpdated{status:disabled}` (inbound async, `delegation-cascade-q`) | — | at-least-once | Message requeued on processing failure; `delegation-cascade-q-dlq` after `maxReceiveCount=5` |
-
----
-
 ## Out of scope
 
 | Concern | Owner |
@@ -613,21 +560,18 @@ Reads (DLG-1, DLG-6, DLG-I3, DLG-I4) and read-only reconciler sweeps (`delegatio
 | Availability state (the actual OOO record) | `iam-user-profile` — this service only sets/clears a pointer |
 | Core's `active_delegations[]` embed | Dropped entirely by ADR-0008 Option C; `DLG-I4` is the escape hatch, unused today |
 
-## Contributing
+## See also
 
-See [CONTRIBUTING.md](CONTRIBUTING.md) for development setup, extending the service, testing requirements, and the PR checklist.
-
-| Document | Description |
+| Doc | Covers |
 |---|---|
-| [`.claude/CLAUDE.md`](.claude/CLAUDE.md) | Top-level guidance for Claude Code working in this repo |
-| [`.claude/database.md`](.claude/database.md) | Tables, RLS, pool config, migrations, triggers |
-| [`.claude/api-and-events.md`](.claude/api-and-events.md) | Endpoints, cache keys, event types, Glue wire format |
-| [`.claude/flows-and-concurrency.md`](.claude/flows-and-concurrency.md) | Create/cancel/cron/cascade flows, optimistic locking, shutdown ordering |
-| [`.claude/development-guide.md`](.claude/development-guide.md) | Design decisions, extending, workflow, troubleshooting, error codes |
-| [`.claude/operations.md`](.claude/operations.md) | Security, observability, configuration, CI/CD, schema governance |
-| [`ARCHITECTURE.md`](ARCHITECTURE.md) | Detailed architecture narrative with Mermaid diagrams; the as-built decision register (DLG-D13+) |
-| [`docs/lld/iam-lld-delegation-service.md`](docs/lld/iam-lld-delegation-service.md) | Full LLD v2.14 — the design document this service implements |
-| [`docs/runbook-schema-registry.md`](docs/runbook-schema-registry.md) | Schema-governance operator runbook |
+| `.claude/database.md` | Tables, RLS, pool config, migrations, triggers |
+| `.claude/api-and-events.md` | Endpoints, cache keys, event types, Glue wire format |
+| `.claude/development-guide.md` | Design decisions, extending, workflow, troubleshooting, error codes |
+| `.claude/operations.md` | Security, observability, configuration, CI/CD, schema governance |
+| `ARCHITECTURE.md` | Detailed architecture narrative with Mermaid diagrams; the as-built decision register |
+| `CONTRIBUTING.md` | Dev setup, extension playbooks, PR checklist |
+| `docs/lld/iam-lld-delegation-service.md` | The full Low-Level Design this service implements |
+| `docs/runbook-schema-registry.md` | Operator runbook for the Glue Schema Registry |
 
 ## License / ownership
 

@@ -18,10 +18,13 @@ type fakeLogger struct {
 	fields map[string]interface{}
 }
 
+func (f *fakeLogger) Debug(string, map[string]interface{}) {}
+func (f *fakeLogger) Info(string, map[string]interface{})  {}
 func (f *fakeLogger) Warn(msg string, fields map[string]interface{}) {
 	f.msg = msg
 	f.fields = fields
 }
+func (f *fakeLogger) Error(string, map[string]interface{}) {}
 
 func newTestCache(t *testing.T) (*Cache, *fakeLogger) {
 	t.Helper()

@@ -57,17 +57,6 @@ type idempotencyStore interface {
 	MarkProcessed(ctx context.Context, consumer, eventID string) error
 }
 
-// Logger is the structured logging port this consumer needs. The map-based
-// signature matches platform-events' internal port.Logger and
-// platform-gincommon's ZapLogger, so a caller's existing logger typically
-// satisfies this directly with no adapter (see wiring.go).
-type Logger interface {
-	Debug(msg string, fields map[string]interface{})
-	Info(msg string, fields map[string]interface{})
-	Warn(msg string, fields map[string]interface{})
-	Error(msg string, fields map[string]interface{})
-}
-
 // GUCBinder binds the tenant (and a system user identity) into ctx as a
 // pgcommon GUCSet, so that whatever the cascade handler does downstream —
 // CascadeService.EndForUser's TxRunner, CascadeService.ScrubTenant's
@@ -112,7 +101,7 @@ type CascadeConsumer struct {
 	idempotency idempotencyStore
 	bindGUC     GUCBinder
 	tx          port.TxRunner
-	logger      Logger
+	logger      port.Logger
 }
 
 // NewCascadeConsumer builds a CascadeConsumer.
@@ -124,7 +113,7 @@ type CascadeConsumer struct {
 // iam-org-membership's MembershipEventConsumer. Unknown-type and
 // filtered-UserUpdated acks also mark inside RunInTx. Nil tx marks
 // directly (tests).
-func NewCascadeConsumer(cascade cascadeService, idempotency idempotencyStore, bindGUC GUCBinder, tx port.TxRunner, logger Logger) *CascadeConsumer {
+func NewCascadeConsumer(cascade cascadeService, idempotency idempotencyStore, bindGUC GUCBinder, tx port.TxRunner, logger port.Logger) *CascadeConsumer {
 	return &CascadeConsumer{cascade: cascade, idempotency: idempotency, bindGUC: bindGUC, tx: tx, logger: logger}
 }
 

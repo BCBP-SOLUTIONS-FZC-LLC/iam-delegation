@@ -24,7 +24,7 @@ excludeFiles:
 # (LLD §6/§6.2). Package layout is fixed by the LLD's own tree (§6):
 #   internal/core/{domain,port,service}
 #   internal/adapter/inbound/{http,consumer}
-#   internal/adapter/outbound/{postgres,valkey,eventbus,userprofile,orgmembership,httpx,metrics}
+#   internal/adapter/outbound/{postgres,valkey,eventbus,userprofile,orgmembership,tender,httpx,metrics}
 #   pkg/requestctx, internal/eventschema, api/, cmd/{server,reconciler}
 components:
   domain:
@@ -71,8 +71,9 @@ components:
       - internal/adapter/inbound/consumer
 
   # postgres is its own component (not folded into adapters_outbound) so
-  # eventbus can import TxFromContext without a false intra-component
-  # cycle — matching iam-realm-provisioner.
+  # cmd and tests can import it without a false intra-component cycle.
+  # eventbus.Publisher reads the tx via port.TxFromContext (iam-user-profile /
+  # iam-org-membership) and no longer imports this package.
   postgres:
     in: internal/adapter/outbound/postgres
 
@@ -88,6 +89,10 @@ components:
       - internal/adapter/outbound/eventbus
       - internal/adapter/outbound/userprofile
       - internal/adapter/outbound/orgmembership
+      # TenderScopeClient's HTTP adapter (LLD §7.6.7, DLG-D13) — implemented
+      # but not constructed anywhere in cmd/server; Tender hasn't shipped
+      # the provider endpoint yet (IB-4, blocked on EXT-1).
+      - internal/adapter/outbound/tender
 
   # Generated Swagger docs — output of `make swag` (swaggo/swag) for
   # cmd/server's HTTP handlers (DLG-1..7, DLG-I1..I4). Declared as a
@@ -172,15 +177,14 @@ deps:
 
   # outbound adapters: port + domain + eventschema (+ observability for
   # instrumenting outbound call latency) — never service, never inbound.
-  # postgres/httptransport are sibling components so eventbus can import
-  # TxFromContext and HTTP clients can wrap httpx.
+  # httptransport is a sibling component so HTTP clients can wrap httpx.
+  # eventbus reads the RunInTx pgx.Tx via port.TxFromContext (not postgres).
   adapters_outbound:
     mayDependOn:
       - port
       - domain
       - eventschema
       - observability
-      - postgres
       - httptransport
 
   # docs_swagger: pure generated assets, no internal deps.

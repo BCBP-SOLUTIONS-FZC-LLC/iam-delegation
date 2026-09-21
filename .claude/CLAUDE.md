@@ -51,7 +51,7 @@ make swag-check       # fail if Swagger regeneration would change docs/swagger/ 
 make ci               # tidy + fmt-check + vet + lint + arch-lint + test-ci + build
 make docker-build     # build the container image (carries both binaries)
 make docker-push      # push the container image
-make docker-up        # start local Postgres + Valkey + Floci (SNS+SQS+Glue, port 4570; UI at 4501)
+make docker-up        # start local Postgres + Valkey + floci (SNS/SQS/Glue) + floci-ui
 make docker-down      # stop containers started by docker-up/compose-up
 make compose-up       # start the full local dev stack, including the service itself (self-migrates at startup)
 make compose-down     # stop and remove the local dev stack, including volumes
@@ -63,7 +63,7 @@ make clean            # remove build artifacts and coverage output
 make schema-pull      # pull the schema-gov Docker image
 make schema-validate  # validate AsyncAPI + event schemas — 8 passes (no AWS required)
 make schema-diff      # diff two schema files: CURRENT=<path> PROPOSED=<path>
-make schema-register  # register event schemas to Glue (requires AWS/Floci)
+make schema-register  # register event schemas to Glue (requires AWS/floci)
 make schema-verify    # pre-deploy check: fail if PascalCase schemas are missing (requires AWS)
 make schema-prune     # dry-run: list orphaned Glue schemas (requires AWS)
 ```
@@ -74,7 +74,7 @@ go test ./internal/core/service/... -run TestDelegationService_Create -v
 go test -tags=rls ./internal/adapter/outbound/postgres/... -run TestRLS -v
 ```
 
-**Test layout note:** unlike some sibling services, every test in this repo is colocated white-box (`*_test.go` next to the source it covers, package-internal) — there is no separate `test/` tree. `go test ./...` alone runs the complete suite (unit + Postgres/testcontainer integration + the full RLS matrix all together); `-tags=integration|rls|e2e` currently select no additional files (no test declares those build tags yet) and are no-ops kept for future extensibility — the `test-*` Makefile targets differ only in which `-tags` flag they pass, not in which packages they run.
+**Test layout note:** unlike some sibling services, every test in this repo is colocated white-box (`*_test.go` next to the source it covers, package-internal) — there is no separate `test/` tree. `go test ./...` alone runs the complete unit/integration/RLS suite (unit + Postgres/testcontainer integration + the full RLS matrix all together); `-tags=integration|rls` still select no additional files (no test declares those two build tags — they're no-ops kept for future extensibility) — but `-tags=e2e` now does: `cmd/server/e2e_test.go` (DLG-D41, LLD §17.4) boots the real composition root against real Postgres/Valkey/floci containers, so `make test-e2e` genuinely exercises the full HTTP/SQS stack rather than silently re-running the unit suite a second time. That file is excluded from `test-unit`/`test-ci`/`race` (none of those pass `-tags=e2e`), so it never affects the coverage gate.
 
 **Coverage note:** measure with `-coverpkg=$(go list ./internal/... ./pkg/... | tr '\n' ',')` — `make cover`/`make cover-func` already do this. CI enforces a single global statement-coverage gate of ≥95% on the merged `coverage.out` (`.github/scripts/coverage-gate.sh`, bumped from 70% during the DLG-D34 production-readiness sweep — global coverage sat at 95.2% as of that pass, 95.4% as of the DLG-D35 follow-up sweep) — see `CONTRIBUTING.md` § Coverage gate for current per-package numbers.
 
@@ -95,13 +95,14 @@ iam-delegation/
 │   ├── server/
 │   │   ├── main.go                    # composition root — errgroup runs six real background workers (see "Key Files to Know")
 │   │   ├── adapters.go                # gucBoundReader (DLG-I3/I4 GUC binding) + reconcilerRunner (DLG-D17 dual entry point) + redisPinger
-│   │   ├── config.go                  # loadConfig() — env var parsing, SNS_TOPIC_ARN/CASCADE_QUEUE_URL fail-fast checks; SYSTEM_DATABASE_URL required outside local/dev ENVIRONMENT (DLG-D34, widened beyond a literal "production" check in DLG-D35's isDevLikeEnvironment)
+│   │   ├── config.go                  # loadConfig() — env var parsing, SNS_TOPIC_ARN/CASCADE_QUEUE_URL fail-fast checks; SYSTEM_DATABASE_URL required outside local/dev ENVIRONMENT (DLG-D34/D35); DOCS_AUTH_TOKEN required when DOCS_ENABLED=true in production (DLG-D40); ensureOutboxEnv backfills historical OUTBOX_* defaults (DLG-D46)
+│   │   ├── wiring.go                  # buildSNSPublisher + cascadeSQSEnv — platform-events config.LoadSNS/LoadSQS/LoadOutbox composition (DLG-D44), with the pgx.Tx type assertion kept out of core/port (DLG-D46)
 │   │   ├── exporters.go               # runActiveGaugeExporter — 5-min BYPASSRLS sysPool snapshot of iam_delegation_active_gauge
-│   │   ├── observability.go
+│   │   ├── e2e_test.go                # //go:build e2e — LLD §17.4 suite against real Postgres/Valkey/floci containers (DLG-D41)
 │   │   └── swagger_info.go            # swaggo metadata
 │   └── reconciler/
 │       ├── main.go                    # --job=<name> dispatch (this chart's own convention, not shelling out over HTTP)
-│       ├── config.go / observability.go
+│       ├── config.go
 │       └── jobs/
 │           ├── context.go             # jobs.Context — shared deps for all four jobs
 │           ├── delegation_activation.go # DLG-D25 (*/5 * * * *, promotes scheduled -> active)
@@ -116,7 +117,7 @@ iam-delegation/
 │   │   │   ├── event.go               # DomainEvent + published/consumed event-type constants — see "Key Files to Know"
 │   │   │   ├── event_payloads.go      # per-event payload structs
 │   │   │   └── errors.go              # domain.Err* sentinels — the full LLD §20 taxonomy (see development-guide.md's Appendix)
-│   │   ├── port/                      # delegation_repository.go · settings_repository.go · user_profile_client.go · membership_check_client.go · idempotency_store.go · event_publisher.go · cache.go · tx_runner.go · errors.go · doc.go
+│   │   ├── port/                      # logger.go (Zap-backed port.Logger via gincommon logger.NewLogger, DLG-D42) · delegation_repository.go · settings_repository.go · user_profile_client.go · membership_check_client.go · tender_scope_client.go (§7.6.7, DLG-D13 — unwired pending Tender's endpoint) · idempotency_store.go · event_publisher.go · cache.go · tx_runner.go (WithTx/TxFromContext carry the tx as `any` — core imports no pgx, DLG-D46) · errors.go · doc.go
 │   │   └── service/
 │   │       ├── delegation_service.go  # DLG-1..5 orchestration
 │   │       ├── settings_service.go    # DLG-6/7
@@ -127,15 +128,16 @@ iam-delegation/
 │       │   └── consumer/              # cascade_consumer.go · wiring.go — delegation-cascade-q
 │       └── outbound/
 │           ├── postgres/              # db.go (TxRunner, WithTenantGUC) · delegation_repository.go · settings_repository.go · processed_events.go · gauge_repository.go · otel_tracer.go · migrate.go · migrations_fs.go · migrations/ (000001_schema only, as of this build)
-│           ├── userprofile/           # http_client.go (UserProfileClient impl, DEL-6): GetAvailability (GAP-DEL-2 pre-flight) · SetAvailability · ClearDelegatePointer (Gap 3, DELETE /internal/users/:id/availability/delegate) + propagate.go
+│           ├── userprofile/           # http_client.go (UserProfileClient impl, DEL-6) + propagate.go
 │           ├── orgmembership/         # http_client.go (MembershipCheckClient impl, DLG-D3) + propagate.go
+│           ├── tender/                # http_client.go (TenderScopeClient impl, §7.6.7, DLG-D13) + propagate.go — built/tested, not constructed anywhere in cmd/server
 │           ├── eventbus/              # publisher.go + validating_codec.go (enqueue) · codec.go (GlueCodec encode + GlueDecodeCodec consume-side decode, DLG-D21) · validator.go (SchemaValidator, tests)
 │           ├── valkey/                # cache.go · client.go · idempotency.go — del: cache + idempotency store
 │           └── metrics/               # metrics.go — iam_delegation_* Prometheus instruments; DLG-D19 is closed — every instrument has a real call site (internal/core/service/metrics.go's injected Metrics port, cmd/reconciler/jobs.Context.Metrics, or cmd/server/exporters.go's active-gauge exporter)
 ├── internal/eventschema/              # delegation_{started,ended,review_requested,escalation_requested}.json + schemas.go (//go:embed) — hand-maintained, no extract-schemas step (DLG-D20)
 ├── pkg/requestctx/                    # gateway-identity / tenant-actor extraction helpers
 ├── docs/
-│   ├── lld/iam-lld-delegation-service.md  # the full LLD v2.13 (design-time source of truth)
+│   ├── lld/iam-lld-delegation-service.md  # the full LLD, current rev 2.18 (design-time source of truth)
 │   ├── architecture/                  # README.md (index) + mermaid/*.mmd — 13 diagrams (layer model, package deps, ER, RLS/GUC flow, 9 request/cron/cascade flows)
 │   ├── runbook-schema-registry.md     # operator runbook for the Glue registry (DLG-D20)
 │   └── swagger/                       # generated by `make swag` — checked in
@@ -176,17 +178,21 @@ Also notable: `github.com/aws/aws-sdk-go-v2/service/glue` (GlueCodec's schema-ve
 - Outbound adapters depend on `port`+`domain`+`eventschema` — never `service`, never inbound.
 - `cmd/*` is the only place concretes get wired together.
 - No session-scoped `SET app.tenant_id` — only `SET LOCAL` via `pgcommon.GUCSetFromContext` (CI greps the forbidden form, `.github/scripts/check-forbidden-set-guc.sh`, RLS-6).
+- Events/outbox pass through `platform-events` only — no direct AWS SDK SNS/SQS client calls or hand-built `events.Envelope` struct literals outside it (CI greps for both, `.github/scripts/check-forbidden-events-bypass.sh`). Consumer-side dedup (`processed_events`) is the one deliberate exception — `platform-events` has no consumer-side idempotency mechanism of its own, only the publish-side, SNS-FIFO-only `WithMessageDeduplicationID`.
+- `outbox_events` is never touched via hand-rolled SQL — only `outbox.Enqueue`/`outbox.Runner.PrunePublished` (CI scans Go backtick literals for `from|into|update outbox_events`, `.github/scripts/check-outbox-access.sh`, DLG-D47; ported from `iam-org-membership`, where this exact bypass happened once and was removed).
 
 ## Key Files to Know
 
 - **`cmd/server/main.go`** — composition root. **Six** real background goroutines run under one `errgroup`: the outbox runner, the `delegation-cascade-q` SQS consumer, the `iam_delegation_active_gauge` exporter (`runActiveGaugeExporter` in `cmd/server/exporters.go` — a 5-minute BYPASSRLS `sysPool` snapshot via `pgadapter.NewGaugeRepository`, since no request or reconciler path can otherwise keep a point-in-time gauge current), a daily outbox-prune sweep (`outboxRunner.PrunePublished`, DLG-D24 — matching `iam-user-profile`'s `runMaintenanceSweep`; without it `outbox_events` grows unbounded, since published rows are never deleted automatically), the HTTP API server, and a dedicated `:METRICS_PORT` metrics server (split from the API listener so a NetworkPolicy can grant scrape access without also granting API access) — plus a graceful-shutdown goroutine and `GlueCodec.StartRefresher`'s internal ticker. DLG-D19's observability gap is closed: every registered `iam_delegation_*` instrument now has a real call site — the deferred/warned/expired reconciler counters (GAP-27/DLG-D25) via `cmd/reconciler/jobs.Context.Metrics`, the service-layer counters via `internal/core/service/metrics.go`'s injected `Metrics` port, and the previously-dead `active_gauge` via the exporter above.
 - **`cmd/server/adapters.go`** — two adapters unique to this service's topology: `gucBoundReader` binds `app.tenant_id` per-call for the mesh-only DLG-I3/I4 reads (no per-request middleware on that route group); `reconcilerRunner` adapts `cmd/reconciler/jobs`' `Expiry`/`ReviewSweep` functions to the HTTP handler's injected runner interfaces so DLG-I1/I2's on-demand HTTP endpoints and the CronJob binary share one implementation (DLG-D17).
+- **`cmd/server/wiring.go`** (DLG-D44/D46) — `buildSNSPublisher` and `cascadeSQSEnv`, the two small helpers that adapt this service's own env-var names (`SNS_TOPIC_ARN`, `CASCADE_QUEUE_URL`, `CASCADE_SQS_CONCURRENCY`) onto `platform-events/pkg/config`'s `LoadSNS`/`LoadSQS` composition contract (the library's own env-var names, `SNS_TOPIC_ARN`/`SQS_QUEUE_URL`/`SQS_CONCURRENCY`, don't match this service's history, so `main.go` can't call `LoadSQS()` unmodified for the cascade queue). `main.go`'s outbox wiring additionally goes through `ensureOutboxEnv` (`config.go`) before `config.LoadOutbox()`, since that library's own defaults (`5s` poll, concurrency 1) differ from this service's historical ones.
+- **`cmd/server/e2e_test.go`** (`//go:build e2e`, DLG-D41) — the LLD §17.4 end-to-end suite. Boots the real `run(ctx, logger)` composition root against real Postgres/Valkey/floci (SNS/SQS-compatible) containers, with User Profile/Org Membership faked via local `httptest.Server`s. Excluded from `test-unit`/`test-ci`/`race` (none pass `-tags=e2e`) — see the Test layout note above.
 - **`internal/core/domain/event.go`** — `EventDelegationStarted`/`EventDelegationEnded`/`EventDelegationReviewRequested`/`EventDelegationEscalationRequested` (DLG-D27 — fired by `CascadeService.EndForDisabledDelegate` alongside `DelegationEnded`, notify-only, escalates to `tenant_admin`/`tenant_owner`) constants. Unlike `iam-user-profile`'s `domain.GlueSchemaName` translation switch, **these constants ARE the PascalCase Glue schema names directly** — no dot-notation-to-PascalCase mapping exists or is needed here.
-- **`internal/core/service/delegation_service.go`** — DLG-1..5 orchestration. Create ordering (DLG-D43): membership checks → `GetAvailability` delegate OOO pre-flight (GAP-DEL-2) → `SetAvailability` (with `ooo_until=review_due_at` for open-ended rows) → `RunInTx`. Cancel: `ClearDelegatePointer` fail-open then `RunInTx`. Extend: `ExtendReview` then `SetAvailability` re-sync fail-open. Self-retrying expiry; 3-day daily-cascade review warnings.
+- **`internal/core/service/delegation_service.go`** — DLG-1..5 orchestration: the availability-first create ordering (membership checks → User Profile → `RunInTx`), fail-open cancel, self-retrying expiry, 3-day daily-cascade review warnings.
 - **`internal/core/service/cascade_service.go`** — `EndForUser` (MembershipRevoked → end every delegation where the user is delegator or delegate; delegate-side only emits an event, delegator-side is silent per DLG-EVT-4) and `ScrubTenant` (TenantMembershipsPurged → soft-delete the tenant's rows).
 - **`internal/adapter/inbound/http/router.go`** — route registration; `tenantGUCMiddleware` on the public group (right after `ContextMiddleware`); `requireIdempotencyKey()` gates `POST /delegations` with a 400, not a service-layer check.
 - **`internal/adapter/inbound/http/errors.go`** — `errorStatusByCode`, the map from every `domain.Err*` sentinel to its HTTP status (LLD §20 verbatim). A code missing from this map falls back to 500.
-- **`internal/adapter/outbound/eventbus/publisher.go`** — `Publisher` implements `port.EventPublisher`; `ValidatingCodec` validates at enqueue (missing schema = pass-through). Glue stays on the SNS `events.WithCodec` path.
+- **`internal/adapter/outbound/eventbus/publisher.go`** — `Publisher` implements `port.EventPublisher` and takes `events.Codec`; `ValidatingCodec` wraps `events.NoopCodec` and validates at enqueue (missing schema = pass-through). Glue stays on the SNS `events.WithCodec` path. There is no local enqueue `Codec`/`NoopCodec`.
 - **`internal/adapter/outbound/postgres/db.go`** — `TxRunner` injects `port.EventPublisher` into ctx; `WithTenantGUC` binds the GUC for reconciler jobs/cascade consumer.
 - **`api/asyncapi.yaml`** — hand-maintained (no `extract-schemas` step, DLG-D20); carries the `x-lifecycle`/`x-owner`/`x-forward-compatibility`/`x-semantic-contract`/`x-version-governance`/`x-usage-override` governance annotations `schema-gov validate` requires.
 - **`api/embed.go`** — `//go:embed asyncapi.yaml` → `AsyncAPISpec []byte`, served by `GET /asyncapi`/`GET /asyncapi.yaml` without a disk read.
@@ -205,4 +211,4 @@ Supplementary docs in the repo root and `docs/`:
 - **`ARCHITECTURE.md`** — detailed architecture narrative with Mermaid diagrams; its "Session-specific decisions" section is the DLG-D13+ as-built decision register
 - **`CONTRIBUTING.md`** — dev setup, extension playbooks, PR checklist
 - **`VERSIONING.md`** — SemVer policy, runtime-contract scope, release process, compatibility matrix
-- **`docs/lld/iam-lld-delegation-service.md`** — the full Low-Level Design (v2.15) this service implements
+- **`docs/lld/iam-lld-delegation-service.md`** — the full Low-Level Design (v2.13) this service implements

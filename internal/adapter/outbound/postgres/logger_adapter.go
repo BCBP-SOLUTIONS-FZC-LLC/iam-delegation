@@ -1,35 +1,24 @@
 package postgres
 
 import (
+	"github.com/BCBP-SOLUTIONS-FZC-LLC/iam-delegation/internal/core/port"
 	"github.com/BCBP-SOLUTIONS-FZC-LLC/platform-pgcommon/pkg/domain"
 )
 
-// Logger is the structured logging interface LoggerAdapter wraps. Matches
-// gincommon's own port.Logger shape (Debug/Info/Warn/Error(msg, fields)) so
-// the same Zap-backed logger built once in each binary's main() can be
-// passed straight through, with no further adapter needed on the caller's
-// side.
-type Logger interface {
-	Debug(msg string, fields map[string]interface{})
-	Info(msg string, fields map[string]interface{})
-	Warn(msg string, fields map[string]interface{})
-	Error(msg string, fields map[string]interface{})
-}
-
 // LoggerAdapter implements platform-pgcommon's pkg/domain.Logger (Debug/Info/
-// Warn/Error(msg, ...domain.Field)) on top of a Logger. Config.Logger and
+// Warn/Error(msg, ...domain.Field)) on top of port.Logger. Config.Logger and
 // migrate.Runner.Logger are typed against this public domain.Logger, so
 // pgcommon's slow-query logging and migration log output can be routed into
 // this service's own Zap-backed sink instead of going nowhere. Mirrors
 // iam-user-profile's/iam-org-membership's identical LoggerAdapter.
 type LoggerAdapter struct {
-	log Logger
+	log port.Logger
 }
 
 var _ domain.Logger = LoggerAdapter{}
 
 // NewLoggerAdapter wraps log as a pgcommon domain.Logger.
-func NewLoggerAdapter(log Logger) LoggerAdapter {
+func NewLoggerAdapter(log port.Logger) LoggerAdapter {
 	return LoggerAdapter{log: log}
 }
 

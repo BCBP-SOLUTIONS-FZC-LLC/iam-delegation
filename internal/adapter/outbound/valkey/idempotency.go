@@ -24,14 +24,14 @@ const idempotencyTTL = 24 * time.Hour
 // effort, ignore" respectively (see delegation_service.go's Create).
 type IdempotencyStore struct {
 	client *redis.Client
-	logger Logger
+	logger port.Logger
 }
 
 var _ port.IdempotencyStore = (*IdempotencyStore)(nil)
 
 // NewIdempotencyStore builds an IdempotencyStore from an existing
 // *redis.Client (see NewClient). logger may be nil.
-func NewIdempotencyStore(client *redis.Client, logger Logger) *IdempotencyStore {
+func NewIdempotencyStore(client *redis.Client, logger port.Logger) *IdempotencyStore {
 	return &IdempotencyStore{client: client, logger: logger}
 }
 

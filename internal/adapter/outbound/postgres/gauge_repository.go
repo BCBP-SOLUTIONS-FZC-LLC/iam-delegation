@@ -4,7 +4,7 @@ import (
 	"context"
 
 	"github.com/BCBP-SOLUTIONS-FZC-LLC/platform-pgcommon/pkg/pgcommon"
-	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgxpool"
 )
 
 // GaugeRepository serves the read-only, cross-tenant aggregate query that
@@ -18,8 +18,9 @@ import (
 // app pool with no tenant GUC bound.
 //
 // Unlike DelegationRepository / SettingsRepository it implements no core
-// port: its only consumer is the composition root's exporter goroutine
-// (iam-realm-provisioner's GaugeRepository convention).
+// port: its only consumer is the composition root's exporter goroutine.
+// The query is a read-only snapshot, so it uses pgcommon.Pool.WithConn
+// (not RunInTx) — matching iam-org-membership's cmd/server/exporters.go.
 type GaugeRepository struct {
 	pool *pgcommon.Pool
 }
@@ -47,8 +48,8 @@ SELECT tenant_id::text, count(*)
 // map rather than present as 0.
 func (r *GaugeRepository) CountActiveByTenant(ctx context.Context) (map[string]int64, error) {
 	out := map[string]int64{}
-	err := withPool(ctx, r.pool, func(tx pgx.Tx) error {
-		rows, err := tx.Query(ctx, countActiveByTenantSQL)
+	err := wrapConnErr(r.pool.WithConn(ctx, func(ctx context.Context, conn *pgxpool.Conn) error {
+		rows, err := conn.Query(ctx, countActiveByTenantSQL)
 		if err != nil {
 			return err
 		}
@@ -64,7 +65,7 @@ func (r *GaugeRepository) CountActiveByTenant(ctx context.Context) (map[string]i
 			out[tenant] = count
 		}
 		return rows.Err()
-	})
+	}))
 	if err != nil {
 		return nil, err
 	}

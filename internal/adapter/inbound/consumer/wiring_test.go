@@ -3,11 +3,14 @@ package consumer
 import (
 	"context"
 	"testing"
+	"time"
 
 	awssqs "github.com/aws/aws-sdk-go-v2/service/sqs"
 	"github.com/google/uuid"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+
+	eventcfg "github.com/BCBP-SOLUTIONS-FZC-LLC/platform-events/pkg/config"
 )
 
 // stubSQSClient satisfies events.SQSClientLike without touching real AWS —
@@ -31,7 +34,15 @@ func (stubSQSClient) ChangeMessageVisibility(context.Context, *awssqs.ChangeMess
 func TestNewCascadeSQSConsumer_BuildsConsumer(t *testing.T) {
 	cascadeConsumer := newTestConsumer(&fakeCascadeService{}, newFakeIdempotencyStore(), func(ctx context.Context, tenantID uuid.UUID, userID string) context.Context { return ctx })
 
-	c, err := NewCascadeSQSConsumer(stubSQSClient{}, "https://sqs.example.com/queue/delegation-cascade-q", "us-east-1", "", noopLogger{}, cascadeConsumer)
+	sqsEnv := eventcfg.SQSConfigEnv{
+		QueueURL:          "https://sqs.example.com/queue/delegation-cascade-q",
+		Region:            "us-east-1",
+		MaxMessages:       10,
+		WaitSeconds:       20,
+		Concurrency:       4,
+		VisibilityTimeout: 30 * time.Second,
+	}
+	c, err := NewCascadeSQSConsumer(stubSQSClient{}, sqsEnv, noopLogger{}, cascadeConsumer)
 	require.NoError(t, err)
 	assert.NotNil(t, c)
 }

@@ -262,24 +262,6 @@ func TestDelegationRepository_HardPurgeSoftDeletedBefore_ExecError(t *testing.T)
 	require.ErrorIs(t, err, errFake)
 }
 
-// ── gauge_repository ─────────────────────────────────────────────────────
-
-func TestGaugeRepository_CountActiveByTenant_QueryError(t *testing.T) {
-	db := setupTestDB(t)
-	repo := NewGaugeRepository(db.Bypass)
-	ctx := WithTx(context.Background(), &errQueryTx{err: errFake})
-	_, err := repo.CountActiveByTenant(ctx)
-	require.ErrorIs(t, err, errFake)
-}
-
-func TestGaugeRepository_CountActiveByTenant_ScanError(t *testing.T) {
-	db := setupTestDB(t)
-	repo := NewGaugeRepository(db.Bypass)
-	ctx := WithTx(context.Background(), &scanErrQueryTx{err: errFake})
-	_, err := repo.CountActiveByTenant(ctx)
-	require.Error(t, err)
-}
-
 // ── processed_events ─────────────────────────────────────────────────────
 
 func TestProcessedEventsRepository_Prune_ExecError(t *testing.T) {
