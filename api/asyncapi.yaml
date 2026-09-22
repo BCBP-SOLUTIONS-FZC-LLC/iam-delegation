@@ -300,15 +300,15 @@ operations:
       - $ref: '#/channels/iam~1delegation~1events/messages/DelegationReviewRequested'
       - $ref: '#/channels/iam~1delegation~1events/messages/DelegationEscalationRequested'
 
-  # ── Inbound operation — Core's removal/offboarding signals + User
-  # Profile's disabled-delegate signal (LLD §10.1, Bug 2/2a) ────────────────
+  # ── Inbound operation — membership lifecycle signals from Core and
+  # User Profile, driving the delegation cascade on this service ─────────────
   consumeDelegationCascade:
     action: receive
     channel:
       $ref: '#/channels/iam~1delegation~1cascade'
     tags:
       - $ref: '#/components/tags/consumed'
-    summary: Consume Core's removal/offboarding signals and User Profile's disabled-delegate signal driving the delegate-side cascade
+    summary: Consume membership lifecycle events to cascade-end affected delegations
     description: |
       Consumer: this service (iam-delegation).
       Producers: Core / Org & Membership — both MembershipRevoked and
@@ -390,8 +390,11 @@ components:
   messages:
     DelegationStarted:
       name: DelegationStarted
-      title: Delegation created (routing begins)
-      summary: Emitted by DLG-2 create and the create leg of DLG-5 reassign.
+      title: Delegation started
+      summary: >-
+        Emitted when a delegation is created or when a previously scheduled
+        delegation becomes active. Consumers should begin routing the
+        delegator's work to the delegate from the starts_at timestamp.
       x-lifecycle:
         status: active    # active | deprecated | retired
       x-owner:
@@ -426,11 +429,15 @@ components:
 
     DelegationEnded:
       name: DelegationEnded
-      title: Delegation ended (routing restored)
-      summary: |
-        Fires on every end path — cancel, ends_at expiry, review auto-end,
-        delegate-removed cascade (DLG-EVT-3) — never path-dependent.
-        Delegator-side removal ends silently, no event (DEL-7/DLG-EVT-4).
+      title: Delegation ended
+      summary: >-
+        Emitted when a delegation ends for any reason. The ended_reason field
+        identifies the cause: expired (scheduled end date reached), cancelled
+        (delegator cancelled manually), reassigned (replaced by a new
+        delegation), delegate_removed (delegate left the tenant),
+        review_expired (open-ended delegation lapsed at the review deadline),
+        or delegate_disabled (delegate's account was disabled).
+        Consumers should stop routing the delegator's work to the delegate.
       x-lifecycle:
         status: active    # active | deprecated | retired
       x-owner:
@@ -465,8 +472,13 @@ components:
 
     DelegationReviewRequested:
       name: DelegationReviewRequested
-      title: Open-ended delegation approaching its review deadline
-      summary: Emitted by the delegation-review sweep once per calendar day for each of the 3 days before review_due_at (DLG-I2, DLG-D7).
+      title: Delegation review reminder
+      summary: >-
+        Emitted once per calendar day for each of the three days before an
+        open-ended delegation's review deadline. Signals that the delegator
+        should decide whether to extend, reassign, or allow the delegation to
+        lapse. The days_remaining field indicates how many calendar days remain
+        (3, 2, or 1).
       x-lifecycle:
         status: active    # active | deprecated | retired
       x-owner:
@@ -501,17 +513,14 @@ components:
 
     DelegationEscalationRequested:
       name: DelegationEscalationRequested
-      title: Delegation ended with no replacement — escalation needed (Bug 2a)
-      summary: |
-        Fired alongside DelegationEnded, in the same transaction, whenever
-        a delegation ends because the delegate was disabled
-        (ended_reason=delegate_disabled, §11.5a). This service owns no
-        org-structure data (no "supervisor"/"team lead" concept), so it
-        escalates to tenant_admin/tenant_owner — the only role it already
-        recognizes as escalation-capable (also notified on
-        DelegationReviewRequested, and the only role that can call DLG-5
-        Reassign). Notify-only: this service never auto-creates a
-        replacement delegation.
+      title: Delegation escalation requested
+      summary: >-
+        Emitted alongside DelegationEnded when a delegation ends because the
+        delegate's account was disabled. Notifies tenant administrators and
+        tenant owners so they can manually reassign the work. This service
+        does not auto-create a replacement delegation — the escalation is
+        notify-only. Always co-emitted with DelegationEnded in the same
+        transaction; reason is always delegate_disabled.
       x-lifecycle:
         status: active    # active | deprecated | retired
       x-owner:
@@ -548,10 +557,12 @@ components:
     MembershipRevoked:
       name: MembershipRevoked
       title: Tenant membership revoked
-      summary: |
-        Consumed by this service (not published). Produced by Core / Org &
-        Membership on iam.membership.events; drives
-        CascadeService.EndForUser (§11.5, DLG-Q4/DLG-D14).
+      summary: >-
+        Produced by the Org & Membership service when a user's tenant
+        membership is removed. This service consumes it to end all active and
+        scheduled delegations where the removed user is the delegator or the
+        delegate. Only delegate-side delegations emit a DelegationEnded event;
+        delegator-side delegations end silently.
       x-lifecycle:
         status: active
       x-owner:
@@ -583,14 +594,12 @@ components:
     TenantMembershipsPurged:
       name: TenantMembershipsPurged
       title: Tenant memberships purged
-      summary: |
-        Consumed by this service (not published). Produced by Core / Org &
-        Membership on a real transition into the 'offboarded' tenant
-        status (itself driven by Core having consumed Realm Provisioner's
-        own TenantOffboarded event on a different queue); drives
-        CascadeService.ScrubTenant (§11.6, DLG-Q4/DLG-D14). Renamed by
-        Core from TenantOffboarded to avoid colliding with RP's event of
-        that name.
+      summary: >-
+        Produced by the Org & Membership service when a tenant is fully
+        offboarded. This service consumes it to soft-delete all delegation
+        records and tenant policy settings for the offboarded tenant. No
+        individual DelegationEnded events are emitted — the deletion is a
+        bulk cleanup operation.
       x-lifecycle:
         status: active
       x-owner:
@@ -621,20 +630,16 @@ components:
 
     UserUpdated:
       name: UserUpdated
-      title: User profile fields changed (delegate-disable signal, Bug 2/DLG-D26)
-      summary: |
-        Consumed by this service (not published). Produced by User Profile
-        (iam-user-profile) on iam.user.events — a distinct topic from
-        Core's iam.membership.events above. This queue's filter policy can
-        only match on EventType ("UserUpdated", PascalCase — User
-        Profile's own convention, migrated from dot-notation while that
-        service was still undeployed; see its CHANGELOG.md/LLD rev 0.46),
-        not payload content, so most deliveries are unrelated field
-        changes this service acks without dispatching. Only a decoded
-        payload with status="disabled" drives
-        CascadeService.EndForDisabledDelegate (§11.5a). Only the fields
-        this service actually reads are documented below — User Profile's
-        own contract carries more (email, other changed_fields).
+      title: User profile updated
+      summary: >-
+        Produced by the User Profile service when a user's profile fields
+        change. This service acts only when the changed_fields array includes
+        status and the new status value is disabled — ending all active and
+        scheduled delegations where the disabled user is the delegate, and
+        requesting escalation to tenant administrators. All other deliveries
+        (name changes, preference updates, etc.) are acknowledged without any
+        action. Only the fields this service reads are documented here; the
+        full UserUpdated payload is defined in iam-user-profile's own AsyncAPI.
       x-lifecycle:
         status: active
       x-owner:
