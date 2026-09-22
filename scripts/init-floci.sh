@@ -11,19 +11,29 @@
 #     platform-events transactional outbox (§10.4)
 #
 #   DOWNSTREAM SUBSCRIBERS (owned by other services; created here for local dev):
-#   - delegation-workflow-q / -dlq      — Workflow Service
+#   - delegation-workflow-q / -dlq            — Workflow Service
 #       filter: EventType IN [DelegationStarted, DelegationEnded, DelegationEscalationRequested]
-#   - delegation-notification-q / -dlq  — Notification Service
+#   - delegation-notification-q / -dlq        — Notification Service
 #       filter: EventType IN [DelegationStarted, DelegationEnded, DelegationReviewRequested, DelegationEscalationRequested]
-#   - delegation-audit-q / -dlq         — Audit Log Service
+#   - delegation-audit-q / -dlq               — Audit Log Service
 #       filter: none (receives all four types)
+#   - delegation-ended-user-profile-q / -dlq  — User Profile (INFRA-2 fix)
+#       filter: EventType IN [DelegationEnded]
+#       Purpose: UP self-heal — clears stale delegate pointer when a delegation
+#       ends; guards against the HTTP fire-and-forget clear call in Cancel/Expiry
+#       failing silently (gap report INFRA-2, 2026-09-21)
 #
 #   INBOUND (this service consumes):
 #   - delegation-cascade-q / -dlq       — MembershipRevoked, TenantMembershipsPurged
-#       (published by iam-org-membership) and UserUpdated (published by
-#       iam-user-profile, Bug 2/DLG-D26, a second upstream topic feeding the
-#       same queue) — send directly to exercise the consumer, no SNS
-#       subscription is modeled by this script for the inbound side
+#       (published by iam-org-membership on iam-membership-events) and
+#       UserUpdated{status:disabled} (published by iam-user-profile on
+#       iam-user-events, Bug 2/DLG-D26).
+#       The iam-user-events → delegation-cascade-q SNS subscription is
+#       provisioned by iam-user-profile's scripts/init-floci.sh (INFRA-1 fix,
+#       2026-09-21) so this script doesn't recreate it. To test the inbound
+#       consumer in isolation without iam-user-profile running, send directly:
+#         aws --endpoint-url http://localhost:4570 sqs send-message \
+#           --queue-url <cascade-q-url> --message-body '{"type":"UserUpdated",...}'
 #
 #   GLUE SCHEMA REGISTRY (LLD §7.6.7-adjacent event contract, DLG-D20/D21):
 #   - iam-delegation-events registry — 4 schemas, one per published event
@@ -162,6 +172,14 @@ provision_subscriber "delegation-notification-q" \
 # Audit Log — all four event types, no filter (immutable audit trail)
 provision_subscriber "delegation-audit-q" ""
 
+# User Profile — self-heal: clears stale delegate pointer when a delegation ends
+# (INFRA-2 fix, 2026-09-21). Backs up the HTTP fire-and-forget
+# DELETE /internal/users/:id/availability/delegate call that Cancel and Expiry
+# make — if that call fails, UP's DelegationEventConsumer clears the pointer
+# asynchronously via this queue. Env var: DELEGATION_EVENTS_QUEUE_URL in UP.
+provision_subscriber "delegation-ended-user-profile-q" \
+  '{"EventType":["DelegationEnded"]}'
+
 # ── Glue Schema Registry — registered LAST, deliberately ─────────────────────
 # The floci healthcheck (docker-compose.yml) polls for the last schema
 # registered here (DelegationEscalationRequested) to decide the container is
@@ -185,7 +203,8 @@ echo ""
 echo "Resources:"
 echo "  Glue registry : iam-delegation-events (4 schemas)"
 echo "  SNS topic     : $TOPIC_ARN"
-echo "  Inbound  q    : delegation-cascade-q  (MembershipRevoked / TenantMembershipsPurged / UserUpdated)"
-echo "  Subscriber    : delegation-workflow-q      (DelegationStarted, DelegationEnded, DelegationEscalationRequested)"
-echo "  Subscriber    : delegation-notification-q  (DelegationStarted, DelegationEnded, DelegationReviewRequested, DelegationEscalationRequested)"
-echo "  Subscriber    : delegation-audit-q         (all events — no filter)"
+echo "  Inbound  q    : delegation-cascade-q              (MembershipRevoked / TenantMembershipsPurged / UserUpdated)"
+echo "  Subscriber    : delegation-workflow-q             (DelegationStarted, DelegationEnded, DelegationEscalationRequested)"
+echo "  Subscriber    : delegation-notification-q         (DelegationStarted, DelegationEnded, DelegationReviewRequested, DelegationEscalationRequested)"
+echo "  Subscriber    : delegation-audit-q               (all events — no filter)"
+echo "  Subscriber    : delegation-ended-user-profile-q  (DelegationEnded — UP self-heal, INFRA-2)"

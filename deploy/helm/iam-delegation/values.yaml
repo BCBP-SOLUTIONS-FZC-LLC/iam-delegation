@@ -100,6 +100,9 @@ env:
   # REQUIRED — cmd/server/config.go fails fast at startup if either of the
   # next two is empty. No generic in-cluster default exists (real ARN/URL
   # depends on the environment's AWS account) — set per environment.
+  # REQUIRED per environment — cmd/server/config.go fails fast at startup if
+  # either is empty. Set these in your environment-specific values override;
+  # no in-cluster default exists because the ARN/URL depends on the AWS account.
   SNS_TOPIC_ARN: ""
   CASCADE_QUEUE_URL: ""
   CASCADE_SQS_CONCURRENCY: "4"
@@ -108,6 +111,14 @@ env:
   # eventbus.GlueCodec at publish time; empty → NoopCodec (dev/test only).
   # See docs/runbook-schema-registry.md.
   GLUE_REGISTRY_NAME: ""
+
+  # Optional — iam-catalog-admin base URL (GAP-020). When set, scope=department
+  # delegations validate the scope_id against the global department catalog
+  # (CAT-7) at create time; fail-closed (503) on 5xx, 422 invalid_scope_id on
+  # 404 or is_active=false. When empty, validation degrades to presence-only.
+  # Example: http://iam-catalog-admin.iam.svc.cluster.local:8081
+  CATALOG_ADMIN_BASE_URL: ""
+  CATALOG_ADMIN_TIMEOUT_MS: "3000"
 
   # Outbox runner — platform-events config.LoadOutbox / RunnerConfigFromEnv
   # (iam-user-profile / iam-org-membership). Historical 500ms / concurrency-4

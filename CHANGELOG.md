@@ -14,6 +14,35 @@ index into those, not a duplicate of them.
 
 ### Added
 
+- **GAP-020 / cross-service compatibility** — `scope=department` delegations now validate `scope_id`
+  against the Catalog Admin global department catalog at create time (GAP-020, DLG-D13). Added:
+  `port.CatalogAdminClient` interface; `internal/adapter/outbound/catalogadmin/` HTTP adapter
+  calling `GET /api/v1/departments/:id` (CAT-7), fail-closed on 5xx (`503 catalog_admin_unavailable`)
+  and `422 invalid_scope_id` on 404 or `is_active=false`; `DelegationService.WithCatalogAdmin()`
+  optional setter (nil = presence-only fallback, no startup failure); `CATALOG_ADMIN_BASE_URL` /
+  `CATALOG_ADMIN_TIMEOUT_MS` config + `.env.example` + Helm `values.yaml` entries; `catalogadmin`
+  package added to `.go-arch-lint.yml` `adapters_outbound` allow-list.
+- **Observability — platform_dependency_* metrics** — `platform_dependency_request_seconds` and
+  `platform_dependency_errors_total` (Registry-Proposed, same pattern as `iam-org-membership`) added
+  to `internal/adapter/outbound/metrics/metrics.go`. All three outbound HTTP clients
+  (`orgmembership`, `userprofile`, `catalogadmin`) now dual-emit Tier-1 latency + error counters
+  alongside the existing Tier-3 legacy metrics during the compatibility period. Package-level
+  `ObserveDependencyLatency` / `IncDependencyError` / `DependencyOutcome` helpers added.
+- **CI enforcement gates** — four new CI scripts in `.github/scripts/` covering platform library
+  compliance: `check-observability-compliance.sh` (logs/metrics/traces via platform-gincommon,
+  9 rules), `check-platform-events-compliance.sh` (events/outbox/dedup via platform-events,
+  11 rules), `check-pgcommon-compliance.sh` (DB connections/config/operations via platform-pgcommon,
+  11 rules), and `check-metric-namespacing.sh` (pre-existing, now wired into `validate-quality.yml`).
+  All four run on every PR via `validate-quality.yml`.
+- **Cross-service dependencies section** — `README.md` now has a dedicated `## Cross-service
+  dependencies` section documenting all synchronous outbound calls (including the new
+  `iam-catalog-admin` entry), inbound callers, async event table, and infrastructure dependencies
+  in one place, mirroring the `iam-org-membership` README convention.
+- **OM-GAP-9 fix** — `x-caller-service: iam-delegation` header added to
+  `internal/adapter/outbound/orgmembership/propagate.go` so `iam-org-membership`'s I-15
+  `iam_org_membership_membership_exists_check_total{caller}` metric correctly labels delegation's
+  grant-time membership checks (previously showed `caller="unknown"`).
+
 - Initial extraction from `iam-org-membership` as the fourth and last O&M extraction service
   (ADR-0008 Option C) — owns `delegations`/`delegation_tenant_settings`/`processed_events`, ships
   the DLG-1..7 public API and DLG-I1..I4 mesh-only internal API, two binaries (`cmd/server`,

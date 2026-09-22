@@ -3,6 +3,7 @@ package metrics
 import (
 	"errors"
 	"os"
+	"strings"
 	"testing"
 
 	"github.com/prometheus/client_golang/prometheus"
@@ -27,7 +28,7 @@ func TestMain(m *testing.M) {
 
 func ensureRegistered(t testing.TB) *Metrics {
 	t.Helper()
-	return Register()
+	return Register(RegisterConfig{Environment: "test"})
 }
 
 func counterValue(t *testing.T, c prometheus.Collector) float64 {
@@ -44,7 +45,7 @@ func counterValue(t *testing.T, c prometheus.Collector) float64 {
 
 func TestRegister_RecordsIncrementCounters(t *testing.T) {
 	reg := prometheus.NewRegistry()
-	m, err := RegisterOn(reg)
+	m, err := RegisterOn(reg, RegisterConfig{Environment: "test"})
 	require.NoError(t, err)
 
 	m.RecordCreated("all")
@@ -60,6 +61,7 @@ func TestRegister_RecordsIncrementCounters(t *testing.T) {
 	m.RecordMembershipCheckFailure()
 	m.RecordUPAvailabilityFailure("create")
 	m.RecordIdempotencyHit()
+	m.RecordMessageReceived("delegation-cascade-q")
 	m.RecordCascadeProcessed()
 	m.RecordCascadeDLQ()
 	m.RecordProcessedEventsDuplicate("cascade")
@@ -75,6 +77,18 @@ func TestRegister_RecordsIncrementCounters(t *testing.T) {
 	for _, mf := range metricFamilies {
 		names[mf.GetName()] = true
 	}
+
+	// Tier 1: platform_* metrics
+	for _, want := range []string{
+		"platform_messages_received_total",
+		"platform_messages_processed_total",
+		"platform_messages_failed_total",
+		"platform_duplicate_messages_total",
+	} {
+		require.True(t, names[want], "missing platform metric family %s", want)
+	}
+
+	// Tier 3: iam_delegation_* metrics (including legacy compatibility metrics)
 	for _, want := range []string{
 		"iam_delegation_created_total",
 		"iam_delegation_ended_total",
@@ -93,22 +107,75 @@ func TestRegister_RecordsIncrementCounters(t *testing.T) {
 		"iam_delegation_processed_events_duplicates_total",
 		"iam_delegation_unknown_event_acknowledged_total",
 	} {
-		require.True(t, names[want], "missing metric family %s", want)
+		require.True(t, names[want], "missing iam_delegation metric family %s", want)
 	}
+}
+
+// TestRecordCascadeProcessed_DualEmit verifies that RecordCascadeProcessed
+// increments both the platform Tier 1 metric and the legacy Tier 3 metric.
+func TestRecordCascadeProcessed_DualEmit(t *testing.T) {
+	reg := prometheus.NewRegistry()
+	m, err := RegisterOn(reg, RegisterConfig{Environment: "test"})
+	require.NoError(t, err)
+
+	m.RecordCascadeProcessed()
+
+	require.Equal(t, float64(1), counterValue(t, m.platformMessagesProcessedTotal.WithLabelValues("delegation-cascade-q")))
+	require.Equal(t, float64(1), counterValue(t, m.cascadeProcessedTotal))
+}
+
+// TestRecordCascadeDLQ_DualEmit verifies that RecordCascadeDLQ increments
+// both the platform Tier 1 metric and the legacy Tier 3 metric.
+func TestRecordCascadeDLQ_DualEmit(t *testing.T) {
+	reg := prometheus.NewRegistry()
+	m, err := RegisterOn(reg, RegisterConfig{Environment: "test"})
+	require.NoError(t, err)
+
+	m.RecordCascadeDLQ()
+
+	require.Equal(t, float64(1), counterValue(t, m.platformMessagesFailedTotal.WithLabelValues("delegation-cascade-q")))
+	require.Equal(t, float64(1), counterValue(t, m.cascadeDLQTotal))
+}
+
+// TestRecordProcessedEventsDuplicate_DualEmit verifies that
+// RecordProcessedEventsDuplicate increments both the platform Tier 1 metric
+// (queue label) and the legacy Tier 3 metric (consumer label).
+func TestRecordProcessedEventsDuplicate_DualEmit(t *testing.T) {
+	reg := prometheus.NewRegistry()
+	m, err := RegisterOn(reg, RegisterConfig{Environment: "test"})
+	require.NoError(t, err)
+
+	m.RecordProcessedEventsDuplicate("cascade")
+
+	require.Equal(t, float64(1), counterValue(t, m.platformDuplicateMessagesTotal.WithLabelValues("delegation-cascade-q")))
+	require.Equal(t, float64(1), counterValue(t, m.processedEventsDuplicatesTotal.WithLabelValues("cascade")))
+}
+
+// TestRecordMessageReceived verifies that RecordMessageReceived increments
+// platform_messages_received_total for the given queue.
+func TestRecordMessageReceived(t *testing.T) {
+	reg := prometheus.NewRegistry()
+	m, err := RegisterOn(reg, RegisterConfig{Environment: "test"})
+	require.NoError(t, err)
+
+	m.RecordMessageReceived("delegation-cascade-q")
+	m.RecordMessageReceived("delegation-cascade-q")
+
+	require.Equal(t, float64(2), counterValue(t, m.platformMessagesReceivedTotal.WithLabelValues("delegation-cascade-q")))
 }
 
 func TestRegisterOn_TwiceOnSameRegistryErrors(t *testing.T) {
 	reg := prometheus.NewRegistry()
-	_, err := RegisterOn(reg)
+	_, err := RegisterOn(reg, RegisterConfig{})
 	require.NoError(t, err)
 
-	_, err = RegisterOn(reg)
+	_, err = RegisterOn(reg, RegisterConfig{})
 	require.Error(t, err, "a second RegisterOn on the same registry must surface the duplicate-collector error, not panic")
 }
 
 func TestRegister_IsIdempotent(t *testing.T) {
 	ensureRegistered(t)
-	assert.NotPanics(t, func() { Register() })
+	assert.NotPanics(t, func() { Register(RegisterConfig{Environment: "test"}) })
 }
 
 func TestRegister_LandsOnGincommonRegisterer(t *testing.T) {
@@ -150,13 +217,14 @@ func TestRegister_AppliesGincommonConstLabels(t *testing.T) {
 		}
 		assert.Equal(t, "iam-delegation", labels["service"])
 		assert.Equal(t, "test", labels["version"])
+		assert.Equal(t, "test", labels["environment"], "environment label must be present on Tier 3 metrics")
 	}
 	assert.True(t, found, "iam_delegation_created_total must be gathered")
 }
 
 func TestReplaceActiveGauges_ResetDropsAbsentTenants(t *testing.T) {
 	reg := prometheus.NewRegistry()
-	m, err := RegisterOn(reg)
+	m, err := RegisterOn(reg, RegisterConfig{Environment: "test"})
 	require.NoError(t, err)
 
 	m.ReplaceActiveGauges(map[string]int64{"tenant-a": 3, "tenant-b": 1})
@@ -187,15 +255,83 @@ func TestReplaceActiveGauges_ResetDropsAbsentTenants(t *testing.T) {
 // We bypass Do by setting registerErr directly (same-package access).
 func TestRegister_PanicsOnError(t *testing.T) {
 	// Ensure Do has already fired so our manual set takes effect.
-	Register()
+	Register(RegisterConfig{Environment: "test"})
 
 	orig := registerErr
 	origLive := Live
 	t.Cleanup(func() { registerErr = orig; Live = origLive })
 
 	registerErr = errors.New("forced registration error")
-	assert.Panics(t, func() { Register() }, "Register must panic when registerErr is set")
+	assert.Panics(t, func() { Register(RegisterConfig{Environment: "test"}) }, "Register must panic when registerErr is set")
 
 	registerErr = orig
 	Live = origLive
+}
+
+// TestMetricsConformanceStandard enforces the Enterprise Platform
+// Observability Standard naming and label invariants at the registry level:
+//
+//   - Counters must end in _total.
+//   - Histograms must end in _seconds.
+//   - platform_* metrics must carry domain, service, environment labels.
+//   - platform_* metrics must not carry high-cardinality labels.
+//   - iam_delegation_* metrics must carry service and environment labels.
+func TestMetricsConformanceStandard(t *testing.T) {
+	reg := prometheus.NewRegistry()
+	_, err := RegisterOn(reg, RegisterConfig{Environment: "test"})
+	require.NoError(t, err)
+
+	families, err := reg.Gather()
+	require.NoError(t, err)
+	require.NotEmpty(t, families)
+
+	highCardinality := []string{"user_id", "email", "tenant_id", "request_id", "event_id", "session_id"}
+
+	for _, mf := range families {
+		name := mf.GetName()
+
+		// Rule: counters must end in _total.
+		if mf.GetType() == dto.MetricType_COUNTER {
+			assert.True(t, strings.HasSuffix(name, "_total"),
+				"counter metric %q must end in _total (Enterprise Platform Observability Standard §Naming-4)", name)
+		}
+
+		// Rule: histograms must end in _seconds.
+		if mf.GetType() == dto.MetricType_HISTOGRAM {
+			assert.True(t, strings.HasSuffix(name, "_seconds"),
+				"histogram metric %q must end in _seconds (Enterprise Platform Observability Standard §Naming-5)", name)
+		}
+
+		for _, m := range mf.GetMetric() {
+			labelMap := make(map[string]string, len(m.GetLabel()))
+			for _, lp := range m.GetLabel() {
+				labelMap[lp.GetName()] = lp.GetValue()
+			}
+
+			// Tier 1: platform_* required labels.
+			if strings.HasPrefix(name, "platform_") {
+				assert.Equal(t, "iam", labelMap["domain"],
+					"platform_* metric %q must have domain=\"iam\" label", name)
+				assert.Equal(t, "iam-delegation", labelMap["service"],
+					"platform_* metric %q must have service label", name)
+				assert.NotEmpty(t, labelMap["environment"],
+					"platform_* metric %q must have non-empty environment label", name)
+
+				// No high-cardinality labels on platform_* metrics.
+				for _, forbidden := range highCardinality {
+					_, exists := labelMap[forbidden]
+					assert.False(t, exists,
+						"platform_* metric %q must not carry high-cardinality label %q", name, forbidden)
+				}
+			}
+
+			// Tier 3: iam_delegation_* required labels.
+			if strings.HasPrefix(name, "iam_delegation_") {
+				assert.NotEmpty(t, labelMap["service"],
+					"iam_delegation_* metric %q must have service label", name)
+				assert.NotEmpty(t, labelMap["environment"],
+					"iam_delegation_* metric %q must have environment label", name)
+			}
+		}
+	}
 }

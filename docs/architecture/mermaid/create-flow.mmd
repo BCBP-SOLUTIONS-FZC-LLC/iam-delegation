@@ -18,7 +18,7 @@ sequenceDiagram
         Core-->>DLG: {active false}
         DLG-->>DR: 422 invalid_delegate
     else both active (each returns tenant_membership_id), starts_at within skewTolerance of now or omitted
-        DLG->>UP: PUT /internal/users/:delegator_id/availability {status ooo, delegate_id, ooo_note, ends_at}
+        DLG->>UP: PUT /internal/users/:delegator_id/availability {status ooo, delegate_id, note, ends_at}
         alt UP 5xx/timeout
             DLG-->>DR: 503 user_profile_unavailable
         else UP 200

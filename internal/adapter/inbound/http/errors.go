@@ -54,6 +54,7 @@ var errorStatusByCode = map[string]int{
 	// 503 — dependency
 	domain.ErrOrgMembershipUnavailable.Error(): http.StatusServiceUnavailable,
 	domain.ErrUserProfileUnavailable.Error():   http.StatusServiceUnavailable,
+	domain.ErrCatalogAdminUnavailable.Error():  http.StatusServiceUnavailable,
 	domain.ErrDBUnavailable.Error():            http.StatusServiceUnavailable,
 }
 

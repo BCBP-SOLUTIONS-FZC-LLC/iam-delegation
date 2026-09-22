@@ -111,7 +111,7 @@ func (h *DelegationHandler) List(c *gin.Context) {
 // @Success      201  {object}  DelegationResponse
 // @Failure      400  {object}  gincommon.ErrorResponse
 // @Failure      422  {object}  gincommon.ErrorResponse  "self_delegation | invalid_delegate | delegate_unavailable | scope_id_required | invalid_scope_id | reason_too_long | delegation_window_inverted | delegation_window_too_long | delegation_start_in_past | delegation_start_too_far_future"
-// @Failure      503  {object}  gincommon.ErrorResponse  "org_membership_unavailable | user_profile_unavailable"
+// @Failure      503  {object}  gincommon.ErrorResponse  "org_membership_unavailable | user_profile_unavailable | catalog_admin_unavailable"
 // @Security     UserID
 // @Security     TenantID
 // @Security     TenantRoles

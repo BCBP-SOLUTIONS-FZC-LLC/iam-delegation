@@ -117,7 +117,7 @@ iam-delegation/
 │   │   │   ├── event.go               # DomainEvent + published/consumed event-type constants — see "Key Files to Know"
 │   │   │   ├── event_payloads.go      # per-event payload structs
 │   │   │   └── errors.go              # domain.Err* sentinels — the full LLD §20 taxonomy (see development-guide.md's Appendix)
-│   │   ├── port/                      # logger.go (Zap-backed port.Logger via gincommon logger.NewLogger, DLG-D42) · delegation_repository.go · settings_repository.go · user_profile_client.go · membership_check_client.go · tender_scope_client.go (§7.6.7, DLG-D13 — unwired pending Tender's endpoint) · idempotency_store.go · event_publisher.go · cache.go · tx_runner.go (WithTx/TxFromContext carry the tx as `any` — core imports no pgx, DLG-D46) · errors.go · doc.go
+│   │   ├── port/                      # logger.go (Zap-backed port.Logger via gincommon logger.NewLogger, DLG-D42) · delegation_repository.go · settings_repository.go · user_profile_client.go · membership_check_client.go · catalog_admin_client.go (GAP-020 — optional CatalogAdminClient for scope=department scope_id validation) · tender_scope_client.go (§7.6.7, DLG-D13 — unwired pending Tender's endpoint) · idempotency_store.go · event_publisher.go · cache.go · tx_runner.go (WithTx/TxFromContext carry the tx as `any` — core imports no pgx, DLG-D46) · errors.go · doc.go
 │   │   └── service/
 │   │       ├── delegation_service.go  # DLG-1..5 orchestration
 │   │       ├── settings_service.go    # DLG-6/7
@@ -131,10 +131,11 @@ iam-delegation/
 │           ├── userprofile/           # http_client.go (UserProfileClient impl, DEL-6) + propagate.go
 │           ├── orgmembership/         # http_client.go (MembershipCheckClient impl, DLG-D3) + propagate.go
 │           ├── tender/                # http_client.go (TenderScopeClient impl, §7.6.7, DLG-D13) + propagate.go — built/tested, not constructed anywhere in cmd/server
+│           ├── catalogadmin/          # http_client.go (CatalogAdminClient impl, GAP-020) + propagate.go — validates scope=department scope_id against Catalog Admin CAT-7; optional (nil when CATALOG_ADMIN_BASE_URL unset)
 │           ├── eventbus/              # publisher.go + validating_codec.go (enqueue) · codec.go (GlueCodec encode + GlueDecodeCodec consume-side decode, DLG-D21) · validator.go (SchemaValidator, tests)
 │           ├── valkey/                # cache.go · client.go · idempotency.go — del: cache + idempotency store
-│           └── metrics/               # metrics.go — iam_delegation_* Prometheus instruments; DLG-D19 is closed — every instrument has a real call site (internal/core/service/metrics.go's injected Metrics port, cmd/reconciler/jobs.Context.Metrics, or cmd/server/exporters.go's active-gauge exporter)
-├── internal/eventschema/              # delegation_{started,ended,review_requested,escalation_requested}.json + schemas.go (//go:embed) — hand-maintained, no extract-schemas step (DLG-D20)
+│           └── metrics/               # metrics.go — three-tier taxonomy: Tier 1 platform_messages_* + platform_dependency_* (Registry-Proposed, dual-emitted with legacy Tier 3 during compat period); Tier 3 iam_delegation_* service-specific; DLG-D19 closed — every instrument has a real call site
+├── internal/eventschema/              # 7 hand-maintained JSON Schemas + schemas.go (//go:embed): 4 published (delegation_{started,ended,review_requested,escalation_requested}.json) + 3 consumed (membership_revoked.json, tenant_memberships_purged.json, user_updated.json); no extract-schemas step (DLG-D20)
 ├── pkg/requestctx/                    # gateway-identity / tenant-actor extraction helpers
 ├── docs/
 │   ├── lld/iam-lld-delegation-service.md  # the full LLD, current rev 2.18 (design-time source of truth)
@@ -147,6 +148,9 @@ iam-delegation/
 │   └── monitoring/                    # app-alerts.yml (threshold alerts) + slo-rules.yml (SLO-1..4 burn-rate, DLG-D39) — both also rendered by templates/prometheusrule.yaml — + prometheus-adapter-rule.yaml + schema-registry-alerts.yml (CI schema pipeline)
 ├── .github/workflows/                 # ci.yml · validate-quality.yml · validate-test.yml · release.yml · changelog-check.yml · schema-registry.yml · schema-prune.yml · schema-health-quarterly.yml · freeze-watchdog.yml
 ├── .githooks/pre-commit               # tidy + fmt-check + lint + swag-check
+├── scripts/
+│   ├── init-floci.sh                  # local-dev SNS/SQS/Glue provisioning (floci, not LocalStack)
+│   └── patch-swagger-extensions.py   # post-processes docs/swagger/ after `make swag` — injects top-level `tags` block (delegations/internal/infra) for correct Swagger UI grouping order
 ├── Dockerfile  docker-compose.yml  Makefile  go.mod  .golangci.yml  .go-arch-lint.yml
 ├── ARCHITECTURE.md                    # detailed architecture narrative with Mermaid diagrams; includes the DLG-D13+ as-built decision register
 ├── CONTRIBUTING.md                    # dev setup, extension playbooks, PR checklist
@@ -180,6 +184,10 @@ Also notable: `github.com/aws/aws-sdk-go-v2/service/glue` (GlueCodec's schema-ve
 - No session-scoped `SET app.tenant_id` — only `SET LOCAL` via `pgcommon.GUCSetFromContext` (CI greps the forbidden form, `.github/scripts/check-forbidden-set-guc.sh`, RLS-6).
 - Events/outbox pass through `platform-events` only — no direct AWS SDK SNS/SQS client calls or hand-built `events.Envelope` struct literals outside it (CI greps for both, `.github/scripts/check-forbidden-events-bypass.sh`). Consumer-side dedup (`processed_events`) is the one deliberate exception — `platform-events` has no consumer-side idempotency mechanism of its own, only the publish-side, SNS-FIFO-only `WithMessageDeduplicationID`.
 - `outbox_events` is never touched via hand-rolled SQL — only `outbox.Enqueue`/`outbox.Runner.PrunePublished` (CI scans Go backtick literals for `from|into|update outbox_events`, `.github/scripts/check-outbox-access.sh`, DLG-D47; ported from `iam-org-membership`, where this exact bypass happened once and was removed).
+- All logs/metrics/traces pass through `platform-gincommon` only — no stdlib `log`, no direct `zap`, no `prometheus.DefaultRegisterer`, no direct OTel TracerProvider construction outside `cmd/` (CI enforces 9 rules: L-1..L-4, M-1..M-3, T-1..T-2 via `.github/scripts/check-observability-compliance.sh`).
+- All events/outbox/dedup pass through `platform-events` only — `outbox.Enqueue` solely in `eventbus/publisher.go`, `NewSQSConsumerWithClient` solely in `consumer/wiring.go`, `processed_events` SQL solely in `postgres/processed_events.go` (CI enforces 11 rules: P-1..P-7, C-1..C-2, D-1..D-2 via `.github/scripts/check-platform-events-compliance.sh`).
+- All DB connections/config/operations pass through `platform-pgcommon` only — `pgcommon.NewPool` solely in `cmd/`, no `pgxpool.New`, no `database/sql`, `RunInTx` solely in `postgres/db.go` (CI enforces 11 rules: PC-1..PC-3, CF-1..CF-3, TX-1..TX-3, OQ-1..OQ-2 via `.github/scripts/check-pgcommon-compliance.sh`).
+- Metric naming/namespace rules enforced by `.github/scripts/check-metric-namespacing.sh` (platform_* suffix, iam_delegation_* suffix, forbidden high-cardinality labels, required platform_dependency_* metrics).
 
 ## Key Files to Know
 

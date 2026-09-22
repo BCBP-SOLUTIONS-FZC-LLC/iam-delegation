@@ -82,6 +82,36 @@ jobs:
       - name: Reject hand-rolled SQL against outbox_events
         run: bash .github/scripts/check-outbox-access.sh
 
+      # Metric naming convention gate — enforces Enterprise Platform Observability
+      # Standard namespace/suffix/label-cardinality rules on metrics/metrics.go
+      # and verifies that platform_dependency_* metrics are present (regression
+      # guard for the GAP-020 / dependency-metrics additions).
+      - name: Metric naming and namespace compliance
+        run: bash .github/scripts/check-metric-namespacing.sh
+
+      # Enterprise Platform Observability Standard — logs, metrics, and traces
+      # must all flow through platform-gincommon.  Nine rules across three
+      # signal families (L-1..L-4, M-1..M-3, T-1..T-2).  See
+      # .github/scripts/check-observability-compliance.sh for the full
+      # rationale and the explicit composition-root exemptions.
+      - name: Enforce observability compliance (logs/metrics/traces via platform-gincommon)
+        run: bash .github/scripts/check-observability-compliance.sh
+
+      # Platform-events pipeline integrity — events/outbox/dedup must all
+      # pass through platform-events only.  Eleven rules across three paths
+      # (P-1..P-7, C-1..C-2, D-1..D-2).  Complements the two narrower
+      # existing scripts (check-forbidden-events-bypass.sh,
+      # check-outbox-access.sh) with call-site and composition-root checks.
+      - name: Enforce platform-events pipeline integrity (events/outbox/dedup)
+        run: bash .github/scripts/check-platform-events-compliance.sh
+
+      # platform-pgcommon compliance — all DB connections, configuration, and
+      # operations must pass through platform-pgcommon only.  Eleven rules
+      # across four areas (PC-1..PC-3, CF-1..CF-3, TX-1..TX-3, OQ-1..OQ-2).
+      # See .github/scripts/check-pgcommon-compliance.sh for full rationale.
+      - name: Enforce pgcommon compliance (DB connections/config/operations)
+        run: bash .github/scripts/check-pgcommon-compliance.sh
+
       - name: Format check
         run: |
           unformatted=$(gofmt -l cmd/ internal/ pkg/ 2>/dev/null || true)

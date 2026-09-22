@@ -166,13 +166,19 @@ groups:
             The delegation-review CronJob's auto-end pass has been deferring
             (DEL-6) for at least 30 minutes. Check iam-user-profile health.
 
-      # ── Cascade DLQ growing ───────────────────────────────────────────────────
+      # ── Cascade DLQ growing (LEGACY — compatibility period) ─────────────────
+      # Uses iam_delegation_cascade_dlq_total (Tier 3 legacy metric).
+      # The canonical alert is IAMDelegationCascadeMessagesFailing below
+      # (iam_delegation_cascade_platform group, Tier 1 platform_messages_failed_total).
+      # Remove this alert once dashboards and on-call runbooks migrate to
+      # platform_messages_failed_total{queue="delegation-cascade-q"}.
       - alert: IAMDelegationCascadeDLQGrowing
         expr: |
           increase(iam_delegation_cascade_dlq_total[30m]) > 0
         labels:
           severity: warning
           team: platform
+          compatibility_period: "true"
         annotations:
           summary: iam-delegation cascade consumer is dead-lettering messages
           description: >-
@@ -181,6 +187,35 @@ groups:
             minutes (maxReceiveCount=5 exhausted). Inspect the DLQ — a
             malformed envelope or a persistent handler error needs manual
             replay/fix (LLD §10.1).
+
+  # ── Tier 1 platform_* cascade alerts (Enterprise Platform Observability
+  #    Standard) — primary signal, replaces IAMDelegationCascadeDLQGrowing
+  #    above for the canonical on-call runbook.  Uses
+  #    platform_messages_failed_total{queue="delegation-cascade-q"} emitted
+  #    alongside the legacy iam_delegation_cascade_dlq_total during the
+  #    compatibility period.
+  - name: iam_delegation_cascade_platform
+    rules:
+
+      - alert: IAMDelegationCascadeMessagesFailing
+        expr: |
+          increase(platform_messages_failed_total{
+            service="iam-delegation",
+            queue="delegation-cascade-q"
+          }[30m]) > 0
+        for: 5m
+        labels:
+          severity: warning
+          team: platform
+        annotations:
+          summary: iam-delegation cascade consumer is failing messages
+          description: >-
+            {{ $value | humanize }} cascade message(s) returned a handler error
+            in the last 30 minutes — SQS will redeliver up to maxReceiveCount=5
+            times before routing to the DLQ (delegation-cascade-q-dlq). Inspect
+            consumer logs (event_type, error) and the DLQ payload if retries
+            are exhausted. Sustained failures indicate a schema-decode error or
+            a persistent handler bug (LLD §10.1).
 
   # ── Transactional outbox dead-letter table — outbox_dead_letters_total is
   #    platform-events' own metric (registered automatically by

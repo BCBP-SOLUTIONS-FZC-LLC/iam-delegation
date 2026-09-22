@@ -448,9 +448,20 @@ var _ port.MembershipCheckClient = (*fakeMembershipCheckClient)(nil)
 type fakeUserProfileClient struct {
 	rec *callRecorder
 
-	mu    sync.Mutex
-	calls []port.SetAvailabilityRequest
-	fn    func(ctx context.Context, req port.SetAvailabilityRequest) error
+	mu                sync.Mutex
+	calls             []port.SetAvailabilityRequest
+	clearCalls        []uuid.UUID // userIDs passed to ClearDelegatePointer
+	fn                func(ctx context.Context, req port.SetAvailabilityRequest) error
+	clearFn           func(ctx context.Context, tenantID, userID uuid.UUID) error
+	getAvailabilityFn func(ctx context.Context, tenantID, userID uuid.UUID) (*port.AvailabilitySnapshot, error)
+}
+
+func (f *fakeUserProfileClient) GetAvailability(ctx context.Context, tenantID, userID uuid.UUID) (*port.AvailabilitySnapshot, error) {
+	f.rec.record("userprofile.GetAvailability")
+	if f.getAvailabilityFn != nil {
+		return f.getAvailabilityFn(ctx, tenantID, userID)
+	}
+	return &port.AvailabilitySnapshot{Status: "available"}, nil
 }
 
 func (f *fakeUserProfileClient) SetAvailability(ctx context.Context, req port.SetAvailabilityRequest) error {
@@ -460,6 +471,17 @@ func (f *fakeUserProfileClient) SetAvailability(ctx context.Context, req port.Se
 	f.rec.record("userprofile.SetAvailability")
 	if f.fn != nil {
 		return f.fn(ctx, req)
+	}
+	return nil
+}
+
+func (f *fakeUserProfileClient) ClearDelegatePointer(ctx context.Context, tenantID, userID uuid.UUID) error {
+	f.mu.Lock()
+	f.clearCalls = append(f.clearCalls, userID)
+	f.mu.Unlock()
+	f.rec.record("userprofile.ClearDelegatePointer")
+	if f.clearFn != nil {
+		return f.clearFn(ctx, tenantID, userID)
 	}
 	return nil
 }

@@ -317,7 +317,7 @@ func TestHandle_HandlerError_DoesNotMarkProcessed(t *testing.T) {
 
 func TestHandle_RecordsMetrics(t *testing.T) {
 	prev := metrics.Live
-	m, err := metrics.RegisterOn(prometheus.NewRegistry())
+	m, err := metrics.RegisterOn(prometheus.NewRegistry(), metrics.RegisterConfig{})
 	require.NoError(t, err)
 	metrics.Live = m
 	t.Cleanup(func() { metrics.Live = prev })

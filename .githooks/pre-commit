@@ -1,5 +1,7 @@
 #!/usr/bin/env bash
 # Local commit gates: formatting, lint, and Swagger staleness.
+# Mirrors iam-org-membership/.githooks/pre-commit.
+# Install via: make install-hooks  (or make setup on first clone)
 set -euo pipefail
 
 echo "[pre-commit] running tidy..."

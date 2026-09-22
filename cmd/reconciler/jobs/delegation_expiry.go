@@ -23,9 +23,7 @@ func Expiry(ctx context.Context, jctx *Context) (Result, error) {
 
 	for _, d := range targets {
 		res.Attempted++
-		if err := jctx.UserProfile.SetAvailability(ctx, port.SetAvailabilityRequest{
-			TenantID: d.TenantID, UserID: d.DelegatorID, ClearDelegate: true,
-		}); err != nil {
+		if err := jctx.UserProfile.ClearDelegatePointer(ctx, d.TenantID, d.DelegatorID); err != nil {
 			jctx.Logger.Warn("delegation-expiry: UP pointer-clear failed — DEL-6 defer",
 				map[string]interface{}{"delegation_id": d.ID, "error": err.Error()})
 			res.Deferred++

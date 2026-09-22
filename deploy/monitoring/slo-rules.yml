@@ -104,14 +104,33 @@ groups:
           + sum(increase(iam_delegation_expiry_deferred_total{job="iam-delegation"}[1h]))
           + sum(increase(iam_delegation_review_deferred_total{job="iam-delegation"}[1h]))
 
-      # delegation-cascade-q cascade error rate — DLQ deliveries over total
-      # attempted (processed + DLQ'd).
+      # delegation-cascade-q cascade error rate — legacy Tier 3 recording rule.
+      # Kept for compatibility period; dashboards that reference this rule name
+      # continue to work unchanged while migrating to the platform_* equivalent
+      # below.  Remove after all consumers have switched to
+      # iam:delegation_cascade_error_rate:ratio_rate_5m_platform.
       - record: iam:delegation_cascade_error_rate:ratio_rate_5m
         expr: |
           sum(rate(iam_delegation_cascade_dlq_total{job="iam-delegation"}[5m]))
           /
           clamp_min(sum(rate(iam_delegation_cascade_processed_total{job="iam-delegation"}[5m]))
             + sum(rate(iam_delegation_cascade_dlq_total{job="iam-delegation"}[5m])), 0.001)
+
+      # delegation-cascade-q cascade error rate — Tier 1 platform_* recording
+      # rule (canonical, replaces the legacy rule above).
+      # Uses platform_messages_failed_total and platform_messages_processed_total
+      # {service="iam-delegation", queue="delegation-cascade-q"} — the required
+      # labels are const-injected by WrapRegistererWith so no job label is needed
+      # here; service scopes to this service's metrics only.
+      - record: iam:delegation_cascade_error_rate:ratio_rate_5m_platform
+        expr: |
+          sum(rate(platform_messages_failed_total{service="iam-delegation",queue="delegation-cascade-q"}[5m]))
+          /
+          clamp_min(
+            sum(rate(platform_messages_processed_total{service="iam-delegation",queue="delegation-cascade-q"}[5m]))
+              + sum(rate(platform_messages_failed_total{service="iam-delegation",queue="delegation-cascade-q"}[5m])),
+            0.001
+          )
 
   # ── SLO burn-rate alerts (multi-window) ───────────────────────────────────
   - name: iam-delegation.slo.burn
@@ -196,9 +215,13 @@ groups:
             fail-open), but this is a real freshness gap. Check
             iam-user-profile's health.
 
-      # SLO-4: cascade DLQ errors not self-healing.
+      # SLO-4: cascade convergence not self-healing (Tier 1 platform_* primary).
+      # References iam:delegation_cascade_error_rate:ratio_rate_5m_platform
+      # (new canonical recording rule, uses platform_messages_failed/processed).
+      # The legacy rule iam:delegation_cascade_error_rate:ratio_rate_5m is kept
+      # for dashboard compatibility during the migration period.
       - alert: IAMSLO4_DelegationCascadeErrorRateElevated
-        expr: iam:delegation_cascade_error_rate:ratio_rate_5m > 0
+        expr: iam:delegation_cascade_error_rate:ratio_rate_5m_platform > 0
         for: 20m
         labels:
           severity: ticket
@@ -207,7 +230,7 @@ groups:
         annotations:
           summary: "SLO-4: iam-delegation cascade convergence not self-healing"
           description: |
-            iam:delegation_cascade_error_rate:ratio_rate_5m has been
+            iam:delegation_cascade_error_rate:ratio_rate_5m_platform has been
             non-zero for 20m+. delegation-cascade-q deliveries should
             converge on redelivery — a sustained non-zero rate means a
             persistent handler error or schema-decode failure, not

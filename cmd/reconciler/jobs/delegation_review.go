@@ -8,7 +8,6 @@ import (
 	"time"
 
 	"github.com/BCBP-SOLUTIONS-FZC-LLC/iam-delegation/internal/core/domain"
-	"github.com/BCBP-SOLUTIONS-FZC-LLC/iam-delegation/internal/core/port"
 )
 
 // ReviewSweep is DLG-I2 (delegation-review, hourly, LLD §11.4).
@@ -83,9 +82,7 @@ func ReviewSweep(ctx context.Context, jctx *Context) (Result, error) {
 		return res, err
 	}
 	for _, d := range endTargets {
-		if err := jctx.UserProfile.SetAvailability(ctx, port.SetAvailabilityRequest{
-			TenantID: d.TenantID, UserID: d.DelegatorID, ClearDelegate: true,
-		}); err != nil {
+		if err := jctx.UserProfile.ClearDelegatePointer(ctx, d.TenantID, d.DelegatorID); err != nil {
 			jctx.Logger.Warn("delegation-review: UP pointer-clear failed — DEL-6 defer",
 				map[string]interface{}{"delegation_id": d.ID, "error": err.Error()})
 			res.Deferred++

@@ -14,8 +14,10 @@ import (
 	"time"
 
 	"github.com/BCBP-SOLUTIONS-FZC-LLC/platform-gincommon/pkg/gincommon"
+	"github.com/google/uuid"
 
 	"github.com/BCBP-SOLUTIONS-FZC-LLC/iam-delegation/internal/adapter/outbound/httpx"
+	"github.com/BCBP-SOLUTIONS-FZC-LLC/iam-delegation/internal/adapter/outbound/metrics"
 	"github.com/BCBP-SOLUTIONS-FZC-LLC/iam-delegation/internal/core/port"
 )
 
@@ -53,32 +55,19 @@ func NewHTTPClient(baseURL string, httpClient *http.Client, timeout time.Duratio
 }
 
 // buildBody constructs the wire payload for req. Fields left zero-value on
-// req are omitted; delegate_id gets three distinct wire states per the port
-// doc comment:
-//   - req.ClearDelegate == true      -> "delegate_id": null (explicit clear)
-//   - req.DelegateID != nil          -> "delegate_id": "<uuid>"
-//   - otherwise                      -> "delegate_id" omitted entirely
+// req are omitted; delegate_id gets two distinct wire states:
+//   - req.DelegateID != nil  -> "delegate_id": "<uuid>"
+//   - otherwise              -> "delegate_id" omitted entirely
 //
 // A plain struct with `omitempty` can't express "explicit null vs omitted"
 // on the same field, so this builds a map instead.
 //
-// status is REQUIRED on iam-user-profile's current PutAvailabilityRequest
-// DTO (binding:"required") — a status-less {delegate_id: null} body, which
-// this client's End path used to send per this port's original "NEVER
-// {status:\"available\"}, UP owns that transition" design, now gets a
-// clean 400 from iam-user-profile rather than a clean pointer-clear. Until
-// iam-user-profile makes status optional again (or exposes a dedicated
-// pointer-clear-only endpoint), default to "available" on the End path so
-// the call succeeds — this does shift the return-to-available decision
-// into iam-delegation, which is a real product/ownership question, not a
-// purely mechanical one; flagged for the iam-user-profile team to confirm.
+// SetAvailability is the create path only — status is always set when called
+// from delegation. Pointer-clear calls use ClearDelegatePointer instead.
 func buildBody(req port.SetAvailabilityRequest) map[string]any {
 	body := map[string]any{}
-	switch {
-	case req.Status != nil:
+	if req.Status != nil {
 		body["status"] = *req.Status
-	case req.ClearDelegate:
-		body["status"] = "available"
 	}
 	if req.OOOFrom != nil {
 		body["ooo_from"] = req.OOOFrom.UTC().Format(time.RFC3339)
@@ -86,16 +75,114 @@ func buildBody(req port.SetAvailabilityRequest) map[string]any {
 	if req.OOOUntil != nil {
 		body["ooo_until"] = req.OOOUntil.UTC().Format(time.RFC3339)
 	}
-	switch {
-	case req.ClearDelegate:
-		body["delegate_id"] = nil
-	case req.DelegateID != nil:
+	if req.DelegateID != nil {
 		body["delegate_id"] = req.DelegateID.String()
 	}
 	if req.Note != "" {
 		body["note"] = req.Note
 	}
 	return body
+}
+
+// GetAvailability calls GET /api/v1/users/:id/availability on iam-user-profile
+// and returns the delegate's current status and OOO end time.
+// 404 → user not provisioned in UP, treated as available (no OOO).
+// 5xx and network failures are wrapped with port.ErrDependencyUnavailable.
+func (c *HTTPClient) GetAvailability(ctx context.Context, tenantID, userID uuid.UUID) (*port.AvailabilitySnapshot, error) {
+	started := time.Now()
+	snap, err := c.getAvailability(ctx, tenantID, userID)
+	elapsed := time.Since(started).Seconds()
+	metrics.ObserveDependencyLatency("user_profile", "get_availability", elapsed)
+	if err != nil {
+		metrics.IncDependencyError("user_profile", "get_availability", metrics.DependencyOutcome(err))
+	}
+	return snap, err
+}
+
+func (c *HTTPClient) getAvailability(ctx context.Context, tenantID, userID uuid.UUID) (*port.AvailabilitySnapshot, error) {
+	url := fmt.Sprintf("%s/api/v1/users/%s/availability", c.baseURL, userID)
+	httpReq, err := http.NewRequestWithContext(ctx, http.MethodGet, url, http.NoBody)
+	if err != nil {
+		return nil, fmt.Errorf("userprofile: build request: %w", err)
+	}
+	setInternalHeaders(httpReq, tenantID)
+	propagate(ctx, httpReq)
+
+	resp, err := c.httpClient.Do(httpReq)
+	if err != nil {
+		return nil, fmt.Errorf("userprofile: request failed: %w: %w", err, port.ErrDependencyUnavailable)
+	}
+	defer func() { _ = resp.Body.Close() }() //nolint:errcheck // best-effort close, nothing actionable on failure
+
+	if resp.StatusCode == http.StatusNotFound {
+		return &port.AvailabilitySnapshot{Status: "available"}, nil
+	}
+	if resp.StatusCode >= http.StatusInternalServerError {
+		return nil, fmt.Errorf("userprofile: unexpected status %d: %w", resp.StatusCode, port.ErrDependencyUnavailable)
+	}
+	if resp.StatusCode < http.StatusOK || resp.StatusCode >= http.StatusMultipleChoices {
+		return nil, fmt.Errorf("userprofile: unexpected status %d", resp.StatusCode)
+	}
+
+	var body struct {
+		Status   string  `json:"status"`
+		OOOUntil *string `json:"ooo_until"`
+	}
+	if err := json.NewDecoder(httpx.LimitBody(resp.Body)).Decode(&body); err != nil {
+		return nil, fmt.Errorf("userprofile: decode response: %w", err)
+	}
+	snap := &port.AvailabilitySnapshot{Status: body.Status}
+	if body.OOOUntil != nil {
+		t, parseErr := time.Parse(time.RFC3339, *body.OOOUntil)
+		if parseErr != nil {
+			return nil, fmt.Errorf("userprofile: parse ooo_until: %w", parseErr)
+		}
+		snap.OOOUntil = &t
+	}
+	return snap, nil
+}
+
+// ClearDelegatePointer calls iam-user-profile's dedicated pointer-clear
+// endpoint (DELETE /api/v1/internal/users/:id/availability/delegate).
+// Unlike SetAvailability, this never touches the user's status — UP preserves
+// whatever status the user had before the delegation started (Gap 3 Option B).
+// 5xx and network failures are wrapped with port.ErrDependencyUnavailable.
+func (c *HTTPClient) ClearDelegatePointer(ctx context.Context, tenantID, userID uuid.UUID) error {
+	started := time.Now()
+	err := c.clearDelegatePointer(ctx, tenantID, userID)
+	elapsed := time.Since(started).Seconds()
+	metrics.ObserveDependencyLatency("user_profile", "clear_delegate_pointer", elapsed)
+	if err != nil {
+		metrics.IncDependencyError("user_profile", "clear_delegate_pointer", metrics.DependencyOutcome(err))
+	}
+	return err
+}
+
+func (c *HTTPClient) clearDelegatePointer(ctx context.Context, tenantID, userID uuid.UUID) error {
+	url := fmt.Sprintf("%s/api/v1/internal/users/%s/availability/delegate", c.baseURL, userID)
+	httpReq, err := http.NewRequestWithContext(ctx, http.MethodDelete, url, http.NoBody)
+	if err != nil {
+		return fmt.Errorf("userprofile: build request: %w", err)
+	}
+	setInternalHeaders(httpReq, tenantID)
+	propagate(ctx, httpReq)
+
+	resp, err := c.httpClient.Do(httpReq)
+	if err != nil {
+		return fmt.Errorf("userprofile: request failed: %w: %w", err, port.ErrDependencyUnavailable)
+	}
+	defer func() { _ = resp.Body.Close() }() //nolint:errcheck // best-effort close
+	if resp.StatusCode >= http.StatusOK && resp.StatusCode < http.StatusMultipleChoices {
+		return nil
+	}
+	if resp.StatusCode >= http.StatusInternalServerError {
+		return fmt.Errorf("userprofile: unexpected status %d: %w", resp.StatusCode, port.ErrDependencyUnavailable)
+	}
+	var errResp gincommon.ErrorResponse
+	if decErr := json.NewDecoder(httpx.LimitBody(resp.Body)).Decode(&errResp); decErr == nil && errResp.Error != "" {
+		return fmt.Errorf("userprofile: %s", errResp.Error)
+	}
+	return fmt.Errorf("userprofile: unexpected status %d", resp.StatusCode)
 }
 
 // SetAvailability calls iam-user-profile's internal availability endpoint.
@@ -106,6 +193,17 @@ func buildBody(req port.SetAvailabilityRequest) map[string]any {
 // contains the callee's error code, so the service layer's
 // strings.Contains(err.Error(), "delegate_unavailable") check still works.
 func (c *HTTPClient) SetAvailability(ctx context.Context, req port.SetAvailabilityRequest) error {
+	started := time.Now()
+	err := c.setAvailability(ctx, req)
+	elapsed := time.Since(started).Seconds()
+	metrics.ObserveDependencyLatency("user_profile", "set_availability", elapsed)
+	if err != nil {
+		metrics.IncDependencyError("user_profile", "set_availability", metrics.DependencyOutcome(err))
+	}
+	return err
+}
+
+func (c *HTTPClient) setAvailability(ctx context.Context, req port.SetAvailabilityRequest) error {
 	body, err := json.Marshal(buildBody(req))
 	if err != nil {
 		return fmt.Errorf("userprofile: encode request: %w", err)
@@ -134,11 +232,11 @@ func (c *HTTPClient) SetAvailability(ctx context.Context, req port.SetAvailabili
 		return fmt.Errorf("userprofile: unexpected status %d: %w", resp.StatusCode, port.ErrDependencyUnavailable)
 	}
 
-	// 4xx business rejection — decode gincommon's standard error body
-	// ({"error": "<code>", "status", "trace_id", "request_id"}, per
-	// iam-user-profile's own newErrorResponse, which mirrors
-	// platform-gincommon.ErrorResponse) and surface the code in the
-	// returned error's message.
+	// 4xx business rejection — decode iam-user-profile's hybrid error envelope.
+	// UP returns extra fields beyond gincommon.ErrorResponse (code, message,
+	// details for 422) that this struct does not map; encoding/json uses
+	// open/permissive decoding so unknown fields are silently ignored.
+	// Reading only the error field is sufficient — it carries the same value as code.
 	var errResp gincommon.ErrorResponse
 	if decErr := json.NewDecoder(httpx.LimitBody(resp.Body)).Decode(&errResp); decErr == nil && errResp.Error != "" {
 		return fmt.Errorf("userprofile: %s", errResp.Error)

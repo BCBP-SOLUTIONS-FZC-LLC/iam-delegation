@@ -21,15 +21,28 @@ func (fakeLogger) Warn(string, map[string]interface{})  {}
 func (fakeLogger) Error(string, map[string]interface{}) {}
 
 type fakeUserProfile struct {
-	failFor  map[uuid.UUID]bool // delegatorID -> fail SetAvailability
-	calls    []uuid.UUID
-	requests []port.SetAvailabilityRequest // full request per call, same order as calls
+	failFor    map[uuid.UUID]bool            // userID -> fail any UP call
+	calls      []uuid.UUID                   // userIDs from SetAvailability
+	requests   []port.SetAvailabilityRequest // full requests from SetAvailability
+	clearCalls []uuid.UUID                   // userIDs from ClearDelegatePointer
 }
 
 func (f *fakeUserProfile) SetAvailability(_ context.Context, req port.SetAvailabilityRequest) error {
 	f.calls = append(f.calls, req.UserID)
 	f.requests = append(f.requests, req)
 	if f.failFor != nil && f.failFor[req.UserID] {
+		return errors.New("user profile down")
+	}
+	return nil
+}
+
+func (f *fakeUserProfile) GetAvailability(_ context.Context, _, _ uuid.UUID) (*port.AvailabilitySnapshot, error) {
+	return &port.AvailabilitySnapshot{Status: "available"}, nil
+}
+
+func (f *fakeUserProfile) ClearDelegatePointer(_ context.Context, _, userID uuid.UUID) error {
+	f.clearCalls = append(f.clearCalls, userID)
+	if f.failFor != nil && f.failFor[userID] {
 		return errors.New("user profile down")
 	}
 	return nil

@@ -76,7 +76,7 @@ func run(logger port.Logger) error {
 		BuildVersion: getEnv("BUILD_VERSION", "dev"),
 	}
 	_ = gincommon.ObservabilityMiddlewares(ginCfg)
-	reconcilerMetrics := metrics.Register()
+	reconcilerMetrics := metrics.Register(metrics.RegisterConfig{Environment: resolveAppEnv()})
 	events.InitWithRegisterer(ginCfg.ServiceName, ginCfg.BuildVersion, gincommon.MetricsRegisterer())
 	pgmetrics.InitWithRegisterer(ginCfg.ServiceName, ginCfg.BuildVersion, gincommon.MetricsRegisterer())
 	serviceName := ginCfg.ServiceName

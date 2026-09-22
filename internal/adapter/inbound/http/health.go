@@ -37,6 +37,18 @@ type healthHandlers struct {
 	outbox      Pinger
 }
 
+// healthz is the liveness endpoint — registered in router.go as
+// gincommon.HealthHandler() which always returns 200 {"status":"ok"}.
+// It never inspects dependencies; Kubernetes restarts the pod on 5xx, not
+// on dependency outages (that is readyz's job).
+//
+// @Summary   Liveness check
+// @Tags      infra
+// @Produce   json
+// @Success   200  {object}  map[string]string  "always {\"status\":\"ok\"}"
+// @Router    /healthz [get]
+func healthz() {} //nolint:unused // annotation-only stub; real handler is gincommon.HealthHandler()
+
 // readyz checks Postgres (critical path for every route — 503 if
 // unreachable), Valkey, and the outbox dispatcher (both degraded-only: a
 // cache or outbox check failure is reported without flipping overall

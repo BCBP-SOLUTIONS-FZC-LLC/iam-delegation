@@ -1,7 +1,7 @@
 {
     "swagger": "2.0",
     "info": {
-        "description": "The system of record for out-of-office (OOO) delegations — time-bounded grants that drive workflow rerouting. Extracted from iam-org-membership per ADR-0008 (Option C), the fourth and last O\u0026M decomposition wave.\n\n**Route prefixes.**  `/api/v1/delegations*` — tenant callers (self or `tenant_admin`/`tenant_owner` via `x-tenant-roles`, gateway-injected identity).  `/internal/*` — in-mesh service-to-service, mTLS trust boundary only, no RBAC/JWT check at all (LLD §8.2/§13.2).\n\nDLG-2 (create) requires an `Idempotency-Key` header; a repeated key within 24h returns the original 201 rather than creating a second delegation (DLG-D8).",
+        "description": "The system of record for out-of-office (OOO) delegations — time-bounded grants that drive workflow rerouting. Extracted from iam-org-membership per ADR-0008 (Option C), the fourth and last O&M decomposition wave.\n\n**Route prefixes.**  `/api/v1/delegations*` — tenant callers (self or `tenant_admin`/`tenant_owner` via `x-tenant-roles`, gateway-injected identity).  `/internal/*` — in-mesh service-to-service, mTLS trust boundary only, no RBAC/JWT check at all (LLD §8.2/§13.2).\n\nDLG-2 (create) requires an `Idempotency-Key` header; a repeated key within 24h returns the original 201 rather than creating a second delegation (DLG-D8).",
         "title": "Delegation Service API",
         "contact": {
             "name": "BCBP Solutions"
@@ -98,7 +98,7 @@
                         }
                     },
                     "503": {
-                        "description": "org_membership_unavailable | user_profile_unavailable",
+                        "description": "org_membership_unavailable | user_profile_unavailable | catalog_admin_unavailable",
                         "schema": {
                             "$ref": "#/definitions/gincommon.ErrorResponse"
                         }
@@ -461,6 +461,28 @@
                         "description": "AsyncAPI YAML",
                         "schema": {
                             "type": "string"
+                        }
+                    }
+                }
+            }
+        },
+        "/healthz": {
+            "get": {
+                "produces": [
+                    "application/json"
+                ],
+                "tags": [
+                    "infra"
+                ],
+                "summary": "Liveness check",
+                "responses": {
+                    "200": {
+                        "description": "always {\\\"status\\\":\\\"ok\\\"}",
+                        "schema": {
+                            "type": "object",
+                            "additionalProperties": {
+                                "type": "string"
+                            }
                         }
                     }
                 }
@@ -911,6 +933,20 @@
             }
         }
     },
+    "tags": [
+        {
+            "name": "delegations",
+            "description": "Out-of-office delegation lifecycle — DLG-1..7 (list, create, cancel, extend, reassign, settings get/set)"
+        },
+        {
+            "name": "internal",
+            "description": "Mesh-only internal API — DLG-I1..I4 (expiry sweep, review sweep, dept-delegate lookup, active-delegations escape-hatch)"
+        },
+        {
+            "name": "infra",
+            "description": "Health & readiness probes + AsyncAPI viewer (unauthenticated)"
+        }
+    ],
     "securityDefinitions": {
         "TenantID": {
             "description": "Tenant UUID injected by the API gateway.",

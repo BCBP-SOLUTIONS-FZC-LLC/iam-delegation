@@ -54,22 +54,41 @@ gauge exporters) — emit-once at start so the first scrape is populated.
 `cmd/reconciler`'s CronJob binary still has no `/metrics` scrape endpoint — alert-visible
 deferred counters reach Prometheus via `cmd/server`'s DLG-I1/I2 HTTP entry points.
 
+Three-tier taxonomy per Enterprise Platform Observability Standard. `platform_*` registered on `prometheus.WrapRegistererWith({domain,service,environment})` via `gincommon.MetricsRegisterer()`. Tier 3 `iam_delegation_*` carry `{service,version,environment}` ConstLabels. Tier 2 (`iam_*`) not currently emitted — all signals are either cross-domain (Tier 1) or delegation-specific (Tier 3).
+
+**Tier 1 — `platform_*` (cross-domain, `{domain,service,environment}` injected centrally)**
+
+| Metric | Type | Labels | Notes |
+|---|---|---|---|
+| `platform_messages_received_total` | Counter | queue | Every SQS delivery entering cascade Handle(), regardless of outcome |
+| `platform_messages_processed_total` | Counter | queue | Successfully handled messages; dual-emits with `iam_delegation_cascade_processed_total` (compat) |
+| `platform_messages_failed_total` | Counter | queue | Handler-returned errors; dual-emits with `iam_delegation_cascade_dlq_total` (compat) |
+| `platform_duplicate_messages_total` | Counter | queue | SQS redeliveries skipped via processed_events (IDEMP-4); Registry-Proposed |
+| `platform_dependency_request_seconds` | Histogram | target_service, endpoint | Latency of outbound HTTP calls to org_membership, user_profile, catalog_admin; dual-emits with Tier 3 legacy; Registry-Proposed |
+| `platform_dependency_errors_total` | Counter | target_service, endpoint, outcome | Outbound call failures (timeout\|5xx); dual-emits with Tier 3 legacy; Registry-Proposed |
+
+**Tier 3 — `iam_delegation_*` (service-specific, `{service,version,environment}` ConstLabels)**
+
 | Metric | Type | Labels | Recorder method |
 |---|---|---|---|
-| `iam_delegation_created_total` | Counter | — | `RecordCreated(scope)` |
-| `iam_delegation_ended_total` | Counter | — | `RecordEnded(reason)` |
+| `iam_delegation_created_total` | Counter | scope | `RecordCreated(scope)` |
+| `iam_delegation_ended_total` | Counter | ended_reason | `RecordEnded(reason)` |
 | `iam_delegation_active_gauge` | Gauge | tenant | `ReplaceActiveGauges` (5-min sysPool snapshot) |
 | `iam_delegation_expiry_deferred_total` | Counter | — | `RecordExpiryDeferred()` |
 | `iam_delegation_review_deferred_total` | Counter | — | `RecordReviewDeferred()` |
 | `iam_delegation_activation_deferred_total` | Counter | — | `RecordActivationDeferred()` |
 | `iam_delegation_review_warned_total` | Counter | days_remaining | `RecordReviewWarned(daysRemaining)` |
 | `iam_delegation_review_expired_total` | Counter | — | `RecordReviewExpired()` |
-| `iam_delegation_membership_check_duration_seconds` | Histogram | — | `ObserveMembershipCheckDuration(seconds)` |
-| `iam_delegation_membership_check_failures_total` | Counter | — | `RecordMembershipCheckFailure()` |
-| `iam_delegation_up_availability_failures_total` | Counter | path | `RecordUPAvailabilityFailure(path)` |
+| `iam_delegation_membership_check_duration_seconds` | Histogram | — | `ObserveMembershipCheckDuration(seconds)` — legacy Tier 3; superseded by `platform_dependency_request_seconds{target_service="org_membership"}` |
+| `iam_delegation_membership_check_failures_total` | Counter | — | `RecordMembershipCheckFailure()` — legacy Tier 3 |
+| `iam_delegation_up_availability_failures_total` | Counter | path | `RecordUPAvailabilityFailure(path)` — legacy Tier 3 |
+| `iam_delegation_dependency_call_duration_seconds` | Histogram | target_service, endpoint | Legacy Tier 3 predecessor of `platform_dependency_request_seconds`; dual-emitted during compat period |
+| `iam_delegation_dependency_call_failures_total` | Counter | target_service, endpoint, outcome | Legacy Tier 3 predecessor of `platform_dependency_errors_total`; dual-emitted during compat period |
 | `iam_delegation_idempotency_hits_total` | Counter | — | `RecordIdempotencyHit()` |
-| `iam_delegation_cascade_processed_total` | Counter | — | `RecordCascadeProcessed()` |
-| `iam_delegation_cascade_dlq_total` | Counter | — | `RecordCascadeDLQ()` |
+| `iam_delegation_cascade_processed_total` | Counter | — | Legacy; use `platform_messages_processed_total{queue="delegation-cascade-q"}` |
+| `iam_delegation_cascade_dlq_total` | Counter | — | Legacy; use `platform_messages_failed_total{queue="delegation-cascade-q"}` |
+| `iam_delegation_processed_events_duplicates_total` | Counter | consumer | Legacy; use `platform_duplicate_messages_total` |
+| `iam_delegation_unknown_event_acknowledged_total` | Counter | consumer, event_type | Forward-compat acks |
 
 ## Alerting (LLD §14.5, DLG-D39)
 
@@ -181,15 +200,17 @@ GitHub Actions (`.github/workflows/`), all names/steps verified against current 
    Swagger staleness check → end-to-end tests (`make test-e2e`, `-tags=e2e` — genuinely exercises
    `cmd/server/e2e_test.go` against real Postgres/Valkey/floci containers as of DLG-D41; this step
    pre-dates that file and was previously a silent no-op re-run of the unit suite).
-2. **`validate-quality.yml`** (`Validate / Quality`) — on push/PR: a repo-specific check rejecting
-   HTML-escaped operators in workflow files, a repo-specific check rejecting non-transaction-local
-   `SET app.tenant_id` (RLS-6 enforcement, `.github/scripts/check-forbidden-set-guc.sh`), a
-   repo-specific check rejecting AWS SDK SNS/SQS bypass of `platform-events`
-   (`.github/scripts/check-forbidden-events-bypass.sh`, DLG-D45/D46), a repo-specific check
-   rejecting hand-rolled SQL against `outbox_events`
-   (`.github/scripts/check-outbox-access.sh`, DLG-D47), gofmt
-   check, `go mod tidy` drift check, `go vet`, `golangci-lint`, `govulncheck`, `go mod verify`,
-   Dockerfile base-image digest check.
+2. **`validate-quality.yml`** (`Validate / Quality`) — on push/PR: HTML-escaped operators check,
+   then **seven repo-specific enforcement scripts** (each exits non-zero on violation):
+   - `check-forbidden-set-guc.sh` — no session-scoped `SET app.tenant_id` (RLS-6)
+   - `check-forbidden-events-bypass.sh` — no direct SNS/SQS SDK calls, no hand-built `events.Envelope{}` literals, scans `cmd/ internal/ pkg/` (DLG-D45/D46)
+   - `check-outbox-access.sh` — no hand-rolled SQL against `outbox_events` (DLG-D47)
+   - `check-metric-namespacing.sh` — platform_* suffix rules, iam_delegation_* suffix rules, forbidden high-cardinality labels, required `platform_dependency_*` metrics
+   - `check-observability-compliance.sh` — logs/metrics/traces via platform-gincommon only (9 rules L-1..L-4, M-1..M-3, T-1..T-2)
+   - `check-platform-events-compliance.sh` — events/outbox/dedup via platform-events only (11 rules P-1..P-7, C-1..C-2, D-1..D-2)
+   - `check-pgcommon-compliance.sh` — DB connections/config/operations via platform-pgcommon only (11 rules PC-1..PC-3, CF-1..CF-3, TX-1..TX-3, OQ-1..OQ-2)
+
+   Then: gofmt check, `go mod tidy` drift, `go vet`, `golangci-lint`, `govulncheck`, `go mod verify`, Dockerfile base-image digest check.
 3. **`ci.yml`** (`CI`) — `build-image` job: Hadolint + `.dockerignore` check → Buildx build
    (**`linux/amd64` only**, not multi-platform) with GHCR cache → Trivy CVE scan (CRITICAL/HIGH/
    UNKNOWN, fails the build) + a second SARIF-upload scan to the GitHub Security tab → smoke tests

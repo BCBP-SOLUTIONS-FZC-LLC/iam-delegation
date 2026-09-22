@@ -25,14 +25,28 @@ grounded in the actual code (`internal/core/service/*.go`, `cmd/reconciler/jobs/
    two goroutines (delegator, delegate) over unbuffered-result channels and blocks on both before
    proceeding. Either erroring → `503 org_membership_unavailable`; either inactive → `422
    invalid_delegate`. This is a real concurrency pattern, not just two `await`s in sequence.
-5. **User Profile call happens AFTER both membership checks succeed, BEFORE the DB write**
-   (availability-first, DEL-6) — `SetAvailability` with `status=ooo`. A `port.ErrDependencyUnavailable`
-   → `503 user_profile_unavailable`; a `delegate_unavailable` substring match → `422
-   delegate_unavailable` (the delegate is themselves OOO); any other error → `422 invalid_delegate`.
-6. **Only then** `RunInTx{ Insert; enqueue DelegationStarted }` — the DB write and event enqueue are
+5. **Delegate OOO pre-flight (GAP-DEL-2, Sep-15 audit fix)** — `GetAvailability(delegate)` is
+   called **before** `SetAvailability`. This check owns the `starts_at` context that User Profile
+   never has: it blocks (→ `422 delegate_unavailable`) only when the delegate is already OOO during
+   the delegation window, not unconditionally. For an immediate delegation: blocks if
+   `snap.Status == "ooo"`. For a future-dated (`scheduled`) delegation: blocks only if
+   `snap.OOOUntil != nil && ooo_until.After(starts_at)` — the delegate may clear their OOO before
+   `starts_at`, so a current OOO status alone is not enough. This check lived nowhere before the
+   fix — User Profile's `SetAvailability` does not perform it.
+6. **User Profile `SetAvailability` call happens AFTER both membership checks and the pre-flight,
+   BEFORE the DB write** (availability-first, DEL-6). `ooo_until` sent to User Profile is
+   `ends_at` if set; for open-ended delegations (`ends_at IS NULL`), the **review deadline
+   (`review_due_at`) is used instead** — this clamps the User Profile OOO window to something
+   within UP's 180-day cap (review_window_days is 1..180 by policy) and closes the confirmed
+   cross-service bug (DLG-D29) where every open-ended Create was rejected with 422 because UP
+   unconditionally requires `ooo_until` whenever `status="ooo"`. A
+   `port.ErrDependencyUnavailable` → `503 user_profile_unavailable`; a `delegate_unavailable`
+   substring match → `422 delegate_unavailable`; any other error → `422 invalid_delegate`.
+7. **Only then** `RunInTx{ Insert; enqueue DelegationStarted }` — the DB write and event enqueue are
    the LAST step, after every external dependency has already succeeded. If the tx fails, User
-   Profile has already been told the user is OOO — this is a known, accepted small inconsistency
-   window (LLD's availability-first tradeoff), not a two-phase-commit.
+   Profile has already been told the user is OOO — the compensating clear fires
+   `ClearDelegatePointer(delegatorID)` best-effort before surfacing the error. This is a known,
+   accepted small inconsistency window (LLD's availability-first tradeoff), not a two-phase-commit.
 7. Idempotency record save (overwriting step 1's `"pending"` reservation with the final `{delegation_id, "created"}` record, same key/TTL) and cache invalidation happen **after** the tx commits, best-effort
    (`//nolint:errcheck` — a failed idempotency-save must never fail an already-committed create).
 
@@ -58,13 +72,15 @@ gap `Create` (above) opens: a genuinely future `starts_at` skips the User Profil
 
 ## Cancel (DLG-3) — `DelegationService.Cancel`
 
-**Asymmetric with Create**: the User Profile call here is fail-open, not fail-closed. `SetAvailability`
-with `ClearDelegate: true` is called and its error is explicitly discarded
-(`//nolint:errcheck // fail-open by design`) — cancellation proceeds to `RunInTx{ End; enqueue
-DelegationEnded{cancelled} }` regardless of whether the pointer-clear succeeded. Rationale (LLD
-§11.2): the delegation-expiry cron re-clears any stale pointer on its next tick (every 5 min), so a
-failed clear here is self-healing, not a correctness gap — unlike Create, where an availability
-failure would mean routing work to someone already OOO.
+**Asymmetric with Create**: the User Profile call here is fail-open, not fail-closed.
+`ClearDelegatePointer(delegatorID)` — a dedicated `DELETE /api/v1/internal/users/:id/availability/delegate`
+endpoint (Gap 3 / Sep-15 audit fix; replaces the earlier `SetAvailability{ClearDelegate:true}` approach
+which set the full availability state instead of only clearing the pointer) — is called and its error
+is explicitly discarded (`//nolint:errcheck // fail-open by design`). Cancellation proceeds to
+`RunInTx{ End; enqueue DelegationEnded{cancelled} }` regardless of whether the pointer-clear succeeded.
+Rationale (LLD §11.2): the delegation-expiry cron re-clears any stale pointer on its next tick (every
+5 min), so a failed clear here is self-healing, not a correctness gap — unlike Create, where an
+availability failure would mean routing work to someone already OOO.
 
 ## Extend (DLG-4) — `DelegationService.Extend`
 
@@ -72,7 +88,15 @@ Open-ended only (`ends_at IS NULL`; a fixed-`ends_at` row → `422 not_review_tr
 `extend_days` (if given) must be `[1,180]`. Window-days precedence: **caller's `extend_days` >
 per-delegation `ReviewWindowDays` override > tenant `delegation_tenant_settings` default** — read
 this order directly from `Extend`'s code, not just the LLD prose, since it's easy to get backwards.
-No User Profile call — extend never touches availability.
+
+**Post-extend User Profile resync (Sep-15 audit fix):** After `ExtendReview` succeeds in the DB,
+`SetAvailability(status="ooo", delegate_id, note, oooFrom=starts_at, oooUntil=new_review_due_at)`
+is called **fail-open** (`//nolint:errcheck // fail-open by design`). This re-syncs UP's `ooo_until`
+to the new (extended) `review_due_at`. Without this, User Profile's own OOO-expiry sweep would reset
+the delegator to `available` once the *original* (pre-extend) `review_due_at` lapsed, desynchronizing
+the state even though the delegation is still active. The call is fail-open because a failed resync
+just means UP's timestamp is stale — it does not make the delegation incorrect; the next extend or
+eventual expiry/review-cron clears the pointer authoritatively.
 
 ## Reassign (DLG-5) — `DelegationService.Reassign`
 
@@ -93,11 +117,11 @@ Both jobs live in `cmd/reconciler/jobs/` **and** are reachable via `POST
 `ExpiryRunner`/`ReviewRunner` interfaces, so the CronJob binary and the on-demand HTTP trigger call
 the exact same implementation — not two independently-maintained code paths.
 
-- **Expiry**: per candidate, User Profile pointer-clear first; on failure, `Deferred++`, the row
-  is left active for the next tick (DEL-6 self-retry), and `iam_delegation_expiry_deferred_total` is
-  incremented (GAP-27) — **it does not proceed to end the row on a UP failure**. Only after a
-  successful clear does it open a tenant-GUC-bound tx (`jctx.BindTenantGUC`) to `End` + enqueue
-  `DelegationEnded{expired}`. A concurrent end/cancel racing the same row
+- **Expiry**: per candidate, `ClearDelegatePointer(delegatorID)` first (dedicated DELETE endpoint,
+  Gap 3); on failure, `Deferred++`, the row is left active for the next tick (DEL-6 self-retry),
+  and `iam_delegation_expiry_deferred_total` is incremented (GAP-27) — **it does not proceed to
+  end the row on a UP failure**. Only after a successful clear does it open a tenant-GUC-bound tx
+  (`jctx.BindTenantGUC`) to `End` + enqueue `DelegationEnded{expired}`. A concurrent end/cancel racing the same row
   (`ErrDelegationNotFound`/`ErrOptimisticLockConflict`) is treated as `raced`, counted toward neither
   `Succeeded` nor `Failed`.
 - **Review-window**: two passes per tick, each independently GUC-bound per row — daily cascade warn
@@ -121,11 +145,10 @@ leaves before `starts_at` is cancelled rather than left to activate against a de
 inside one tx, but **event emission is asymmetric by design (DEL-7/DLG-EVT-4)**: only delegate-side
 rows get `DelegationEnded{delegate_removed}` enqueued — `if d.DelegateID != userID { continue }`
 skips enqueue entirely for delegator-side rows. Read this in `cascade_service.go` directly; it's
-easy to assume both sides fire an event. The User Profile pointer-clear for each affected delegator
-happens **after the tx commits**, outside the transaction, and is fire-and-forget
-(`//nolint:errcheck`) — the row is already ended and inert once the user has no membership (§7.6.5),
-so there's nothing to retry against; a failed clear here is not revisited by any cron (the expiry
-cron only scans still-*active* rows).
+easy to assume both sides fire an event. `ClearDelegatePointer(delegatorID)` for each affected delegator happens **after the tx commits**,
+outside the transaction, and is fire-and-forget (`//nolint:errcheck`) — the row is already ended
+and inert once the user has no membership (§7.6.5), so there's nothing to retry against; a failed
+clear here is not revisited by any cron (the expiry cron only scans still-*active* rows).
 
 ## Cascade removal — `CascadeService.EndForDisabledDelegate` (`UserUpdated{status:disabled}`, Bug 2/DLG-D26)
 
@@ -155,10 +178,11 @@ adds it.
 
 ## Cascade removal — `CascadeService.ScrubTenant` (`TenantMembershipsPurged`)
 
-Two plain soft-delete calls (`delegations.SoftDeleteTenant`, `settings.SoftDeleteTenant`), no event
+Two soft-delete calls (`delegations.SoftDeleteTenant`, `settings.SoftDeleteTenant`), no event
 emission at all — the LLD reasons that soft-deleted rows are inert, so nothing downstream needs to
-react. Not wrapped in a `RunInTx` — the two deletes are independent statements, not required to be
-atomic with each other.
+react. Both deletes are wrapped in a single `RunInTx` so they commit atomically — if the settings
+delete fails, the delegations delete rolls back too, keeping the two tables consistent.
+(Gap-7 fix: previous version of this doc incorrectly stated "not wrapped in RunInTx".)
 
 ## Cleanup job (`delegation-cleanup`, monthly) — `jobs.Cleanup`
 

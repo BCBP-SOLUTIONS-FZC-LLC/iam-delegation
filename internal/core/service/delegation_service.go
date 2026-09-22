@@ -10,7 +10,6 @@ package service
 import (
 	"context"
 	"errors"
-	"strings"
 	"time"
 	"unicode/utf8"
 
@@ -33,6 +32,7 @@ type DelegationService struct {
 	settings        port.SettingsRepository
 	membershipCheck port.MembershipCheckClient
 	userProfile     port.UserProfileClient
+	catalogAdmin    port.CatalogAdminClient // optional — nil degrades to presence-only scope_id check (GAP-020)
 	idempotency     port.IdempotencyStore
 	cache           port.Cache
 	txRunner        port.TxRunner
@@ -53,6 +53,15 @@ func NewDelegationService(
 		delegations: d, settings: settings, membershipCheck: membershipCheck,
 		userProfile: up, idempotency: idem, cache: cache, txRunner: txRunner,
 	}
+}
+
+// WithCatalogAdmin attaches an optional CatalogAdminClient for validating
+// scope="department" scope_ids against the global department catalog (GAP-020).
+// Nil is valid — when unset, department scope_id validation degrades to the
+// existing presence-only check in validateCreateInput.
+func (s *DelegationService) WithCatalogAdmin(c port.CatalogAdminClient) *DelegationService {
+	s.catalogAdmin = c
+	return s
 }
 
 // WithMetrics attaches an optional recorder. Nil is valid (no-op).
@@ -144,6 +153,22 @@ func (s *DelegationService) Create(ctx context.Context, tenantID, delegatorID uu
 		return nil, err
 	}
 
+	// GAP-020: validate scope="department" scope_id against the global
+	// department catalog. Runs after structural validation (presence/absence)
+	// and before any cross-service membership checks or DB writes, so an
+	// invalid department is rejected cheaply. Fail-closed on transport error
+	// (503 catalog_admin_unavailable). Skipped when catalogAdmin is nil —
+	// degrades to the presence-only check in validateCreateInput above.
+	if domain.DelegationScope(req.Scope) == domain.ScopeDepartment && req.ScopeID != nil && s.catalogAdmin != nil {
+		exists, active, caErr := s.catalogAdmin.DepartmentActive(ctx, *req.ScopeID)
+		if caErr != nil {
+			return nil, domain.NewError(domain.ErrCatalogAdminUnavailable, "catalog admin service is unavailable")
+		}
+		if !exists || !active {
+			return nil, domain.NewError(domain.ErrInvalidScopeID, "scope_id does not reference an active department in the catalog")
+		}
+	}
+
 	now := time.Now().UTC()
 	starts := now
 	if req.StartsAt != nil {
@@ -195,6 +220,25 @@ func (s *DelegationService) Create(ctx context.Context, tenantID, delegatorID uu
 	// activate immediately with no behavior change.
 	isScheduled := starts.After(now)
 
+	// GAP-DEL-2: delegate OOO pre-flight. UP never performed this check on
+	// SetAvailability — the prior strings.Contains path was permanently dead
+	// code. DEL owns the check here because it is the only party that knows
+	// starts_at: a delegate who is OOO until Sep 20 must not block a
+	// delegation that starts Sep 22.
+	snap, err := s.userProfile.GetAvailability(ctx, tenantID, req.DelegateID)
+	if err != nil {
+		if s.metrics != nil {
+			s.metrics.RecordUPAvailabilityFailure("create")
+		}
+		if errors.Is(err, port.ErrDependencyUnavailable) {
+			return nil, domain.NewError(domain.ErrUserProfileUnavailable, "user profile unavailable")
+		}
+		return nil, domain.NewError(domain.ErrUserProfileUnavailable, "user profile unavailable")
+	}
+	if snap.Status == "ooo" && (!isScheduled || (snap.OOOUntil != nil && snap.OOOUntil.After(starts))) {
+		return nil, domain.NewError(domain.ErrDelegateUnavailable, "delegate is currently unavailable (OOO)")
+	}
+
 	// reviewDueAt applies only to open-ended delegations (EndsAt == nil,
 	// DEL-8) and is computed here — before the UP call below, not inside
 	// RunInTx as previously — because it now doubles as the bound sent to
@@ -242,9 +286,6 @@ func (s *DelegationService) Create(ctx context.Context, tenantID, delegatorID uu
 			}
 			if errors.Is(err, port.ErrDependencyUnavailable) {
 				return nil, domain.NewError(domain.ErrUserProfileUnavailable, "user profile unavailable")
-			}
-			if strings.Contains(err.Error(), "delegate_unavailable") {
-				return nil, domain.NewError(domain.ErrDelegateUnavailable, "delegate is currently unavailable (OOO)")
 			}
 			return nil, domain.NewError(domain.ErrInvalidDelegate, "delegate validation failed via user profile")
 		}
@@ -300,9 +341,7 @@ func (s *DelegationService) Create(ctx context.Context, tenantID, delegatorID uu
 			// updated before this tx; if tx failed, clear the stale OOO
 			// pointer. Not needed when isScheduled: UP was never called.
 			//nolint:errcheck // best-effort: failure is logged by UP client; must not mask the original tx error
-			_ = s.userProfile.SetAvailability(ctx, port.SetAvailabilityRequest{
-				TenantID: tenantID, UserID: delegatorID, ClearDelegate: true,
-			})
+			_ = s.userProfile.ClearDelegatePointer(ctx, tenantID, delegatorID)
 		}
 		return nil, err
 	}
@@ -383,9 +422,7 @@ func (s *DelegationService) cancelInternal(ctx context.Context, tenantID, id uui
 	}
 	// fail-open by design (LLD §11.2): if UP is down, log
 	// and proceed — the expiry cron re-clears the pointer later (DEL-6).
-	if err := s.userProfile.SetAvailability(ctx, port.SetAvailabilityRequest{
-		TenantID: tenantID, UserID: d.DelegatorID, ClearDelegate: true,
-	}); err != nil && s.metrics != nil {
+	if err := s.userProfile.ClearDelegatePointer(ctx, tenantID, d.DelegatorID); err != nil && s.metrics != nil {
 		s.metrics.RecordUPAvailabilityFailure("cancel")
 	}
 	actorID := d.DelegatorID
