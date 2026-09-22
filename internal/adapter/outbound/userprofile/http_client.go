@@ -234,9 +234,9 @@ func (c *HTTPClient) setAvailability(ctx context.Context, req port.SetAvailabili
 
 	// 4xx business rejection — decode iam-user-profile's hybrid error envelope.
 	// UP returns extra fields beyond gincommon.ErrorResponse (code, message,
-	// details for 422) that this struct does not map; encoding/json ignores
-	// them since DisallowUnknownFields is not set. Reading only the error
-	// field is sufficient — it carries the same value as code.
+	// details for 422) that this struct does not map; encoding/json uses
+	// open/permissive decoding so unknown fields are silently ignored.
+	// Reading only the error field is sufficient — it carries the same value as code.
 	var errResp gincommon.ErrorResponse
 	if decErr := json.NewDecoder(httpx.LimitBody(resp.Body)).Decode(&errResp); decErr == nil && errResp.Error != "" {
 		return fmt.Errorf("userprofile: %s", errResp.Error)

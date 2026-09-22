@@ -6,6 +6,20 @@ import "github.com/swaggo/swag"
 const docTemplate = `{
     "schemes": {{ marshal .Schemes }},
     "swagger": "2.0",
+    "tags": [
+        {
+            "name": "delegations",
+            "description": "Out-of-office delegation lifecycle — DLG-1..7 (list, create, cancel, extend, reassign, settings get/set)"
+        },
+        {
+            "name": "internal",
+            "description": "Mesh-only internal API — DLG-I1..I4 (expiry sweep, review sweep, dept-delegate lookup, active-delegations escape-hatch)"
+        },
+        {
+            "name": "infra",
+            "description": "Health & readiness probes + AsyncAPI viewer (unauthenticated)"
+        }
+    ],
     "info": {
         "description": "{{escape .Description}}",
         "title": "{{.Title}}",

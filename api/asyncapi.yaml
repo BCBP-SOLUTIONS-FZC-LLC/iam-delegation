@@ -473,6 +473,8 @@ components:
         Consumed by this service (not published). Produced by Core / Org &
         Membership on iam.membership.events; drives
         CascadeService.EndForUser (§11.5, DLG-Q4/DLG-D14).
+      x-lifecycle:
+        status: active
       tags:
         - $ref: '#/components/tags/consumed'
       contentType: application/json
@@ -506,6 +508,8 @@ components:
         CascadeService.ScrubTenant (§11.6, DLG-Q4/DLG-D14). Renamed by
         Core from TenantOffboarded to avoid colliding with RP's event of
         that name.
+      x-lifecycle:
+        status: active
       tags:
         - $ref: '#/components/tags/consumed'
       contentType: application/json
@@ -544,6 +548,8 @@ components:
         CascadeService.EndForDisabledDelegate (§11.5a). Only the fields
         this service actually reads are documented below — User Profile's
         own contract carries more (email, other changed_fields).
+      x-lifecycle:
+        status: active
       tags:
         - $ref: '#/components/tags/consumed'
       contentType: application/json
@@ -585,9 +591,11 @@ components:
         user_agent:  { type: string, description: iam-delegation/<cron>-cron on cron-origin events }
 
     DelegationStartedPayload:
+      additionalProperties: true
       allOf:
         - $ref: '#/components/schemas/EventEnvelope'
         - type: object
+          additionalProperties: true
           required: [delegation_id, delegator_id, delegate_id, scope, starts_at]
           properties:
             delegation_id: { type: string, format: uuid }
@@ -601,9 +609,11 @@ components:
             actor_id:      { type: string, format: uuid, description: Who triggered this create/reassign — the requestctx caller, or a system sentinel on the create leg of an automated flow. }
 
     DelegationEndedPayload:
+      additionalProperties: true
       allOf:
         - $ref: '#/components/schemas/EventEnvelope'
         - type: object
+          additionalProperties: true
           required: [delegation_id, delegator_id, delegate_id, ended_reason]
           properties:
             delegation_id: { type: string, format: uuid }
@@ -616,9 +626,11 @@ components:
             actor_id:      { type: string, format: uuid, description: Who triggered the end — the requestctx caller for cancel/reassign, or SystemActorID for cron/cascade-driven ends. }
 
     DelegationReviewRequestedPayload:
+      additionalProperties: true
       allOf:
         - $ref: '#/components/schemas/EventEnvelope'
         - type: object
+          additionalProperties: true
           required: [delegation_id, delegator_id, delegate_id, days_remaining]
           properties:
             delegation_id: { type: string, format: uuid }
@@ -631,9 +643,11 @@ components:
             actor_id:      { type: string, format: uuid, description: Always SystemActorID — this only ever fires from the review-sweep cron. }
 
     DelegationEscalationRequestedPayload:
+      additionalProperties: true
       allOf:
         - $ref: '#/components/schemas/EventEnvelope'
         - type: object
+          additionalProperties: true
           required: [delegation_id, delegator_id, delegate_id, reason]
           properties:
             delegation_id: { type: string, format: uuid }
@@ -650,6 +664,7 @@ components:
     # as produced upstream (internal/core/domain/event_payloads.go).
     MembershipRevokedPayload:
       type: object
+      additionalProperties: true
       required: [tenant_id, user_id, actor_id]
       properties:
         tenant_id: { type: string, format: uuid }
@@ -658,6 +673,7 @@ components:
 
     TenantMembershipsPurgedPayload:
       type: object
+      additionalProperties: true
       required: [tenant_id, actor_id]
       properties:
         tenant_id: { type: string, format: uuid }
@@ -665,6 +681,7 @@ components:
 
     UserUpdatedPayload:
       type: object
+      additionalProperties: true
       description: |
         Flat, no EventEnvelope allOf — mirrors the subset of
         iam-user-profile's UserUpdatedPayload this service actually reads

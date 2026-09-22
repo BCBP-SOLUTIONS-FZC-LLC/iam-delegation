@@ -1,47 +1,64 @@
 {
   "$schema": "http://json-schema.org/draft-07/schema#",
   "title": "DelegationReviewRequestedPayload",
-  "description": "Payload of the DelegationReviewRequested event (LLD §10.3/§10.5). Emitted by the delegation-review sweep once per calendar day for each of the 3 days before review_due_at (DLG-I2, DLG-Q6's 3-day daily cascade). Carries days_remaining rather than review_due_at — review_due_at does not exist in this service's shape.",
   "type": "object",
-  "required": [
-    "delegation_id",
-    "delegator_id",
-    "delegate_id",
-    "days_remaining"
-  ],
   "additionalProperties": true,
-  "properties": {
-    "delegation_id": {
-      "type": "string",
-      "format": "uuid"
+  "properties": {},
+  "allOf": [
+    {
+      "$ref": "#/components/schemas/EventEnvelope"
     },
-    "tenant_id": {
-      "type": "string",
-      "format": "uuid"
-    },
-    "delegator_id": {
-      "type": "string",
-      "format": "uuid"
-    },
-    "delegate_id": {
-      "type": "string",
-      "format": "uuid"
-    },
-    "scope": {
-      "type": "string",
-      "enum": ["all", "department", "tender"]
-    },
-    "scope_id": {
-      "type": "string",
-      "format": "uuid"
-    },
-    "days_remaining": {
-      "type": "integer",
-      "enum": [3, 2, 1]
-    },
-    "actor_id": {
-      "type": "string",
-      "format": "uuid"
+    {
+      "type": "object",
+      "additionalProperties": true,
+      "required": [
+        "delegation_id",
+        "delegator_id",
+        "delegate_id",
+        "days_remaining"
+      ],
+      "properties": {
+        "delegation_id": {
+          "type": "string",
+          "format": "uuid"
+        },
+        "tenant_id": {
+          "type": "string",
+          "format": "uuid"
+        },
+        "delegator_id": {
+          "type": "string",
+          "format": "uuid"
+        },
+        "delegate_id": {
+          "type": "string",
+          "format": "uuid"
+        },
+        "scope": {
+          "type": "string",
+          "enum": [
+            "all",
+            "department",
+            "tender"
+          ]
+        },
+        "scope_id": {
+          "type": "string",
+          "format": "uuid"
+        },
+        "days_remaining": {
+          "type": "integer",
+          "enum": [
+            3,
+            2,
+            1
+          ]
+        },
+        "actor_id": {
+          "type": "string",
+          "format": "uuid"
+        }
+      }
     }
-  }
+  ]
 }

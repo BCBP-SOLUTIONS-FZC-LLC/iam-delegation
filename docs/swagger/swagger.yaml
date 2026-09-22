@@ -605,6 +605,13 @@ paths:
       summary: Readiness check
       tags:
       - infra
+tags:
+- description: Out-of-office delegation lifecycle — DLG-1..7 (list, create, cancel, extend, reassign, settings get/set)
+  name: delegations
+- description: Mesh-only internal API — DLG-I1..I4 (expiry sweep, review sweep, dept-delegate lookup, active-delegations escape-hatch)
+  name: internal
+- description: "Health & readiness probes + AsyncAPI viewer (unauthenticated)"
+  name: infra
 securityDefinitions:
   TenantID:
     description: Tenant UUID injected by the API gateway.
