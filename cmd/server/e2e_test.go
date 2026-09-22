@@ -20,6 +20,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strconv"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -398,11 +399,20 @@ func newFakeUserProfile() *fakeUserProfile {
 		body, _ := io.ReadAll(r.Body)
 		var decoded map[string]any
 		_ = json.Unmarshal(body, &decoded)
-		// path: /api/v1/internal/users/{userID}/availability
-		parts := bytes.Split([]byte(r.URL.Path), []byte("/"))
+		// Paths handled:
+		//   PUT    /api/v1/internal/users/{userID}/availability
+		//   DELETE /api/v1/internal/users/{userID}/availability/delegate
+		//   GET    /api/v1/users/{userID}/availability
+		// The user ID is always the segment immediately after "users/".
+		// Using parts[len-2] was wrong for the DELETE path: it returned
+		// "availability" instead of the UUID (Gap 3 fix added the /delegate suffix).
+		parts := strings.Split(r.URL.Path, "/")
 		userID := ""
-		if len(parts) >= 2 {
-			userID = string(parts[len(parts)-2])
+		for i, p := range parts {
+			if p == "users" && i+1 < len(parts) {
+				userID = parts[i+1]
+				break
+			}
 		}
 		f.mu.Lock()
 		f.calls = append(f.calls, availabilityCall{UserID: userID, Body: decoded})
