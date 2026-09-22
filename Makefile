@@ -359,9 +359,17 @@ schema-pull:
 # (1) structure, (2) draft-07, (3) enum drift, (4) lifecycle annotations,
 # (5) open-schema guard, (6) consumer strict-mode, (7) coverage, (8) AsyncAPI structure.
 # No AWS credentials needed.
+#
+# NOTE: intentionally does NOT depend on extract-schemas (DLG-D20).
+# internal/eventschema/*.json are hand-maintained and are the authoritative source
+# for ValidatingCodec at event enqueue time. extract-schemas generates schemas
+# containing $ref to EventEnvelope which the JSON Schema resolver cannot follow
+# outside asyncapi.yaml context — running it overwrites the hand-maintained files
+# and breaks server startup. Run extract-schemas separately for inspection only;
+# never commit its output unless manually verified to be $ref-free.
 .PHONY: schema-validate
-schema-validate: extract-schemas
-	docker run --rm --platform linux/amd64 \
+schema-validate:
+	docker run --rm --platform "$(SCHEMA_GOV_PLATFORM)" \
 	  -v "$(CURDIR)":/workspace \
 	  "$(SCHEMA_GOV_IMAGE)" validate \
 	  --asyncapi   api/asyncapi.yaml \

@@ -1,67 +1,47 @@
 {
   "$schema": "http://json-schema.org/draft-07/schema#",
   "title": "DelegationEndedPayload",
+  "description": "Payload of the DelegationEnded event (LLD §10.3/§10.5). Fires on every end path — cancel, ends_at expiry, review auto-end, delegate-removed cascade, delegate-disabled cascade (Bug 2/DLG-D26) — never path-dependent. The delegator-side removal ends silently, no event (DEL-7/DLG-EVT-4).",
   "type": "object",
+  "required": [
+    "delegation_id",
+    "delegator_id",
+    "delegate_id",
+    "ended_reason"
+  ],
   "additionalProperties": true,
-  "properties": {},
-  "allOf": [
-    {
-      "$ref": "#/components/schemas/EventEnvelope"
+  "properties": {
+    "delegation_id": {
+      "type": "string",
+      "format": "uuid"
     },
-    {
-      "type": "object",
-      "additionalProperties": true,
-      "required": [
-        "delegation_id",
-        "delegator_id",
-        "delegate_id",
-        "ended_reason"
-      ],
-      "properties": {
-        "delegation_id": {
-          "type": "string",
-          "format": "uuid"
-        },
-        "tenant_id": {
-          "type": "string",
-          "format": "uuid"
-        },
-        "delegator_id": {
-          "type": "string",
-          "format": "uuid"
-        },
-        "delegate_id": {
-          "type": "string",
-          "format": "uuid"
-        },
-        "scope": {
-          "type": "string",
-          "enum": [
-            "all",
-            "department",
-            "tender"
-          ]
-        },
-        "scope_id": {
-          "type": "string",
-          "format": "uuid"
-        },
-        "ended_reason": {
-          "type": "string",
-          "enum": [
-            "expired",
-            "cancelled",
-            "reassigned",
-            "delegate_removed",
-            "review_expired",
-            "delegate_disabled"
-          ]
-        },
-        "actor_id": {
-          "type": "string",
-          "format": "uuid"
-        }
-      }
+    "tenant_id": {
+      "type": "string",
+      "format": "uuid"
+    },
+    "delegator_id": {
+      "type": "string",
+      "format": "uuid"
+    },
+    "delegate_id": {
+      "type": "string",
+      "format": "uuid"
+    },
+    "scope": {
+      "type": "string",
+      "enum": ["all", "department", "tender"]
+    },
+    "scope_id": {
+      "type": "string",
+      "format": "uuid"
+    },
+    "ended_reason": {
+      "type": "string",
+      "enum": ["expired", "cancelled", "reassigned", "delegate_removed", "review_expired", "delegate_disabled"]
+    },
+    "actor_id": {
+      "type": "string",
+      "format": "uuid"
     }
-  ]
+  }
 }

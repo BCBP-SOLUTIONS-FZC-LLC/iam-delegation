@@ -1,6 +1,7 @@
 {
   "$schema": "http://json-schema.org/draft-07/schema#",
   "title": "UserUpdatedPayload",
+  "description": "Subset of iam-user-profile's UserUpdatedPayload consumed by this service on delegation-cascade-q (Bug 2/DLG-D26) to drive CascadeService.EndForDisabledDelegate when status=disabled. Only the fields this service actually reads are declared; additionalProperties:true allows the full user-profile payload to pass through. Mirrors internal/core/domain/event_payloads.go UserUpdatedPayload exactly.",
   "type": "object",
   "required": [
     "user_id",
@@ -10,21 +11,18 @@
   "properties": {
     "user_id": {
       "type": "string",
-      "format": "uuid"
+      "format": "uuid",
+      "description": "The user whose profile was updated."
     },
     "changed_fields": {
       "type": "array",
-      "items": {
-        "type": "string"
-      }
+      "items": { "type": "string" },
+      "description": "List of field names that changed. This service dispatches only when 'status' is present."
     },
     "status": {
       "type": "string",
-      "enum": [
-        "active",
-        "disabled",
-        "deleted"
-      ]
+      "enum": ["active", "disabled", "deleted"],
+      "description": "Populated only when 'status' is in changed_fields. This service dispatches only on 'disabled'."
     }
   }
 }

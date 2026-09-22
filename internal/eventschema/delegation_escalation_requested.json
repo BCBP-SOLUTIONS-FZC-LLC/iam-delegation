@@ -1,62 +1,47 @@
 {
   "$schema": "http://json-schema.org/draft-07/schema#",
   "title": "DelegationEscalationRequestedPayload",
+  "description": "Payload of the DelegationEscalationRequested event (Bug 2a). Fired alongside DelegationEnded, in the same transaction, whenever a delegation ends because the delegate was disabled (reason=delegate_disabled) — this service owns no org-structure data, so it escalates to tenant_admin/tenant_owner rather than a supervisor/team-lead concept it doesn't have. Notify-only: this service never auto-creates a replacement delegation.",
   "type": "object",
+  "required": [
+    "delegation_id",
+    "delegator_id",
+    "delegate_id",
+    "reason"
+  ],
   "additionalProperties": true,
-  "properties": {},
-  "allOf": [
-    {
-      "$ref": "#/components/schemas/EventEnvelope"
+  "properties": {
+    "delegation_id": {
+      "type": "string",
+      "format": "uuid"
     },
-    {
-      "type": "object",
-      "additionalProperties": true,
-      "required": [
-        "delegation_id",
-        "delegator_id",
-        "delegate_id",
-        "reason"
-      ],
-      "properties": {
-        "delegation_id": {
-          "type": "string",
-          "format": "uuid"
-        },
-        "tenant_id": {
-          "type": "string",
-          "format": "uuid"
-        },
-        "delegator_id": {
-          "type": "string",
-          "format": "uuid"
-        },
-        "delegate_id": {
-          "type": "string",
-          "format": "uuid"
-        },
-        "scope": {
-          "type": "string",
-          "enum": [
-            "all",
-            "department",
-            "tender"
-          ]
-        },
-        "scope_id": {
-          "type": "string",
-          "format": "uuid"
-        },
-        "reason": {
-          "type": "string",
-          "enum": [
-            "delegate_disabled"
-          ]
-        },
-        "actor_id": {
-          "type": "string",
-          "format": "uuid"
-        }
-      }
+    "tenant_id": {
+      "type": "string",
+      "format": "uuid"
+    },
+    "delegator_id": {
+      "type": "string",
+      "format": "uuid"
+    },
+    "delegate_id": {
+      "type": "string",
+      "format": "uuid"
+    },
+    "scope": {
+      "type": "string",
+      "enum": ["all", "department", "tender"]
+    },
+    "scope_id": {
+      "type": "string",
+      "format": "uuid"
+    },
+    "reason": {
+      "type": "string",
+      "enum": ["delegate_disabled"]
+    },
+    "actor_id": {
+      "type": "string",
+      "format": "uuid"
     }
-  ]
+  }
 }
