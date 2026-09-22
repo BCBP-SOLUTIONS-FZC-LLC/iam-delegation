@@ -62,6 +62,7 @@ name: Schema Registry Prune
 
 permissions:
   contents: read
+  packages: read
 
 env:
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: 'true'
@@ -98,7 +99,7 @@ jobs:
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
-          password: ${{ secrets.GO_PRIVATE_TOKEN }}
+          password: ${{ secrets.GITHUB_TOKEN }}
 
       # Schedule always runs dry-run (generates a monthly candidate report).
       # workflow_dispatch respects the dry_run input; un-check to execute.
@@ -186,7 +187,7 @@ jobs:
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
-          password: ${{ secrets.GO_PRIVATE_TOKEN }}
+          password: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Prune orphaned schemas
         env:

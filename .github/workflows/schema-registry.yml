@@ -118,7 +118,7 @@ jobs:
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
-          password: ${{ secrets.GO_PRIVATE_TOKEN }}
+          password: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Pull schema-gov image
         run: docker pull "${{ env.SCHEMA_GOV_IMAGE }}"
@@ -392,7 +392,7 @@ jobs:
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
-          password: ${{ secrets.GO_PRIVATE_TOKEN }}
+          password: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Pull schema-gov image
         run: docker pull "${{ env.SCHEMA_GOV_IMAGE }}"
@@ -663,7 +663,7 @@ jobs:
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
-          password: ${{ secrets.GO_PRIVATE_TOKEN }}
+          password: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Pull schema-gov image
         run: docker pull "${{ env.SCHEMA_GOV_IMAGE }}"

@@ -19,6 +19,7 @@ name: Validate / Test
 
 permissions:
   contents: read
+  packages: read
 
 env:
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: 'true'
@@ -109,6 +110,27 @@ jobs:
       # committed artifacts (docs/swagger/) are stale.
       - name: Swagger staleness check
         run: bash .github/scripts/check-swagger-stale.sh
+
+      # Validate AsyncAPI spec + event schemas via platform-schemagov (8 passes).
+      # Mirrors iam-user-profile's validate-test.yml schema-gov check.
+      # packages: read permission (workflow-level) lets GITHUB_TOKEN pull the image.
+      - name: Log in to GHCR
+        uses: docker/login-action@v4.6.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Schema governance — validate AsyncAPI + event schemas
+        env:
+          SCHEMA_GOV_IMAGE: ghcr.io/bcbp-solutions-fzc-llc/platform-schemagov:0.4
+        run: |
+          docker run --rm --platform linux/amd64 \
+            -v "${{ github.workspace }}":/workspace \
+            -e GITHUB_ACTIONS \
+            "${SCHEMA_GOV_IMAGE}" validate \
+            --asyncapi   api/asyncapi.yaml \
+            --schema-dir internal/eventschema
 
       # End-to-end tests exercise the full HTTP router (DLG-1..7, DLG-I1..I4)
       # against real Postgres+Valkey, plus the cascade SQS consumer and both
