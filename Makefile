@@ -407,10 +407,14 @@ swag-check:
 # regenerate them first.
 SCHEMA_GOV_IMAGE ?= ghcr.io/bcbp-solutions-fzc-llc/platform-schemagov:0.4
 
+# SCHEMA_GOV_PLATFORM: force linux/amd64 on Apple Silicon (the image has no arm64 manifest;
+# Docker's Rosetta emulation on M-series Macs runs amd64 containers transparently).
+SCHEMA_GOV_PLATFORM ?= linux/amd64
+
 # schema-pull: pull the platform-schemagov Docker image.
 .PHONY: schema-pull
 schema-pull:
-	docker pull "$(SCHEMA_GOV_IMAGE)"
+	docker pull --platform "$(SCHEMA_GOV_PLATFORM)" "$(SCHEMA_GOV_IMAGE)"
 
 # schema-validate: validate AsyncAPI spec + event schemas — 8 passes:
 # (1) structure, (2) draft-07, (3) enum drift, (4) lifecycle annotations,
@@ -418,7 +422,7 @@ schema-pull:
 # No AWS credentials needed.
 .PHONY: schema-validate
 schema-validate:
-	docker run --rm \
+	docker run --rm --platform "$(SCHEMA_GOV_PLATFORM)" \
 	  -v "$(CURDIR)":/workspace \
 	  "$(SCHEMA_GOV_IMAGE)" validate \
 	  --asyncapi   api/asyncapi.yaml \
@@ -433,7 +437,7 @@ schema-diff:
 	  echo "Usage: make schema-diff CURRENT=<current.json> PROPOSED=<proposed.json> [SCHEMA_NAME=<name>]"; \
 	  exit 1; \
 	}
-	docker run --rm \
+	docker run --rm --platform "$(SCHEMA_GOV_PLATFORM)" \
 	  -v "$(CURDIR)":/workspace \
 	  "$(SCHEMA_GOV_IMAGE)" diff \
 	  --current     "$(CURRENT)" \
@@ -449,7 +453,7 @@ schema-prune:
 	  echo "GLUE_REGISTRY_NAME is not set — add it to .env or pass on the command line"; \
 	  exit 1; \
 	}
-	docker run --rm \
+	docker run --rm --platform "$(SCHEMA_GOV_PLATFORM)" \
 	  -v "$(CURDIR)":/workspace \
 	  -e AWS_ACCESS_KEY_ID \
 	  -e AWS_SECRET_ACCESS_KEY \
@@ -467,7 +471,7 @@ schema-register:
 	  echo "GLUE_REGISTRY_NAME is not set — add it to .env or pass on the command line"; \
 	  exit 1; \
 	}
-	docker run --rm \
+	docker run --rm --platform "$(SCHEMA_GOV_PLATFORM)" \
 	  -v "$(CURDIR)":/workspace \
 	  -e AWS_ACCESS_KEY_ID \
 	  -e AWS_SECRET_ACCESS_KEY \
