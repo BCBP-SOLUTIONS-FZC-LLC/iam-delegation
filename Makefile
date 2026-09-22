@@ -15,19 +15,35 @@ export GONOSUMDB  ?= github.com/BCBP-SOLUTIONS-FZC-LLC/*
 
 export APP_NAME APP_ENV BUILD_VERSION
 
-# Test package groups (explicit to handle per-group build tags cleanly)
-TEST_UNIT_PKGS     := ./test/unit/...
-TEST_POSTGRES_PKGS := ./test/postgres/...
-TEST_INT_PKGS      := ./test/integration/...
-TEST_E2E_PKGS      := ./test/e2e/...
+# Test package groups.
+# This service has no separate test/ directory — all tests are colocated
+# white-box (*_test.go next to the source, package-internal). TEST_UNIT_PKGS,
+# TEST_POSTGRES_PKGS, and TEST_INT_PKGS are intentionally empty; CI suites
+# that would normally run those directories are no-ops here.
+TEST_UNIT_PKGS     :=
+TEST_POSTGRES_PKGS :=
+TEST_INT_PKGS      :=
+TEST_E2E_PKGS      := ./cmd/server/...
 
-# White-box (package-internal) tests that need no Docker.
-# Included in unit runs and coverage but kept separate so they build cleanly.
-TEST_INTERNAL_PKGS := ./internal/adapter/inbound/http/... \
+# All colocated white-box tests — every package in this service that has
+# *_test.go files. Run without Docker for unit suite; some need testcontainers
+# (valkey, postgres) and are guarded by t.Skip when the container isn't up.
+TEST_INTERNAL_PKGS := ./internal/adapter/inbound/consumer/... \
+                      ./internal/adapter/inbound/http/... \
+                      ./internal/adapter/outbound/catalogadmin/... \
                       ./internal/adapter/outbound/eventbus/... \
+                      ./internal/adapter/outbound/httpx/... \
+                      ./internal/adapter/outbound/metrics/... \
+                      ./internal/adapter/outbound/orgmembership/... \
                       ./internal/adapter/outbound/postgres/... \
-                      ./internal/adapter/outbound/s3/... \
-                      ./internal/core/service/...
+                      ./internal/adapter/outbound/tender/... \
+                      ./internal/adapter/outbound/userprofile/... \
+                      ./internal/adapter/outbound/valkey/... \
+                      ./internal/core/domain/... \
+                      ./internal/core/service/... \
+                      ./pkg/... \
+                      ./cmd/reconciler/... \
+                      ./cmd/server/...
 
 # Source packages measured for coverage (excludes test helpers and cmd).
 # Uses tr+sed instead of paste -sd, because macOS BSD paste rejects combined flags.
@@ -128,20 +144,19 @@ _test-unit: | .coverage
 
 .PHONY: _test-postgres
 _test-postgres: | .coverage
-	$(GO) test $(TEST_POSTGRES_PKGS) \
-	  -tags=integration -race -count=1 -timeout 300s \
-	  -coverpkg=$(COVER_PKG_LIST) \
-	  -coverprofile=.coverage/postgres.out
+	@# No separate postgres test directory — all tests are colocated (see TEST_INTERNAL_PKGS).
+	@# Create an empty profile so _merge-coverage has a valid input file.
+	@echo "mode: atomic" > .coverage/postgres.out
 
 .PHONY: _test-integration
 _test-integration: | .coverage
-	$(GO) test $(TEST_INT_PKGS) \
-	  -tags=integration -race -count=1 -timeout 300s \
-	  -coverpkg=$(COVER_PKG_LIST) \
-	  -coverprofile=.coverage/integration.out
+	@# No separate integration test directory — all tests are colocated (see TEST_INTERNAL_PKGS).
+	@# Create an empty profile so _merge-coverage has a valid input file.
+	@echo "mode: atomic" > .coverage/integration.out
 
 # Merge the three per-suite profiles into a single coverage.out.
 # Takes the MAX count per block so any suite covering a block is reflected.
+# merge_coverage.py handles empty/missing profiles gracefully (FileNotFoundError pass).
 .PHONY: _merge-coverage
 _merge-coverage:
 	@python3 scripts/merge_coverage.py \
@@ -161,11 +176,9 @@ _test-unit-plain:
 	$(GO) test $(TEST_UNIT_PKGS) $(TEST_INTERNAL_PKGS) \
 	  -count=1 -timeout 120s -v
 _test-postgres-plain:
-	$(GO) test $(TEST_POSTGRES_PKGS) \
-	  -tags=integration -count=1 -timeout 300s -v
+	@echo "No separate postgres test directory — skipping (tests are colocated)."
 _test-integration-plain:
-	$(GO) test $(TEST_INT_PKGS) \
-	  -tags=integration -count=1 -timeout 300s -v
+	@echo "No separate integration test directory — skipping (tests are colocated)."
 
 # ── test-ci: parallel + race + coverage (used by CI / 'make ci') ─────────────
 # All three suites run concurrently; profiles are merged into coverage.out.
