@@ -236,8 +236,8 @@ build:
 
 .PHONY: docker-up
 docker-up:
-	@echo "Starting local PostgreSQL + PgBouncer + Valkey + floci (S3/SNS/SQS/Glue)..."
-	docker compose up -d postgres pgbouncer redis floci floci-ui
+	@echo "Starting local PostgreSQL + Valkey + floci (SNS/SQS/Glue) + floci-ui..."
+	docker compose up -d postgres valkey floci floci-ui
 
 .PHONY: docker-down
 docker-down:
