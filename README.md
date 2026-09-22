@@ -551,6 +551,68 @@ offset from the sibling IAM services' own stacks so multiple can run side-by-sid
 `CASCADE_QUEUE_URL` — the process fails fast at startup if any of these five is empty (the last
 two unconditionally; the dependency base URLs via their client constructors).
 
+---
+
+## Cross-service dependencies
+
+### 1. Synchronous outbound calls (this service → other services)
+
+List and read-only endpoints (DLG-1, DLG-6, DLG-I1..I4) have **no** synchronous cross-service dependency — Postgres + Valkey only.
+
+| Operation | Dependency | Adapter package | Posture | On failure |
+|---|---|---|---|---|
+| Create — delegator/delegate membership-existence check (DLG-2) | `iam-org-membership` | `outbound/orgmembership/` | fail-closed | `503 org_membership_unavailable` — no delegation written |
+| Create — delegate availability check (DLG-2) | `iam-user-profile` | `outbound/userprofile/` | fail-closed | `503 user_profile_unavailable` — no delegation written |
+| `delegation-activation` CronJob — set OOO pointer on flip `scheduled → active` | `iam-user-profile` | `outbound/userprofile/` | fail-closed (activation aborted) | Activation skipped; retried next 5-min cycle |
+| Cancel (DLG-3) — clear OOO pointer | `iam-user-profile` | `outbound/userprofile/` | fail-open | Cancel commits; pointer cleared best-effort |
+| Reassign (DLG-5) — new delegate membership-existence check | `iam-org-membership` | `outbound/orgmembership/` | fail-closed | `503 org_membership_unavailable` — no change committed |
+| `delegation-expiry` CronJob — clear OOO pointer on expiry | `iam-user-profile` | `outbound/userprofile/` | fail-open (self-retrying) | Expiry retried next 5-min cycle until pointer clears |
+| Cascade end (MembershipRevoked / delegate-disabled) — clear OOO pointer | `iam-user-profile` | `outbound/userprofile/` | fail-open | Delegation ends; pointer cleared best-effort |
+| Tender-scope lookup (§7.6.7, DLG-D13) | Tender Service | `outbound/tender/` | — | Not yet wired in `cmd/server` — built and tested, pending Tender's endpoint |
+
+### 2. Inbound callers (other services → this service)
+
+| Caller | Endpoints used | Purpose |
+|---|---|---|
+| **`iam-org-membership`** | DLG-I3 `GET /internal/delegations/dept-delegate` | Dept-scope precision leg of the delegate-impact pre-check (§8.8.4) — degrades to tenant-wide scoping on failure, never a hard error from the caller's perspective |
+| **Operator / SRE tooling** | DLG-I1 `POST /internal/delegations/expire`, DLG-I2 `POST /internal/delegations/review-sweep` | On-demand trigger for the expiry / review-warning sweep (same code as the CronJob binaries, DLG-D17) |
+
+`DLG-I4 GET /internal/users/:id/active-delegations` is the escape-hatch replacement for Core's dropped `active_delegations[]` embed — registered and functional, unused by any caller today.
+
+### 3. Async event dependencies
+
+**Events this service consumes** (`delegation-cascade-q`):
+
+| Producer topic | Event | Consumer bucket | Dispatched to |
+|---|---|---|---|
+| `iam.membership.events` (Core) | `MembershipRevoked` | `cascade` | `CascadeService.EndForUser` — ends every delegation where the user is delegator or delegate |
+| `iam.membership.events` (Core) | `TenantMembershipsPurged` | `offboarding` | `CascadeService.ScrubTenant` — soft-deletes the tenant's rows |
+| `iam.user.events` (User Profile) | `UserUpdated` (`status=="disabled"` only; other deliveries acked without dispatch) | `delegate_disable` | `CascadeService.EndForDisabledDelegate` — ends every active/scheduled delegation where the disabled user is the delegate; **note:** subscription not yet provisioned in any environment (DLG-D26 pre-deploy gap) |
+
+At-least-once delivery, deduped via `processed_events (event_id, consumer)`. DLQ: `delegation-cascade-q-dlq`, `maxReceiveCount=5`.
+
+**Events this service produces** (`iam.delegation.events`) and their downstream consumers:
+
+| Consumer | Queue | Events consumed |
+|---|---|---|
+| **Audit Log Service** | `delegation-audit-q` | Catch-all — every event on the topic |
+| **Workflow Service** | `delegation-workflow-q` | `DelegationStarted`, `DelegationEnded` — reroute and restore work on delegation lifecycle changes (LLD §10.5) |
+| **Notification Service** | `delegation-notification-q` | `DelegationReviewRequested`, `DelegationEscalationRequested` — review warnings and tenant-admin/tenant-owner escalation on delegate-disabled end |
+
+**Idempotency:** record the envelope `id` (UUID v7) against your own consumer name before committing any side effect — delivery is at-least-once. **Ordering:** SNS does not guarantee delivery order; this service's own consumer handles it via `processed_events (event_id, consumer)` dedup with three distinct consumer buckets.
+
+### 4. Infrastructure dependencies
+
+| System | Role |
+|---|---|
+| **PostgreSQL** (`delegation` DB) | Primary store — `delegations` and `delegation_tenant_settings` tables, `FORCE ROW LEVEL SECURITY`; `processed_events` is RLS-exempt; PgBouncer transaction pooling in production |
+| **Valkey** (Redis-compatible) | List cache (`del:list:{tenant}:{delegator}`, 60 s TTL) and idempotency store (`del:idem:*`, 24 h default TTL) |
+| **AWS SNS** | One topic: `iam.delegation.events` (4 event types — `DelegationStarted`, `DelegationEnded`, `DelegationReviewRequested`, `DelegationEscalationRequested`) |
+| **AWS SQS** | `delegation-cascade-q` (with `delegation-cascade-q-dlq`, `maxReceiveCount=5`) |
+| **AWS Glue Schema Registry** | `iam-delegation-events` — wire-format validation for all 4 published event schemas at publish time |
+
+---
+
 ## Out of scope
 
 | Concern | Owner |

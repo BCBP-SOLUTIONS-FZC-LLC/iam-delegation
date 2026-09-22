@@ -20,6 +20,8 @@ type config struct {
 	UserProfileTimeout   time.Duration
 	OrgMembershipBaseURL string
 	OrgMembershipTimeout time.Duration
+	CatalogAdminBaseURL  string // optional — empty disables department scope_id validation (GAP-020)
+	CatalogAdminTimeout  time.Duration
 
 	ValkeyAddr     string
 	IdempotencyTTL time.Duration
@@ -65,6 +67,7 @@ func loadConfig() (config, error) {
 		MetricsPort:          getEnv("METRICS_PORT", "9090"),
 		UserProfileBaseURL:   os.Getenv("USER_PROFILE_BASE_URL"),
 		OrgMembershipBaseURL: os.Getenv("ORG_MEMBERSHIP_BASE_URL"),
+		CatalogAdminBaseURL:  os.Getenv("CATALOG_ADMIN_BASE_URL"),
 		ValkeyAddr:           getEnv("VALKEY_ADDR", "localhost:6379"),
 		SNSTopicARN:          os.Getenv("SNS_TOPIC_ARN"),
 		AWSRegion:            getEnv("AWS_REGION", "ap-south-1"),
@@ -82,6 +85,9 @@ func loadConfig() (config, error) {
 		return cfg, err
 	}
 	if cfg.OrgMembershipTimeout, err = getEnvDuration("ORG_MEMBERSHIP_MEMBERSHIP_CHECK_TIMEOUT_MS", 3000*time.Millisecond); err != nil {
+		return cfg, err
+	}
+	if cfg.CatalogAdminTimeout, err = getEnvDuration("CATALOG_ADMIN_TIMEOUT_MS", 3000*time.Millisecond); err != nil {
 		return cfg, err
 	}
 	if cfg.IdempotencyTTL, err = getEnvDurationSeconds("IDEMPOTENCY_TTL_SECONDS", 86400*time.Second); err != nil {

@@ -32,6 +32,7 @@ type DelegationService struct {
 	settings        port.SettingsRepository
 	membershipCheck port.MembershipCheckClient
 	userProfile     port.UserProfileClient
+	catalogAdmin    port.CatalogAdminClient // optional — nil degrades to presence-only scope_id check (GAP-020)
 	idempotency     port.IdempotencyStore
 	cache           port.Cache
 	txRunner        port.TxRunner
@@ -52,6 +53,15 @@ func NewDelegationService(
 		delegations: d, settings: settings, membershipCheck: membershipCheck,
 		userProfile: up, idempotency: idem, cache: cache, txRunner: txRunner,
 	}
+}
+
+// WithCatalogAdmin attaches an optional CatalogAdminClient for validating
+// scope="department" scope_ids against the global department catalog (GAP-020).
+// Nil is valid — when unset, department scope_id validation degrades to the
+// existing presence-only check in validateCreateInput.
+func (s *DelegationService) WithCatalogAdmin(c port.CatalogAdminClient) *DelegationService {
+	s.catalogAdmin = c
+	return s
 }
 
 // WithMetrics attaches an optional recorder. Nil is valid (no-op).
@@ -141,6 +151,22 @@ func (s *DelegationService) Create(ctx context.Context, tenantID, delegatorID uu
 
 	if err := validateCreateInput(delegatorID, req); err != nil {
 		return nil, err
+	}
+
+	// GAP-020: validate scope="department" scope_id against the global
+	// department catalog. Runs after structural validation (presence/absence)
+	// and before any cross-service membership checks or DB writes, so an
+	// invalid department is rejected cheaply. Fail-closed on transport error
+	// (503 catalog_admin_unavailable). Skipped when catalogAdmin is nil —
+	// degrades to the presence-only check in validateCreateInput above.
+	if domain.DelegationScope(req.Scope) == domain.ScopeDepartment && req.ScopeID != nil && s.catalogAdmin != nil {
+		exists, active, caErr := s.catalogAdmin.DepartmentActive(ctx, *req.ScopeID)
+		if caErr != nil {
+			return nil, domain.NewError(domain.ErrCatalogAdminUnavailable, "catalog admin service is unavailable")
+		}
+		if !exists || !active {
+			return nil, domain.NewError(domain.ErrInvalidScopeID, "scope_id does not reference an active department in the catalog")
+		}
 	}
 
 	now := time.Now().UTC()

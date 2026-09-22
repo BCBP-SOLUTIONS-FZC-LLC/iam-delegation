@@ -44,6 +44,7 @@ var (
 	// 503 — dependency
 	ErrOrgMembershipUnavailable = errors.New("org_membership_unavailable")
 	ErrUserProfileUnavailable   = errors.New("user_profile_unavailable")
+	ErrCatalogAdminUnavailable  = errors.New("catalog_admin_unavailable")
 	ErrDBUnavailable            = errors.New("db_unavailable")
 )
 

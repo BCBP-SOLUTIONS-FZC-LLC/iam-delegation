@@ -41,6 +41,7 @@ import (
 	_ "github.com/BCBP-SOLUTIONS-FZC-LLC/iam-delegation/docs/swagger"
 	"github.com/BCBP-SOLUTIONS-FZC-LLC/iam-delegation/internal/adapter/inbound/consumer"
 	httpadapter "github.com/BCBP-SOLUTIONS-FZC-LLC/iam-delegation/internal/adapter/inbound/http"
+	"github.com/BCBP-SOLUTIONS-FZC-LLC/iam-delegation/internal/adapter/outbound/catalogadmin"
 	"github.com/BCBP-SOLUTIONS-FZC-LLC/iam-delegation/internal/adapter/outbound/eventbus"
 	"github.com/BCBP-SOLUTIONS-FZC-LLC/iam-delegation/internal/adapter/outbound/metrics"
 	"github.com/BCBP-SOLUTIONS-FZC-LLC/iam-delegation/internal/adapter/outbound/orgmembership"
@@ -272,6 +273,18 @@ func run(ctx context.Context, logger port.Logger) error {
 		return fmt.Errorf("build Org Membership client: %w", err)
 	}
 
+	// CatalogAdminClient is optional (GAP-020): when CATALOG_ADMIN_BASE_URL is
+	// set, scope="department" scope_ids are validated against the global
+	// catalog at create time. When unset, validation degrades to the existing
+	// presence-only check — no startup failure.
+	var catalogAdminClient port.CatalogAdminClient
+	if cfg.CatalogAdminBaseURL != "" {
+		catalogAdminClient, err = catalogadmin.NewHTTPClient(cfg.CatalogAdminBaseURL, nil, cfg.CatalogAdminTimeout)
+		if err != nil {
+			return fmt.Errorf("build Catalog Admin client: %w", err)
+		}
+	}
+
 	redisClient := valkey.NewClient(cfg.ValkeyAddr)
 	//nolint:errcheck // best-effort shutdown cleanup — an error here has no recovery action at process exit.
 	defer func() { _ = redisClient.Close() }()
@@ -290,7 +303,9 @@ func run(ctx context.Context, logger port.Logger) error {
 	settingsRepo := pgadapter.NewSettingsRepository(pool)
 
 	// Core services.
-	delegationService := service.NewDelegationService(delegationRepo, settingsRepo, membershipCheckClient, userProfileClient, idempotencyStore, cache, txRunner).WithMetrics(appMetrics)
+	delegationService := service.NewDelegationService(delegationRepo, settingsRepo, membershipCheckClient, userProfileClient, idempotencyStore, cache, txRunner).
+		WithMetrics(appMetrics).
+		WithCatalogAdmin(catalogAdminClient)
 	settingsService := service.NewSettingsService(settingsRepo)
 	cascadeService := service.NewCascadeService(delegationRepo, settingsRepo, userProfileClient, txRunner).WithMetrics(appMetrics)
 
