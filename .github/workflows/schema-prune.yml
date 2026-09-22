@@ -98,7 +98,7 @@ jobs:
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
+          password: ${{ secrets.GO_PRIVATE_TOKEN }}
 
       # Schedule always runs dry-run (generates a monthly candidate report).
       # workflow_dispatch respects the dry_run input; un-check to execute.
@@ -186,7 +186,7 @@ jobs:
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
+          password: ${{ secrets.GO_PRIVATE_TOKEN }}
 
       - name: Prune orphaned schemas
         env:
