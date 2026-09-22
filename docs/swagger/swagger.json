@@ -466,6 +466,28 @@
                 }
             }
         },
+        "/healthz": {
+            "get": {
+                "produces": [
+                    "application/json"
+                ],
+                "tags": [
+                    "infra"
+                ],
+                "summary": "Liveness check",
+                "responses": {
+                    "200": {
+                        "description": "always {\\\"status\\\":\\\"ok\\\"}",
+                        "schema": {
+                            "type": "object",
+                            "additionalProperties": {
+                                "type": "string"
+                            }
+                        }
+                    }
+                }
+            }
+        },
         "/internal/delegations/dept-delegate": {
             "get": {
                 "description": "Mesh-only. Backs Core's synchronous removal-gate call (LLD §11.5) — never 404; found:false is the valid \"no active department delegation\" answer.",

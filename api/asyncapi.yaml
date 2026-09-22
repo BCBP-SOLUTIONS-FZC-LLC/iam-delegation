@@ -1,7 +1,7 @@
 asyncapi: 3.0.0
 
 info:
-  title: iam-delegation events
+  title: IAM Delegation Events
   version: 1.0.0
   description: |
     Outbound events published to iam.delegation.events (SNS → SQS fan-out),
@@ -54,6 +54,36 @@ info:
     cycle so consumers can migrate, then retire the old type — see
     x-version-governance.compaction-protocol below.
 
+    ── Glue Schema Version / dataschema ────────────────────────────────────
+    The 16-byte UUID in the Glue wire-format header (bytes 2-17) is the
+    authoritative schema version identifier. The same UUID is echoed into
+    the envelope JSON as `dataschema` so consumers that work with the
+    decoded body can inspect or log it without re-parsing the binary header.
+    The UUID is resolved from the Glue registry at startup and cached; it
+    changes automatically whenever a new schema version is registered.
+    In dev/test (NoopCodec path, GLUE_REGISTRY_NAME unset) there is no
+    Glue header and `dataschema` is absent from the envelope.
+
+    ── Failure Mode ────────────────────────────────────────────────────────
+    GlueCodec fetches each published schema's version ID from Glue exactly
+    once at startup (no retry). If any lookup fails the pod panics —
+    Kubernetes restarts it (CrashLoopBackoff). This is intentional: a pod
+    that cannot reach the Glue registry would silently produce malformed
+    events rather than failing visibly.
+
+    Resolution path:
+      1. Verify GLUE_REGISTRY_NAME is correct and the registry/schemas exist.
+      2. Verify the pod IAM role has glue:GetSchemaVersion on GLUE_REGISTRY_ARN.
+      3. Fix the root cause — the pod recovers automatically on restart.
+    Alert on outbox_dead_letters_total for events that fail after startup.
+
+    ── Message Size Limit ───────────────────────────────────────────────────
+    SNS hard limit: 256 KB per message (total wire size including the 18-byte
+    Glue header and all SNS framing). A 240 KB soft limit is enforced at
+    outbox-enqueue time by platform-events (pkg/outbox.Enqueue's
+    maxEnvelopeBytes check). Delegation event payloads are small bounded
+    structs; size is not a concern for any current event type.
+
   x-forward-compatibility:
     summary: >-
       Non-breaking schema updates (added fields, widened enums) are
@@ -70,6 +100,27 @@ info:
       OPEN and new fields may appear in any Glue schema version without a
       version bump. CI's schema-gov validate Pass 5 rejects any schema that
       re-introduces "additionalProperties": false.
+    rollout-sequence:
+      - "1. Register new schema version in Glue (UUID rotates; envelope.dataschema changes)"
+      - "2. Deploy all consumers (ensure lenient deserialization settings below are in place)"
+      - "3. Deploy producer (starts emitting new fields / wider enums)"
+    java-jackson: "mapper.configure(DeserializationFeature.FAIL_ON_UNKNOWN_PROPERTIES, false) OR @JsonIgnoreProperties(ignoreUnknown=true) on every payload class."
+    python-pydantic-v2: "model_config = ConfigDict(extra='ignore') on every payload model."
+    kotlin-serialization: "Json { ignoreUnknownKeys = true } on the Json instance used to decode payloads."
+    enum-safety: >-
+      All switch/match/when on enum values MUST include a default/else branch.
+      Enum widening is a backward-compatible change; new values appear in
+      production without a consumer migration. An unhandled enum value crashes
+      exhaustive matchers.
+    ci-integration: >-
+      schema-registry.yml's diff step emits ⚠ warnings when a non-breaking
+      change affects forward-compatibility. CI blocks breaking changes
+      entirely. Pass 5 of schema-gov validate additionally blocks any schema
+      that declares additionalProperties: false — preventing the
+      closed-schema anti-pattern from being re-introduced. Pass 6 scans Go
+      source for DisallowUnknownFields and emits ::warning annotations so
+      reviewers can confirm those sites do not decode iam.delegation.events
+      or iam.membership.events payloads.
 
   x-semantic-contract:
     summary: >-
@@ -84,6 +135,34 @@ info:
       (e.g. DelegationEnded.v2) and mark the old type deprecated — do not
       reuse an existing field name for a semantically different value.
       See the "Event Schema Semantic Evolution" PR-template checklist.
+    detection: >-
+      If field descriptions or titles change between Glue versions, the
+      schema-registry.yml diff step emits a consumer_note. This is the only
+      automated signal available — semantic intent lives in human-readable
+      documentation, not in the JSON Schema type system.
+    field-annotation-guidance: >-
+      Annotate fields with semantic intent in their description. Example:
+        days_remaining:
+          type: integer
+          description: "Calendar days (not business days) until review_due_at."
+      Precise descriptions make semantic drift detectable during review.
+
+  x-consumer-sdk:
+    summary: >-
+      Consumer SDKs MUST be configured for lenient decoding before
+      subscribing to iam.delegation.events or delegation-cascade-q.
+      The required settings are listed under x-forward-compatibility.
+    in-repo-enforcement: >-
+      CI Pass 6 (consumer strict-mode scan) greps this repository's Go
+      source for DisallowUnknownFields. Matches emit ::warning annotations
+      so reviewers can verify each site does not decode event payloads
+      with strict deserialization. Test files and vendor/ are excluded.
+    out-of-repo-guidance: >-
+      External consumer services must enforce lenient decoding in their own
+      codebase. Services using the platform-events SQS consumer get lenient
+      mode by default (encoding/json defaults). Services that wrap raw
+      message bytes must opt in explicitly — see
+      x-forward-compatibility.required-settings for per-language settings.
 
   x-version-governance:
     summary: >-
@@ -475,6 +554,10 @@ components:
         CascadeService.EndForUser (§11.5, DLG-Q4/DLG-D14).
       x-lifecycle:
         status: active
+      x-owner:
+        team: iam-core-team
+        slack: "#iam-org-membership"
+        note: "Schema ownership stays with the producing service (iam-org-membership). This definition is this service's consumer-side documentation only."
       tags:
         - $ref: '#/components/tags/consumed'
       contentType: application/json
@@ -510,6 +593,10 @@ components:
         that name.
       x-lifecycle:
         status: active
+      x-owner:
+        team: iam-core-team
+        slack: "#iam-org-membership"
+        note: "Schema ownership stays with the producing service (iam-org-membership). This definition is this service's consumer-side documentation only."
       tags:
         - $ref: '#/components/tags/consumed'
       contentType: application/json
@@ -550,6 +637,10 @@ components:
         own contract carries more (email, other changed_fields).
       x-lifecycle:
         status: active
+      x-owner:
+        team: iam-user-platform
+        slack: "#user-events"
+        note: "Schema ownership stays with the producing service (iam-user-profile). This definition documents only the subset of fields this service reads."
       tags:
         - $ref: '#/components/tags/consumed'
       contentType: application/json

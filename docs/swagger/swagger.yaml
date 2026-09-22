@@ -482,6 +482,20 @@ paths:
       summary: Raw AsyncAPI spec
       tags:
       - infra
+  /healthz:
+    get:
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: always {\"status\":\"ok\"}
+          schema:
+            additionalProperties:
+              type: string
+            type: object
+      summary: Liveness check
+      tags:
+      - infra
   /internal/delegations/dept-delegate:
     get:
       description: Mesh-only. Backs Core's synchronous removal-gate call (LLD §11.5)
