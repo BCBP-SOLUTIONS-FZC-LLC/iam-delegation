@@ -135,7 +135,7 @@ iam-delegation/
 │           ├── eventbus/              # publisher.go + validating_codec.go (enqueue) · codec.go (GlueCodec encode + GlueDecodeCodec consume-side decode, DLG-D21) · validator.go (SchemaValidator, tests)
 │           ├── valkey/                # cache.go · client.go · idempotency.go — del: cache + idempotency store
 │           └── metrics/               # metrics.go — three-tier taxonomy: Tier 1 platform_messages_* + platform_dependency_* (Registry-Proposed, dual-emitted with legacy Tier 3 during compat period); Tier 3 iam_delegation_* service-specific; DLG-D19 closed — every instrument has a real call site
-├── internal/eventschema/              # delegation_{started,ended,review_requested,escalation_requested}.json + schemas.go (//go:embed) — hand-maintained, no extract-schemas step (DLG-D20)
+├── internal/eventschema/              # 7 hand-maintained JSON Schemas + schemas.go (//go:embed): 4 published (delegation_{started,ended,review_requested,escalation_requested}.json) + 3 consumed (membership_revoked.json, tenant_memberships_purged.json, user_updated.json); no extract-schemas step (DLG-D20)
 ├── pkg/requestctx/                    # gateway-identity / tenant-actor extraction helpers
 ├── docs/
 │   ├── lld/iam-lld-delegation-service.md  # the full LLD, current rev 2.18 (design-time source of truth)
@@ -148,6 +148,9 @@ iam-delegation/
 │   └── monitoring/                    # app-alerts.yml (threshold alerts) + slo-rules.yml (SLO-1..4 burn-rate, DLG-D39) — both also rendered by templates/prometheusrule.yaml — + prometheus-adapter-rule.yaml + schema-registry-alerts.yml (CI schema pipeline)
 ├── .github/workflows/                 # ci.yml · validate-quality.yml · validate-test.yml · release.yml · changelog-check.yml · schema-registry.yml · schema-prune.yml · schema-health-quarterly.yml · freeze-watchdog.yml
 ├── .githooks/pre-commit               # tidy + fmt-check + lint + swag-check
+├── scripts/
+│   ├── init-floci.sh                  # local-dev SNS/SQS/Glue provisioning (floci, not LocalStack)
+│   └── patch-swagger-extensions.py   # post-processes docs/swagger/ after `make swag` — injects top-level `tags` block (delegations/internal/infra) for correct Swagger UI grouping order
 ├── Dockerfile  docker-compose.yml  Makefile  go.mod  .golangci.yml  .go-arch-lint.yml
 ├── ARCHITECTURE.md                    # detailed architecture narrative with Mermaid diagrams; includes the DLG-D13+ as-built decision register
 ├── CONTRIBUTING.md                    # dev setup, extension playbooks, PR checklist

@@ -1493,3 +1493,14 @@ The removal-gate errors (`409 workflow_resolution_required`, `503 workflow_servi
 | DLG-D13 | **Tender-scope liveness validation** (§7.6.7, action item #8a). A `scope='tender'` delegation makes one synchronous grant-time call to Tender — `GET /internal/tenants/:id/tenders/:scope_id/exists` — behind a swappable `TenderScopeClient`, fail-closed (`503 tender_unavailable`) and rejecting a dead/unknown tender with `422 tender_scope_not_found` (§20). Department- and all-scoped delegations are unaffected. **Cross-team task:** Tender owns and must expose the endpoint; until then the client's HTTP adapter is built and tested but left entirely unwired (no construction, no config, no flag), with a documented fallback to the presence-only `chk_scope_id` check. |
 
 *End of document. This v2 resolves all ten open questions as decisions for the development-stage build; the DLG-Q4 cross-team task (Core adding the `MembershipRevoked`/`TenantMembershipsPurged` emission this service's cascade consumes) is confirmed shipped as of v2.3. **v2.14 opens one new cross-team task (DLG-D13): Tender must expose `GET /internal/tenants/:id/tenders/:tender_id/exists` for the tender-scope liveness check (§7.6.7); until it ships, `TenderScopeClient`'s adapter is built and tested but not wired into the composition root (no flag exists) with a documented presence-only fallback.***
+
+---
+
+## Post-design As-Built Additions (2026-09-22)
+
+The following decisions were made after this LLD was finalised during the cross-service compatibility audit and production-readiness sweep. Full rationale is in `ARCHITECTURE.md`'s decision register (DLG-D48/DLG-D49).
+
+| Decision | Summary |
+|---|---|
+| **DLG-D48** | **`scope=department` scope_id validation against Catalog Admin (GAP-020).** `DelegationService.Create` now validates `scope_id` against `iam-catalog-admin`'s `GET /api/v1/departments/:id` (CAT-7) for `scope=department` delegations. Added `port.CatalogAdminClient`, `internal/adapter/outbound/catalogadmin/` HTTP adapter, `ErrCatalogAdminUnavailable` (503), `CATALOG_ADMIN_BASE_URL` env var. The client is optional (nil = presence-only fallback, matching DLG-D13's `TenderScopeClient` pattern). |
+| **DLG-D49** | **Enterprise Platform Observability Standard — 3-tier metrics + 7 CI enforcement scripts.** `platform_dependency_request_seconds` and `platform_dependency_errors_total` (Registry-Proposed) added; all 3 outbound HTTP clients dual-emit Tier-1 + Tier-3 legacy. Four new CI gates: `check-metric-namespacing.sh`, `check-observability-compliance.sh` (logs/metrics/traces via platform-gincommon), `check-platform-events-compliance.sh` (events/outbox/dedup via platform-events), `check-pgcommon-compliance.sh` (DB via platform-pgcommon). |

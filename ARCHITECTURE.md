@@ -65,7 +65,7 @@ graph TD
     end
 
     subgraph eventschema_grp["Generated Schemas — internal/eventschema/"]
-        eventschema["eventschema/\nEmbedded JSON Schemas for the four published events\nDelegationStarted · DelegationEnded · DelegationReviewRequested · DelegationEscalationRequested"]
+        eventschema["eventschema/\n7 hand-maintained JSON Schemas (4 published + 3 consumed)\nDelegationStarted · DelegationEnded · DelegationReviewRequested · DelegationEscalationRequested\n+ MembershipRevoked · TenantMembershipsPurged · UserUpdated"]
     end
 
     subgraph core["Core — internal/core/"]
@@ -167,12 +167,16 @@ iam-delegation/
 │           ├── userprofile/                 -- UserProfileClient HTTP impl
 │           ├── orgmembership/                -- MembershipCheckClient HTTP impl
 │           ├── tender/                      -- TenderScopeClient HTTP impl (§7.6.7, DLG-D13 — built/tested, not constructed in cmd/server)
+│           ├── catalogadmin/                -- CatalogAdminClient HTTP adapter (GAP-020) — validates scope=department scope_id against CAT-7
 │           ├── eventbus/                    -- SNS publisher (iam-delegation-events) + Glue codec (encode+decode)
 │           ├── valkey/                      -- del: cache + idempotency store
-│           └── metrics/                     -- iam_delegation_* Prometheus instruments
-├── internal/eventschema/                    -- embedded JSON Schemas for the four published events
+│           └── metrics/                     -- 3-tier metrics: Tier 1 platform_messages_* + platform_dependency_* · Tier 3 iam_delegation_*
+├── internal/eventschema/                    -- 7 hand-maintained JSON Schemas + schemas.go (embed): 4 published (DelegationStarted/Ended/ReviewRequested/EscalationRequested) + 3 consumed (MembershipRevoked/TenantMembershipsPurged/UserUpdated); no extract-schemas step (DLG-D20)
 ├── pkg/requestctx/                          -- gateway-identity / tenant-actor extraction helpers
-├── api/                                     -- asyncapi.yaml (hand-maintained) + embed.go
+├── api/                                     -- asyncapi.yaml (hand-maintained, IAM Delegation Events spec) + embed.go
+├── scripts/
+│   ├── init-floci.sh                        -- local-dev SNS/SQS/Glue provisioning (floci)
+│   └── patch-swagger-extensions.py          -- post-processes docs/swagger/ after make swag (injects tags block)
 └── deploy/helm/iam-delegation/              -- this service's independent Helm chart
 ```
 
