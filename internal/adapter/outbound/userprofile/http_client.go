@@ -17,6 +17,7 @@ import (
 	"github.com/google/uuid"
 
 	"github.com/BCBP-SOLUTIONS-FZC-LLC/iam-delegation/internal/adapter/outbound/httpx"
+	"github.com/BCBP-SOLUTIONS-FZC-LLC/iam-delegation/internal/adapter/outbound/metrics"
 	"github.com/BCBP-SOLUTIONS-FZC-LLC/iam-delegation/internal/core/port"
 )
 
@@ -88,6 +89,17 @@ func buildBody(req port.SetAvailabilityRequest) map[string]any {
 // 404 → user not provisioned in UP, treated as available (no OOO).
 // 5xx and network failures are wrapped with port.ErrDependencyUnavailable.
 func (c *HTTPClient) GetAvailability(ctx context.Context, tenantID, userID uuid.UUID) (*port.AvailabilitySnapshot, error) {
+	started := time.Now()
+	snap, err := c.getAvailability(ctx, tenantID, userID)
+	elapsed := time.Since(started).Seconds()
+	metrics.ObserveDependencyLatency("user_profile", "get_availability", elapsed)
+	if err != nil {
+		metrics.IncDependencyError("user_profile", "get_availability", metrics.DependencyOutcome(err))
+	}
+	return snap, err
+}
+
+func (c *HTTPClient) getAvailability(ctx context.Context, tenantID, userID uuid.UUID) (*port.AvailabilitySnapshot, error) {
 	url := fmt.Sprintf("%s/api/v1/users/%s/availability", c.baseURL, userID)
 	httpReq, err := http.NewRequestWithContext(ctx, http.MethodGet, url, http.NoBody)
 	if err != nil {
@@ -136,6 +148,17 @@ func (c *HTTPClient) GetAvailability(ctx context.Context, tenantID, userID uuid.
 // whatever status the user had before the delegation started (Gap 3 Option B).
 // 5xx and network failures are wrapped with port.ErrDependencyUnavailable.
 func (c *HTTPClient) ClearDelegatePointer(ctx context.Context, tenantID, userID uuid.UUID) error {
+	started := time.Now()
+	err := c.clearDelegatePointer(ctx, tenantID, userID)
+	elapsed := time.Since(started).Seconds()
+	metrics.ObserveDependencyLatency("user_profile", "clear_delegate_pointer", elapsed)
+	if err != nil {
+		metrics.IncDependencyError("user_profile", "clear_delegate_pointer", metrics.DependencyOutcome(err))
+	}
+	return err
+}
+
+func (c *HTTPClient) clearDelegatePointer(ctx context.Context, tenantID, userID uuid.UUID) error {
 	url := fmt.Sprintf("%s/api/v1/internal/users/%s/availability/delegate", c.baseURL, userID)
 	httpReq, err := http.NewRequestWithContext(ctx, http.MethodDelete, url, http.NoBody)
 	if err != nil {
@@ -170,6 +193,17 @@ func (c *HTTPClient) ClearDelegatePointer(ctx context.Context, tenantID, userID 
 // contains the callee's error code, so the service layer's
 // strings.Contains(err.Error(), "delegate_unavailable") check still works.
 func (c *HTTPClient) SetAvailability(ctx context.Context, req port.SetAvailabilityRequest) error {
+	started := time.Now()
+	err := c.setAvailability(ctx, req)
+	elapsed := time.Since(started).Seconds()
+	metrics.ObserveDependencyLatency("user_profile", "set_availability", elapsed)
+	if err != nil {
+		metrics.IncDependencyError("user_profile", "set_availability", metrics.DependencyOutcome(err))
+	}
+	return err
+}
+
+func (c *HTTPClient) setAvailability(ctx context.Context, req port.SetAvailabilityRequest) error {
 	body, err := json.Marshal(buildBody(req))
 	if err != nil {
 		return fmt.Errorf("userprofile: encode request: %w", err)

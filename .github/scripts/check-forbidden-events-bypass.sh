@@ -26,7 +26,7 @@ set -euo pipefail
 ALLOWED_SDK_IMPORT_FILES="cmd/server/main.go"
 
 sdk_import_hits=$(grep -RIl -E '"github\.com/aws/aws-sdk-go-v2/service/(sns|sqs)"' \
-  --include='*.go' cmd/ internal/ 2>/dev/null | grep -v '_test\.go$' || true)
+  --include='*.go' cmd/ internal/ pkg/ 2>/dev/null | grep -v '_test\.go$' || true)
 
 for f in $sdk_import_hits; do
   allowed=false
@@ -45,7 +45,7 @@ done
 # ── 2. Even in an allowed file, the SNS/SQS transport methods themselves
 #      must never be called directly — only used to build the client. ────
 method_hits=$(grep -REn '\.(SendMessage|ReceiveMessage|DeleteMessage|ChangeMessageVisibility|Publish|Subscribe)\(' \
-  --include='*.go' cmd/ internal/ 2>/dev/null | grep -v '_test\.go' || true)
+  --include='*.go' cmd/ internal/ pkg/ 2>/dev/null | grep -v '_test\.go' || true)
 
 if [ -n "$method_hits" ]; then
   echo "::error::Direct SNS/SQS transport method call detected outside platform-events. Publish via outbox.Enqueue (eventbus.Publisher.EnqueueCtx); consume via events.NewSQSConsumerWithClient's registered handler — never call the AWS SDK client's own methods."
@@ -57,7 +57,7 @@ fi
 #      never as a struct literal (which would skip its ID/time/schema
 #      defaulting). ────────────────────────────────────────────────────────
 envelope_literal_hits=$(grep -REn 'events\.Envelope(\[[^]]*\])?\{' \
-  --include='*.go' cmd/ internal/ 2>/dev/null | grep -v '_test\.go' || true)
+  --include='*.go' cmd/ internal/ pkg/ 2>/dev/null | grep -v '_test\.go' || true)
 
 if [ -n "$envelope_literal_hits" ]; then
   echo "::error::events.Envelope constructed as a struct literal instead of events.NewEnvelope(...). This skips platform-events' own ID/time/schema-version defaulting."

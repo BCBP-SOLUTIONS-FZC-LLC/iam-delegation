@@ -93,6 +93,10 @@ components:
       # but not constructed anywhere in cmd/server; Tender hasn't shipped
       # the provider endpoint yet (IB-4, blocked on EXT-1).
       - internal/adapter/outbound/tender
+      # CatalogAdminClient's HTTP adapter (GAP-020) — validates scope=department
+      # scope_id against Catalog Admin's GET /api/v1/departments/:id (CAT-7).
+      # Optional: wired in cmd/server/main.go when CATALOG_ADMIN_BASE_URL is set.
+      - internal/adapter/outbound/catalogadmin
 
   # Generated Swagger docs — output of `make swag` (swaggo/swag) for
   # cmd/server's HTTP handlers (DLG-1..7, DLG-I1..I4). Declared as a

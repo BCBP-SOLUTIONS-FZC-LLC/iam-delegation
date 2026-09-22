@@ -25,6 +25,7 @@ import (
 	"github.com/google/uuid"
 
 	"github.com/BCBP-SOLUTIONS-FZC-LLC/iam-delegation/internal/adapter/outbound/httpx"
+	"github.com/BCBP-SOLUTIONS-FZC-LLC/iam-delegation/internal/adapter/outbound/metrics"
 	"github.com/BCBP-SOLUTIONS-FZC-LLC/iam-delegation/internal/core/port"
 )
 
@@ -68,6 +69,17 @@ type departmentResponse struct {
 // exists=false, active=false, err=nil (business rejection, not a fault).
 // Any 5xx or transport error wraps port.ErrDependencyUnavailable.
 func (c *HTTPClient) DepartmentActive(ctx context.Context, departmentID uuid.UUID) (exists, active bool, err error) {
+	started := time.Now()
+	exists, active, err = c.departmentActive(ctx, departmentID)
+	elapsed := time.Since(started).Seconds()
+	metrics.ObserveDependencyLatency("catalog_admin", "cat7_dept_active", elapsed)
+	if err != nil {
+		metrics.IncDependencyError("catalog_admin", "cat7_dept_active", metrics.DependencyOutcome(err))
+	}
+	return
+}
+
+func (c *HTTPClient) departmentActive(ctx context.Context, departmentID uuid.UUID) (exists, active bool, err error) {
 	url := fmt.Sprintf("%s/api/v1/departments/%s", c.baseURL, departmentID)
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, http.NoBody)
 	if err != nil {

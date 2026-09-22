@@ -1,0 +1,17 @@
+#!/usr/bin/env bash
+# Local commit gates: formatting, lint, and Swagger staleness.
+# Mirrors iam-org-membership/.githooks/pre-commit.
+# Install via: make install-hooks  (or make setup on first clone)
+set -euo pipefail
+
+echo "[pre-commit] running tidy..."
+make tidy
+
+echo "[pre-commit] running fmt-check..."
+make fmt-check
+
+echo "[pre-commit] running lint..."
+make lint
+
+echo "[pre-commit] checking Swagger docs staleness..."
+bash .github/scripts/check-swagger-stale.sh

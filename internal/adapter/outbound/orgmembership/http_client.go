@@ -73,10 +73,14 @@ type existsResponse struct {
 func (c *HTTPChecker) Exists(ctx context.Context, tenantID, userID uuid.UUID) (bool, uuid.UUID, error) {
 	started := time.Now()
 	active, id, err := c.exists(ctx, tenantID, userID)
+	elapsed := time.Since(started).Seconds()
 	if m := metrics.Live; m != nil {
-		m.ObserveMembershipCheckDuration(time.Since(started).Seconds())
+		m.ObserveMembershipCheckDuration(elapsed)
+		// Tier 1 dual-emit
+		m.ObserveDependencyLatency("org_membership", "i15_member_exists", elapsed)
 		if err != nil {
 			m.RecordMembershipCheckFailure()
+			m.IncDependencyError("org_membership", "i15_member_exists", metrics.DependencyOutcome(err))
 		}
 	}
 	return active, id, err

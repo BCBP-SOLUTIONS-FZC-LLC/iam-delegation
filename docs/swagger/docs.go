@@ -106,7 +106,7 @@ const docTemplate = `{
                         }
                     },
                     "503": {
-                        "description": "org_membership_unavailable | user_profile_unavailable",
+                        "description": "org_membership_unavailable | user_profile_unavailable | catalog_admin_unavailable",
                         "schema": {
                             "$ref": "#/definitions/gincommon.ErrorResponse"
                         }

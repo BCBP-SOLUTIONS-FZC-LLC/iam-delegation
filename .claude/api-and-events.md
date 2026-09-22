@@ -78,6 +78,7 @@ Key: `del:idem:{tenantID}:{key}`, TTL 24h (`idempotencyTTL` constant, shared by 
 | `extend_days_out_of_range` | 422 | `ErrExtendDaysOutOfRange` |
 | `org_membership_unavailable` | 503 | `ErrOrgMembershipUnavailable` |
 | `user_profile_unavailable` | 503 | `ErrUserProfileUnavailable` |
+| `catalog_admin_unavailable` | 503 | `ErrCatalogAdminUnavailable` — only on DLG-2 Create when `CATALOG_ADMIN_BASE_URL` is set and `scope=department`; 5xx/transport failure from Catalog Admin CAT-7 |
 
 # Caching (LLD §9)
 

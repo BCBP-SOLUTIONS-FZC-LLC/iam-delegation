@@ -27,6 +27,9 @@
 package metrics
 
 import (
+	"context"
+	"errors"
+	"net"
 	"sync"
 
 	"github.com/prometheus/client_golang/prometheus"
@@ -128,6 +131,22 @@ type Metrics struct {
 	// services already in development (§Registry Ratification Requirement).
 	platformDuplicateMessagesTotal *prometheus.CounterVec
 
+	// platform_dependency_request_seconds — latency of synchronous outbound
+	// cross-service calls, by target_service and endpoint.  Labels:
+	// target_service, endpoint.  Dual-emitted alongside legacy
+	// iam_delegation_dependency_call_duration_seconds.
+	//
+	// REGISTRY-PROPOSED — same rationale as iam-org-membership.
+	platformDependencyRequestSeconds *prometheus.HistogramVec
+
+	// platform_dependency_errors_total — synchronous outbound call failures,
+	// by target_service, endpoint, and outcome (timeout|5xx).  Labels:
+	// target_service, endpoint, outcome.  Dual-emitted alongside legacy
+	// iam_delegation_dependency_call_failures_total.
+	//
+	// REGISTRY-PROPOSED — same rationale as iam-org-membership.
+	platformDependencyErrorsTotal *prometheus.CounterVec
+
 	// ── Tier 3: iam_delegation_* ─────────────────────────────────────────
 
 	createdTotal                 *prometheus.CounterVec
@@ -142,6 +161,11 @@ type Metrics struct {
 	membershipCheckFailuresTotal prometheus.Counter
 	upAvailabilityFailuresTotal  *prometheus.CounterVec
 	idempotencyHitsTotal         prometheus.Counter
+
+	// Tier 3 legacy predecessors of platform_dependency_* — dual-emitted
+	// during the compatibility period; remove once dashboards migrate.
+	dependencyCallDurationSeconds *prometheus.HistogramVec
+	dependencyCallFailuresTotal   *prometheus.CounterVec
 
 	// Legacy Tier 3 — kept for backward compatibility during the migration
 	// period; will be removed once dashboards and on-call runbooks migrate to
@@ -227,6 +251,23 @@ func registerOn(reg prometheus.Registerer, cfg RegisterConfig) (*Metrics, error)
 				Help: "Total SQS redeliveries skipped because processed_events already recorded the envelope (IDEMP-4). Labels: queue.",
 			},
 			[]string{"queue"},
+		),
+		platformDependencyRequestSeconds: prometheus.NewHistogramVec(
+			prometheus.HistogramOpts{
+				// REGISTRY-PROPOSED
+				Name:    "platform_dependency_request_seconds",
+				Help:    "Latency of synchronous outbound cross-service calls, by target_service and endpoint.",
+				Buckets: prometheus.DefBuckets,
+			},
+			[]string{"target_service", "endpoint"},
+		),
+		platformDependencyErrorsTotal: prometheus.NewCounterVec(
+			prometheus.CounterOpts{
+				// REGISTRY-PROPOSED
+				Name: "platform_dependency_errors_total",
+				Help: "Synchronous outbound cross-service call failures, by target_service, endpoint, and outcome (timeout|5xx).",
+			},
+			[]string{"target_service", "endpoint", "outcome"},
 		),
 
 		// ── Tier 3: iam_delegation_* ──────────────────────────────────────
@@ -321,6 +362,23 @@ func registerOn(reg prometheus.Registerer, cfg RegisterConfig) (*Metrics, error)
 				ConstLabels: svcLabels,
 			},
 		),
+		dependencyCallDurationSeconds: prometheus.NewHistogramVec(
+			prometheus.HistogramOpts{
+				Name:        "iam_delegation_dependency_call_duration_seconds",
+				Help:        "LEGACY predecessor of platform_dependency_request_seconds. Latency of synchronous outbound calls by target_service and endpoint.",
+				Buckets:     prometheus.DefBuckets,
+				ConstLabels: svcLabels,
+			},
+			[]string{"target_service", "endpoint"},
+		),
+		dependencyCallFailuresTotal: prometheus.NewCounterVec(
+			prometheus.CounterOpts{
+				Name:        "iam_delegation_dependency_call_failures_total",
+				Help:        "LEGACY predecessor of platform_dependency_errors_total. Outbound call failures by target_service, endpoint, and outcome.",
+				ConstLabels: svcLabels,
+			},
+			[]string{"target_service", "endpoint", "outcome"},
+		),
 
 		// Legacy Tier 3 — dual-emitted alongside platform_messages_*
 		// equivalents during the compatibility period.
@@ -364,6 +422,8 @@ func registerOn(reg prometheus.Registerer, cfg RegisterConfig) (*Metrics, error)
 		m.platformMessagesProcessedTotal,
 		m.platformMessagesFailedTotal,
 		m.platformDuplicateMessagesTotal,
+		m.platformDependencyRequestSeconds,
+		m.platformDependencyErrorsTotal,
 	}
 	for _, c := range platformCollectors {
 		if err := platformReg.Register(c); err != nil {
@@ -379,6 +439,7 @@ func registerOn(reg prometheus.Registerer, cfg RegisterConfig) (*Metrics, error)
 		m.reviewWarnedTotal, m.reviewExpiredTotal,
 		m.membershipCheckDuration, m.membershipCheckFailuresTotal,
 		m.upAvailabilityFailuresTotal, m.idempotencyHitsTotal,
+		m.dependencyCallDurationSeconds, m.dependencyCallFailuresTotal,
 		m.cascadeProcessedTotal, m.cascadeDLQTotal,
 		m.processedEventsDuplicatesTotal, m.unknownEventAcknowledgedTotal,
 	}
@@ -416,7 +477,36 @@ func registerOn(reg prometheus.Registerer, cfg RegisterConfig) (*Metrics, error)
 		m.processedEventsDuplicatesTotal.WithLabelValues(consumer)
 	}
 
+	// Tier 1 + legacy Tier 3 — dependency label combos for all known downstream
+	// services and their endpoints so dashboards show 0 rather than "no data"
+	// before the first outbound call.
+	for _, svc := range []string{"org_membership", "user_profile", "catalog_admin"} {
+		for _, ep := range knownEndpoints(svc) {
+			m.platformDependencyRequestSeconds.WithLabelValues(svc, ep)
+			m.dependencyCallDurationSeconds.WithLabelValues(svc, ep)
+			for _, outcome := range []string{"timeout", "5xx"} {
+				m.platformDependencyErrorsTotal.WithLabelValues(svc, ep, outcome)
+				m.dependencyCallFailuresTotal.WithLabelValues(svc, ep, outcome)
+			}
+		}
+	}
+
 	return m, nil
+}
+
+// knownEndpoints returns the set of endpoint label values that a given
+// target_service exposes to this service.  Used for pre-initialization only.
+func knownEndpoints(targetService string) []string {
+	switch targetService {
+	case "org_membership":
+		return []string{"i15_member_exists"}
+	case "user_profile":
+		return []string{"get_availability", "set_availability", "clear_delegate_pointer"}
+	case "catalog_admin":
+		return []string{"cat7_dept_active"}
+	default:
+		return nil
+	}
 }
 
 // ── Tier 1 recorders ─────────────────────────────────────────────────────────
@@ -531,4 +621,53 @@ func (m *Metrics) RecordProcessedEventsDuplicate(consumer string) {
 // iam_delegation_unknown_event_acknowledged_total.
 func (m *Metrics) RecordUnknownEventAcknowledged(consumer, eventType string) {
 	m.unknownEventAcknowledgedTotal.WithLabelValues(consumer, eventType).Inc()
+}
+
+// ObserveDependencyLatency records platform_dependency_request_seconds (Tier 1)
+// and the legacy iam_delegation_dependency_call_duration_seconds (Tier 3) for
+// one synchronous outbound call.
+func (m *Metrics) ObserveDependencyLatency(targetService, endpoint string, seconds float64) {
+	m.platformDependencyRequestSeconds.WithLabelValues(targetService, endpoint).Observe(seconds)
+	m.dependencyCallDurationSeconds.WithLabelValues(targetService, endpoint).Observe(seconds)
+}
+
+// IncDependencyError increments platform_dependency_errors_total (Tier 1) and
+// the legacy iam_delegation_dependency_call_failures_total (Tier 3) for one
+// synchronous outbound call failure.  outcome must be "timeout" or "5xx".
+func (m *Metrics) IncDependencyError(targetService, endpoint, outcome string) {
+	m.platformDependencyErrorsTotal.WithLabelValues(targetService, endpoint, outcome).Inc()
+	m.dependencyCallFailuresTotal.WithLabelValues(targetService, endpoint, outcome).Inc()
+}
+
+// ── Package-level nil-safe helpers (call via Live) ───────────────────────────
+
+// ObserveDependencyLatency is a nil-safe package-level wrapper over
+// (*Metrics).ObserveDependencyLatency.  Safe to call from outbound adapters
+// that cannot hold a *Metrics reference (mirrors RecordMessageReceived pattern).
+func ObserveDependencyLatency(targetService, endpoint string, seconds float64) {
+	if m := Live; m != nil {
+		m.ObserveDependencyLatency(targetService, endpoint, seconds)
+	}
+}
+
+// IncDependencyError is a nil-safe package-level wrapper over
+// (*Metrics).IncDependencyError.
+func IncDependencyError(targetService, endpoint, outcome string) {
+	if m := Live; m != nil {
+		m.IncDependencyError(targetService, endpoint, outcome)
+	}
+}
+
+// DependencyOutcome classifies an outbound call error into the outcome label
+// values used by platform_dependency_errors_total: "timeout" for context
+// deadline exceeded or net.Error timeouts; "5xx" for all other errors.
+func DependencyOutcome(err error) string {
+	var netErr net.Error
+	if errors.As(err, &netErr) && netErr.Timeout() {
+		return "timeout"
+	}
+	if errors.Is(err, context.DeadlineExceeded) {
+		return "timeout"
+	}
+	return "5xx"
 }

@@ -82,6 +82,14 @@ for label in "${forbidden_labels[@]}"; do
     fi
 done
 
+# ── Rule 4: required platform_dependency_* metrics must exist ───────────────
+for required in "platform_dependency_request_seconds" "platform_dependency_errors_total"; do
+    if ! grep -q "\"${required}\"" "$METRICS_FILE"; then
+        echo "::error file=${METRICS_FILE},title=Required metric missing::Required platform metric '${required}' not found in metrics file — Enterprise Platform Observability Standard §Implementation" >&2
+        FAIL=1
+    fi
+done
+
 if [[ $FAIL -eq 0 ]]; then
     echo "Metric namespacing checks passed (${METRICS_FILE})."
 fi

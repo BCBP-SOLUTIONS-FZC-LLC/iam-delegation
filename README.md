@@ -568,6 +568,7 @@ List and read-only endpoints (DLG-1, DLG-6, DLG-I1..I4) have **no** synchronous 
 | Reassign (DLG-5) — new delegate membership-existence check | `iam-org-membership` | `outbound/orgmembership/` | fail-closed | `503 org_membership_unavailable` — no change committed |
 | `delegation-expiry` CronJob — clear OOO pointer on expiry | `iam-user-profile` | `outbound/userprofile/` | fail-open (self-retrying) | Expiry retried next 5-min cycle until pointer clears |
 | Cascade end (MembershipRevoked / delegate-disabled) — clear OOO pointer | `iam-user-profile` | `outbound/userprofile/` | fail-open | Delegation ends; pointer cleared best-effort |
+| Create — department `scope_id` validation against global catalog (DLG-2, `scope=department` only, GAP-020) | `iam-catalog-admin` | `outbound/catalogadmin/` | fail-closed (when `CATALOG_ADMIN_BASE_URL` set); degrades to presence-only check when unset | `503 catalog_admin_unavailable` on 5xx; `422 invalid_scope_id` on 404 or `is_active=false` |
 | Tender-scope lookup (§7.6.7, DLG-D13) | Tender Service | `outbound/tender/` | — | Not yet wired in `cmd/server` — built and tested, pending Tender's endpoint |
 
 ### 2. Inbound callers (other services → this service)
