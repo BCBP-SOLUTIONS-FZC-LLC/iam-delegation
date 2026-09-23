@@ -25,6 +25,14 @@ TEST_POSTGRES_PKGS :=
 TEST_INT_PKGS      :=
 TEST_E2E_PKGS      := ./cmd/server/...
 
+# The Postgres adapter package — repository tests plus the §17.5 RLS matrix
+# (rls_test.go), all against a Testcontainers Postgres. Used by test-postgres
+# and test-rls (TEST_POSTGRES_PKGS stays empty so the colocated test-ci
+# suites don't run it twice). Raise the -parallel cap on a bigger box, e.g.
+# `make test-postgres TEST_POSTGRES_PARALLEL=8` (matches iam-org-membership).
+POSTGRES_ADAPTER_PKGS  := ./internal/adapter/outbound/postgres/...
+TEST_POSTGRES_PARALLEL ?= 4
+
 # All colocated white-box tests — every package in this service that has
 # *_test.go files. Run without Docker for unit suite; some need testcontainers
 # (valkey, postgres) and are guarded by t.Skip when the container isn't up.
@@ -82,8 +90,7 @@ ALL_TEST_TAGS := integration,rls,e2e
 setup:
 	@test -f .env || cp .env-example .env
 	@mkdir -p .git/hooks
-	@cp .githooks/pre-commit .git/hooks/pre-commit
-	@chmod +x .git/hooks/pre-commit
+	@test -f .githooks/pre-commit && cp .githooks/pre-commit .git/hooks/pre-commit && chmod +x .git/hooks/pre-commit || true
 	@echo "Environment ready (.env)"
 
 .PHONY: help
@@ -91,7 +98,7 @@ help:
 	@echo "Available commands:"
 	@echo "  make setup           - copy .env-example to .env if missing; install .githooks/pre-commit"
 	@echo "  make tidy            - go mod tidy"
-	@echo "  make fmt             - go fmt ./..."
+	@echo "  make fmt             - gofmt -w every Go file"
 	@echo "  make vet             - go vet (default build + every test build tag)"
 	@echo "  make lint            - run golangci-lint (default build + every test build tag)"
 	@echo "  make arch-lint       - run go-arch-lint against .go-arch-lint.yml (LLD §6/§6.2)"
@@ -100,7 +107,7 @@ help:
 	@echo "  make test-unit       - unit tests only (no Docker required)"
 	@echo "  make test-postgres   - Postgres + RLS integration tests (requires Docker)"
 	@echo "  make test-integration - full colocated suite incl. Postgres/Valkey/floci Testcontainers (requires Docker)"
-	@echo "  make test-rls        - Postgres adapter suite incl. the §17.5 Row-Level-Security matrix (requires Docker)"
+	@echo "  make test-rls        - the §17.5 Row-Level-Security matrix only (requires Docker)"
 	@echo "  make test-e2e        - end-to-end tests (requires Docker)"
 	@echo "  make test-smoke      - build the image, then image-size + startup-gate checks for both binaries (smoke-tests.sh)"
 	@echo "  make race            - all tests with -race flag"
@@ -155,7 +162,7 @@ tidy:
 
 .PHONY: fmt
 fmt:
-	$(GO) fmt ./...
+	@gofmt -l -w .
 
 .PHONY: vet
 vet:
@@ -246,7 +253,7 @@ test-unit:
 
 .PHONY: test-postgres
 test-postgres:
-	$(GO) test $(TEST_POSTGRES_PKGS) -tags=integration -count=1 -timeout 300s -v
+	$(GO) test $(POSTGRES_ADAPTER_PKGS) -count=1 -timeout 300s -parallel $(TEST_POSTGRES_PARALLEL) -v
 
 # test-integration / test-rls: every test here is colocated white-box with no
 # integration/rls build tags (see TEST_UNIT_PKGS above), so these select by
@@ -259,7 +266,7 @@ test-integration:
 
 .PHONY: test-rls
 test-rls:
-	$(GO) test ./internal/adapter/outbound/postgres/... -count=1 -timeout 300s -v
+	$(GO) test $(POSTGRES_ADAPTER_PKGS) -run 'RLS' -count=1 -timeout 300s -parallel $(TEST_POSTGRES_PARALLEL) -v
 
 .PHONY: test-e2e
 test-e2e:
@@ -474,8 +481,8 @@ swag:
 	  --output docs/swagger \
 	  --parseDependency \
 	  --parseInternal
-	@echo "Swagger docs written to docs/swagger/"
 	@python3 scripts/patch-swagger-extensions.py
+	@echo "Swagger docs written to docs/swagger/"
 
 .PHONY: swag-check
 swag-check:
@@ -519,14 +526,15 @@ schema-pull:
 # (5) open-schema guard, (6) consumer strict-mode, (7) coverage, (8) AsyncAPI structure.
 # No AWS credentials needed.
 #
-# Does not run extract-schemas itself — run `make schema-sync-check` (or
-# extract-schemas) alongside. (Before DLG-D51 asyncapi's payloads were
-# envelope-allOf schemas, so extract emitted a $ref to EventEnvelope that
-# could not be embedded and the JSON had to be hand-maintained; the payloads
-# are now flat and $ref-free, so extract output is exactly the committed
-# files.)
+# Regenerates the JSON from api/asyncapi.yaml first (like iam-org-membership),
+# so it validates what the committed files SHOULD be; `make schema-sync-check`
+# (and CI) is what fails when the committed files have drifted. Before
+# DLG-D51 asyncapi's payloads were envelope-allOf schemas, so extract emitted
+# a $ref to EventEnvelope that could not be embedded and the JSON had to be
+# hand-maintained; the payloads are now flat and $ref-free, so extract output
+# is exactly the committed files.
 .PHONY: schema-validate
-schema-validate:
+schema-validate: extract-schemas
 	docker run --rm --platform "$(SCHEMA_GOV_PLATFORM)" \
 	  -v "$(CURDIR)":/workspace \
 	  "$(SCHEMA_GOV_IMAGE)" validate \
@@ -542,7 +550,7 @@ schema-diff:
 	  echo "Usage: make schema-diff CURRENT=<current.json> PROPOSED=<proposed.json> [SCHEMA_NAME=<name>]"; \
 	  exit 1; \
 	}
-	docker run --rm --platform linux/amd64 \
+	docker run --rm --platform "$(SCHEMA_GOV_PLATFORM)" \
 	  -v "$(CURDIR)":/workspace \
 	  "$(SCHEMA_GOV_IMAGE)" diff \
 	  --current     "$(CURRENT)" \
@@ -558,7 +566,7 @@ schema-prune:
 	  echo "GLUE_REGISTRY_NAME is not set — add it to .env or pass on the command line"; \
 	  exit 1; \
 	}
-	docker run --rm --platform linux/amd64 \
+	docker run --rm --platform "$(SCHEMA_GOV_PLATFORM)" \
 	  -v "$(CURDIR)":/workspace \
 	  -e AWS_ACCESS_KEY_ID \
 	  -e AWS_SECRET_ACCESS_KEY \
@@ -635,7 +643,7 @@ schema-verify:
 # fmt-check: verify formatting without modifying files (mirrors CI gofmt step).
 .PHONY: fmt-check
 fmt-check:
-	@unformatted=$$(gofmt -l cmd/ internal/ pkg/ test/); \
+	@unformatted=$$(gofmt -l . 2>/dev/null); \
 	if [ -n "$$unformatted" ]; then \
 		echo "FAIL: unformatted files:"; \
 		echo "$$unformatted"; \
