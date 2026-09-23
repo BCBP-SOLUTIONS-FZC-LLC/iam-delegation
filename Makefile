@@ -99,7 +99,8 @@ help:
 	@echo "  make schema-validate  - validate AsyncAPI + event schemas — 8 passes (no AWS required)"
 	@echo "  make schema-diff      - diff two schema files: CURRENT=<path> PROPOSED=<path>"
 	@echo "  make schema-register  - register event schemas to Glue (requires AWS/floci)"
-	@echo "  make schema-verify    - pre-deploy check: fail if PascalCase schemas are missing (requires AWS)"
+	@echo "  make schema-sync-check - fail if internal/eventschema/*.json drifted from api/asyncapi.yaml"
+	@echo "  make schema-verify    - pre-deploy check: fail unless each schema definition is registered + AVAILABLE (requires AWS)"
 	@echo "  make schema-prune     - dry-run: list orphaned Glue schemas (requires AWS)"
 
 # -----------------------------
@@ -304,9 +305,12 @@ race:
 # -----------------------------
 
 # extract-schemas: derive internal/eventschema/*.json from api/asyncapi.yaml.
-# api/asyncapi.yaml is the single source of truth for event payload schemas.
-# Re-run whenever asyncapi.yaml changes; commit the updated JSON files alongside.
-# The JSON files are read by schema-gov validate --schema-dir internal/eventschema.
+# api/asyncapi.yaml is the single source of truth for event payload schemas:
+# each message's <Name>Envelope wraps a flat, $ref-free <Name>Payload, and
+# extract writes exactly those payloads (4 produced + 3 consumed) — the files
+# ValidatingCodec, ConsumedValidator and GlueCodec embed (DLG-D51). Re-run
+# whenever asyncapi.yaml changes and commit the JSON alongside; never
+# hand-edit it. CI's "Event schema sync check" fails on drift.
 .PHONY: extract-schemas
 extract-schemas:
 	@echo "Extracting event schemas from api/asyncapi.yaml..."
@@ -316,6 +320,17 @@ extract-schemas:
 	  --asyncapi   api/asyncapi.yaml \
 	  --schema-dir internal/eventschema
 	@echo "Done. Run 'git add internal/eventschema/' to stage the changes."
+
+# schema-sync-check: fail if internal/eventschema/*.json has drifted from
+# api/asyncapi.yaml (the same check CI runs). No AWS credentials needed.
+.PHONY: schema-sync-check
+schema-sync-check:
+	docker run --rm --platform "$(SCHEMA_GOV_PLATFORM)" \
+	  -v "$(CURDIR)":/workspace \
+	  "$(SCHEMA_GOV_IMAGE)" extract \
+	  --asyncapi   api/asyncapi.yaml \
+	  --schema-dir internal/eventschema \
+	  --check
 
 # swag: generate Swagger JSON/YAML from handler annotations into docs/swagger/.
 # Re-run whenever annotations change. The output is checked in to the repo.
@@ -373,13 +388,12 @@ schema-pull:
 # (5) open-schema guard, (6) consumer strict-mode, (7) coverage, (8) AsyncAPI structure.
 # No AWS credentials needed.
 #
-# NOTE: intentionally does NOT depend on extract-schemas (DLG-D20).
-# internal/eventschema/*.json are hand-maintained and are the authoritative source
-# for ValidatingCodec at event enqueue time. extract-schemas generates schemas
-# containing $ref to EventEnvelope which the JSON Schema resolver cannot follow
-# outside asyncapi.yaml context — running it overwrites the hand-maintained files
-# and breaks server startup. Run extract-schemas separately for inspection only;
-# never commit its output unless manually verified to be $ref-free.
+# Does not run extract-schemas itself — run `make schema-sync-check` (or
+# extract-schemas) alongside. (Before DLG-D51 asyncapi's payloads were
+# envelope-allOf schemas, so extract emitted a $ref to EventEnvelope that
+# could not be embedded and the JSON had to be hand-maintained; the payloads
+# are now flat and $ref-free, so extract output is exactly the committed
+# files.)
 .PHONY: schema-validate
 schema-validate:
 	docker run --rm --platform "$(SCHEMA_GOV_PLATFORM)" \
@@ -424,6 +438,10 @@ schema-prune:
 	  $(if $(filter true,$(EXECUTE)),--execute,)
 
 # schema-register: register event schemas to Glue (requires AWS credentials or floci).
+# Registers a PascalCase-renamed, produced-only copy (stage-produced-event-schemas.sh)
+# — schema-gov names each schema after its file stem, and GlueCodec resolves
+# the PascalCase event-type names (DelegationStarted, ...). Consumed schemas
+# are never registered here.
 # Set AWS_ENDPOINT_URL=http://localhost:4566 in .env for floci.
 .PHONY: schema-register
 schema-register:
@@ -431,7 +449,9 @@ schema-register:
 	  echo "GLUE_REGISTRY_NAME is not set — add it to .env or pass on the command line"; \
 	  exit 1; \
 	}
-	docker run --rm --platform linux/amd64 \
+	@rm -rf .tmp/glue-schemas
+	@bash .github/scripts/stage-produced-event-schemas.sh .tmp/glue-schemas
+	docker run --rm --platform "$(SCHEMA_GOV_PLATFORM)" \
 	  -v "$(CURDIR)":/workspace \
 	  -e AWS_ACCESS_KEY_ID \
 	  -e AWS_SECRET_ACCESS_KEY \
@@ -440,32 +460,42 @@ schema-register:
 	  -e AWS_ENDPOINT_URL="$(AWS_ENDPOINT_URL)" \
 	  "$(SCHEMA_GOV_IMAGE)" register \
 	  --registry   "$(GLUE_REGISTRY_NAME)" \
-	  --schema-dir internal/eventschema
+	  --schema-dir .tmp/glue-schemas
 
-# schema-verify: fail if any of the four expected PascalCase schema names is
-# missing from the Glue registry. Names match domain.GlueSchemaName + LLD
-# §7.3.1 registry-layout table. Surfaces a mismatch pre-deploy rather than at
-# first-event publish. Requires GLUE_REGISTRY_NAME and AWS credentials.
+# schema-verify: fail unless each of the four PascalCase schemas has an
+# AVAILABLE version whose definition matches this checkout's
+# internal/eventschema file — the exact lookup GlueCodec does at startup
+# (GetSchemaByDefinition, compact + ASCII-escaped like schema-gov register
+# uploads it). Surfaces "pod would CrashLoop on NewGlueCodec" pre-deploy.
+# Requires GLUE_REGISTRY_NAME, AWS credentials (or AWS_ENDPOINT_URL for
+# floci) and python3.
 .PHONY: schema-verify
 schema-verify:
 	@test -n "$(GLUE_REGISTRY_NAME)" || { \
 	  echo "GLUE_REGISTRY_NAME is not set — add it to .env or pass on the command line"; \
 	  exit 1; \
 	}
-	@missing=""; \
-	for name in DelegationStarted DelegationEnded DelegationReviewRequested DelegationEscalationRequested; do \
-	  if ! aws glue get-schema \
+	@rm -rf .tmp/glue-schemas-verify
+	@bash .github/scripts/stage-produced-event-schemas.sh .tmp/glue-schemas-verify >/dev/null
+	@failed=""; \
+	for file in .tmp/glue-schemas-verify/*.json; do \
+	  name=$$(basename "$$file" .json); \
+	  def=$$(python3 -c 'import json,sys; sys.stdout.write(json.dumps(json.load(open(sys.argv[1])), separators=(",", ":")))' "$$file"); \
+	  status=$$(aws glue get-schema-by-definition \
 	      --schema-id "RegistryName=$(GLUE_REGISTRY_NAME),SchemaName=$$name" \
-	      --region "$(AWS_REGION)" >/dev/null 2>&1; then \
-	    missing="$$missing $$name"; \
+	      --schema-definition "$$def" \
+	      --region "$(AWS_REGION)" --query Status --output text 2>/dev/null); \
+	  if [ "$$status" != "AVAILABLE" ]; then \
+	    failed="$$failed $$name($${status:-not-registered})"; \
 	  fi; \
 	done; \
-	if [ -n "$$missing" ]; then \
-	  echo "FAIL: missing Glue schemas in registry '$(GLUE_REGISTRY_NAME)':$$missing"; \
-	  echo "     run 'make schema-register' to create them"; \
+	rm -rf .tmp/glue-schemas-verify; \
+	if [ -n "$$failed" ]; then \
+	  echo "FAIL: this checkout's schema definition is not registered+AVAILABLE in '$(GLUE_REGISTRY_NAME)':$$failed"; \
+	  echo "     run 'make schema-register' (or wait for schema-registry.yml) to register it"; \
 	  exit 1; \
 	fi; \
-	echo "OK: all four schemas present in registry '$(GLUE_REGISTRY_NAME)'"
+	echo "OK: all four schema definitions registered and AVAILABLE in '$(GLUE_REGISTRY_NAME)'"
 
 # -----------------------------
 # CHECKS (mirror what CI runs; safe to call locally before pushing)

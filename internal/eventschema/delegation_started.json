@@ -1,7 +1,6 @@
 {
   "$schema": "http://json-schema.org/draft-07/schema#",
   "title": "DelegationStartedPayload",
-  "description": "Payload of the DelegationStarted event (LLD §10.3/§10.5). Emitted by DLG-2 create and the create leg of DLG-5 reassign. Self-contained snapshot — tenant_id/actor_id are repeated here even though they are also carried at the envelope level (DLG-EVT-7).",
   "type": "object",
   "required": [
     "delegation_id",
@@ -30,7 +29,11 @@
     },
     "scope": {
       "type": "string",
-      "enum": ["all", "department", "tender"]
+      "enum": [
+        "all",
+        "department",
+        "tender"
+      ]
     },
     "scope_id": {
       "type": "string",

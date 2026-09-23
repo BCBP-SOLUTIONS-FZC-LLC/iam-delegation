@@ -59,13 +59,13 @@ graph TD
         postgres["postgres/\nDelegationRepository · SettingsRepository · GaugeRepository\nTxRunner (injects port.EventPublisher) · migrations/\nWithTenantGUC · SystemDSNFromEnv (LLD §4.4-equivalent)"]
         userprofile["userprofile/\nHTTPClient — UserProfileClient impl\n(DEL-6 availability-first pointer set/clear)"]
         orgmembership["orgmembership/\nHTTPChecker — MembershipCheckClient impl\n(DLG-D3 grant-time membership-existence checks)"]
-        eventbus["eventbus/\nPublisher + ValidatingCodec (enqueue-time)\nGlueCodec · GlueDecodeCodec (consume-side) · events.NoopCodec"]
+        eventbus["eventbus/\nPublisher + ValidatingCodec (enqueue-time)\nGlueCodec · GlueDecodeCodec + ConsumedValidator (consume-side)\nevents.NoopCodec"]
         valkey["valkey/\ndel: cache — del:list: (60s) · del:idem: (24h)"]
         metrics["metrics/\niam_delegation_* Prometheus instruments\n(RecordCreated/Ended/ReviewWarned/CascadeProcessed/...)"]
     end
 
     subgraph eventschema_grp["Generated Schemas — internal/eventschema/"]
-        eventschema["eventschema/\n7 hand-maintained JSON Schemas (4 published + 3 consumed)\nDelegationStarted · DelegationEnded · DelegationReviewRequested · DelegationEscalationRequested\n+ MembershipRevoked · TenantMembershipsPurged · UserUpdated"]
+        eventschema["eventschema/\n7 JSON Schemas generated from asyncapi.yaml (4 published + 3 consumed)\nDelegationStarted · DelegationEnded · DelegationReviewRequested · DelegationEscalationRequested\n+ MembershipRevoked · TenantMembershipsPurged · UserUpdated"]
     end
 
     subgraph core["Core — internal/core/"]
@@ -79,7 +79,7 @@ graph TD
     end
 
     subgraph apidir["Design-time Contract — api/"]
-        api["asyncapi.yaml (hand-maintained) + embed.go\nvalidated by platform-schemagov against a live\nGlue registry (iam-delegation-events, DLG-D20)"]
+        api["asyncapi.yaml (single source) + embed.go\nvalidated by platform-schemagov, JSON schemas\nderived from it (extract --check, DLG-D51)"]
     end
 
     main        --> http_h
@@ -112,7 +112,7 @@ graph TD
     valkey      --> port
     metrics     --> domain
     port        --> domain
-    api         -.->|"make extract-schemas (n/a — hand-maintained\nboth sides here, DLG-D20)"| eventschema
+    api         -.->|"make extract-schemas\n(CI extract --check, DLG-D51)"| eventschema
 ```
 
 Directory layout, for reference:
@@ -171,9 +171,9 @@ iam-delegation/
 │           ├── eventbus/                    -- SNS publisher (iam-delegation-events) + Glue codec (encode+decode)
 │           ├── valkey/                      -- del: cache + idempotency store
 │           └── metrics/                     -- 3-tier metrics: Tier 1 platform_messages_* + platform_dependency_* · Tier 3 iam_delegation_*
-├── internal/eventschema/                    -- 7 hand-maintained JSON Schemas + schemas.go (embed): 4 published (DelegationStarted/Ended/ReviewRequested/EscalationRequested) + 3 consumed (MembershipRevoked/TenantMembershipsPurged/UserUpdated); no extract-schemas step (DLG-D20)
+├── internal/eventschema/                    -- 7 JSON Schemas generated from api/asyncapi.yaml by make extract-schemas (DLG-D51) + schemas.go (embed): 4 published (DelegationStarted/Ended/ReviewRequested/EscalationRequested) + 3 consumed (MembershipRevoked/TenantMembershipsPurged/UserUpdated); no extract-schemas step (DLG-D20)
 ├── pkg/requestctx/                          -- gateway-identity / tenant-actor extraction helpers
-├── api/                                     -- asyncapi.yaml (hand-maintained, IAM Delegation Events spec) + embed.go
+├── api/                                     -- asyncapi.yaml (single source of internal/eventschema) + embed.go
 ├── scripts/
 │   ├── init-floci.sh                        -- local-dev SNS/SQS/Glue provisioning (floci)
 │   └── patch-swagger-extensions.py          -- post-processes docs/swagger/ after make swag (injects tags block)
@@ -272,9 +272,9 @@ erDiagram
         timestamptz starts_at "NOT NULL DEFAULT now()"
         timestamptz ends_at "NULL = open-ended (DEL-8)"
         timestamptz review_due_at "open-ended only, starts_at + review window (DEL-13)"
-        int review_last_warned_bucket "7 or 3 or NULL, tracks which review notice fired (DLG-Q6)"
+        int review_last_warned_bucket "3, 2, 1, or NULL — last days_remaining value notified (DLG-Q6)"
         int review_window_days "per-delegation override, range 1..180 (DEL-14)"
-        delegation_status status "ENUM scheduled-active-ended-cancelled (DEL-3, scheduled added DLG-D25)"
+        delegation_status status "ENUM scheduled-active-ended-cancelled (DEL-3, DLG-D25)"
         bigint record_version "optimistic lock"
         timestamptz created_at
         timestamptz updated_at
@@ -347,6 +347,7 @@ sequenceDiagram
     actor DR as Delegator (or admin)
     participant DLG as Delegation Service
     participant Core as Core (Org and Membership)
+    participant TN as Tender
     participant UP as User Profile
     participant PG as Delegation Postgres
 
@@ -355,6 +356,14 @@ sequenceDiagram
     par membership checks (both parties)
         DLG->>Core: GET /internal/tenants/:id/members/:delegator_id/exists
         DLG->>Core: GET /internal/tenants/:id/members/:delegate_id/exists
+    end
+    opt scope = 'tender' (§7.6.7)
+        DLG->>TN: GET /internal/tenants/:id/tenders/:scope_id/exists
+        alt Tender unreachable
+            DLG-->>DR: 503 tender_unavailable
+        else scope_id not a live tender in this tenant
+            DLG-->>DR: 422 tender_scope_not_found
+        end
     end
     alt either Core unreachable
         DLG-->>DR: 503 org_membership_unavailable
@@ -368,7 +377,7 @@ sequenceDiagram
         else UP 200
             DLG->>PG: RunInTx { INSERT delegations status=active (incl. review_window_days from tenant settings), outbox DelegationStarted }
             alt RunInTx fails (DB error, pool exhaustion, etc.)
-                DLG->>UP: PUT /internal/users/:delegator_id/availability {delegate_id null} (best-effort compensating clear)
+                DLG->>UP: DELETE /internal/users/:delegator_id/availability/delegate (best-effort compensating clear — BUG-05)
                 DLG-->>DR: 500 / appropriate error
             else RunInTx ok
                 DLG->>DLG: SET del:idem, INVALIDATE del:list cache
@@ -380,7 +389,7 @@ sequenceDiagram
         DLG->>PG: RunInTx { INSERT delegations status=scheduled — no UP call, no outbox event yet }
         DLG->>DLG: SET del:idem, INVALIDATE del:list cache
         DLG-->>DR: 201 Created
-        Note over DLG,PG: no DelegationStarted yet — delegation-activation cron (below) calls UP and activates this row once starts_at is reached
+        Note over DLG,PG: no DelegationStarted yet — delegation-activation cron (§11.1a) calls UP and activates this row once starts_at is reached
     end
 ```
 
@@ -405,7 +414,7 @@ sequenceDiagram
     participant UP as User Profile
     participant PG as Delegation Postgres
 
-    CR->>DLG: (in-process job call, mirrors DLG-I1/I2's reconciler topology)
+    CR->>DLG: (in-process job call, mirrors DLG-I1/I2's reconciler topology — §16.1)
     DLG->>PG: ListScheduledBefore: SELECT ... WHERE status='scheduled' AND starts_at <= now() AND deleted_at IS NULL ORDER BY starts_at LIMIT 100
     loop per due delegation
         DLG->>UP: PUT /internal/users/:delegator_id/availability {status ooo, delegate_id, note, ooo_until: ends_at or review_due_at}
@@ -433,9 +442,9 @@ sequenceDiagram
 
     U->>DLG: DELETE /api/v1/delegations/:id?record_version=N
     DLG->>PG: FindByID (RLS-scoped)
-    DLG->>UP: PUT /internal/users/:delegator_id/availability {delegate_id null} (clear pointer only, never status available)
+    DLG->>UP: DELETE /internal/users/:delegator_id/availability/delegate (clear pointer only, never status available)
     Note over DLG,UP: fail-open — if UP is down, log and proceed, the expiry cron re-clears later
-    DLG->>PG: RunInTx { End status=cancelled at record_version N, then outbox DelegationEnded cancelled }
+    DLG->>PG: RunInTx { End status=cancelled at record_version N (WHERE status IN (active, scheduled) — DLG-D25), then outbox DelegationEnded cancelled }
     alt version mismatch
         DLG-->>U: 409 optimistic_lock_conflict
     else terminal already
@@ -460,7 +469,7 @@ sequenceDiagram
     CR->>DLG: POST /internal/delegations/expire
     DLG->>PG: SELECT ... WHERE status=active AND deleted_at IS NULL AND ends_at IS NOT NULL AND ends_at < now() LIMIT 50
     loop per expired delegation
-        DLG->>UP: PUT /internal/users/:delegator_id/availability {delegate_id null}
+        DLG->>UP: DELETE /internal/users/:delegator_id/availability/delegate
         alt UP fail
             DLG->>DLG: leave active, defer (DEL-6), retry next tick
         else UP 200
@@ -477,28 +486,30 @@ sequenceDiagram
 ```mermaid
 sequenceDiagram
     autonumber
-    participant CR as delegation-review CronJob
+    participant CR as delegation-review CronJob (hourly, 0 * * * *)
     participant DLG as Delegation Service
     participant UP as User Profile
     participant PG as Delegation Postgres
 
     CR->>DLG: POST /internal/delegations/review-sweep
-    DLG->>PG: Pass 1 (daily cascade warn) WHERE ends_at IS NULL AND status=active AND review_due_at in (now(), now()+3d]
+    Note over DLG: Pass 1 — daily cascade warn
+    DLG->>PG: SELECT WHERE ends_at IS NULL AND status='active' AND review_due_at > now() AND review_due_at <= now()+3d AND status='active' AND deleted_at IS NULL ORDER BY review_due_at LIMIT 100
     loop per target row
-        DLG->>DLG: days_remaining = CEIL((review_due_at - now()) / 1 day), clamped to [1,3]
+        DLG->>DLG: days_remaining = CEIL((review_due_at − now()) / 1 day) clamped to [1,3]
         alt review_last_warned_bucket IS DISTINCT FROM days_remaining
-            DLG->>PG: RunInTx { UPDATE review_last_warned_bucket=days_remaining AND status=active, then outbox DelegationReviewRequested{days_remaining} }
+            DLG->>PG: RunInTx { UPDATE review_last_warned_bucket=days_remaining AND status='active', outbox DelegationReviewRequested{days_remaining} }
         else already notified today
             DLG->>DLG: skip (idempotent)
         end
     end
-    DLG->>PG: Pass 2 (auto-end) WHERE ends_at IS NULL AND status=active AND review_due_at <= now()
+    Note over DLG: Pass 2 — auto-end
+    DLG->>PG: SELECT WHERE ends_at IS NULL AND status='active' AND review_due_at <= now() AND deleted_at IS NULL ORDER BY review_due_at LIMIT 100
     loop per end target
-        DLG->>UP: PUT /internal/users/:delegator_id/availability {delegate_id null}
+        DLG->>UP: DELETE /internal/users/:delegator_id/availability/delegate
         alt UP ok
-            DLG->>PG: RunInTx { UPDATE status=ended, then outbox DelegationEnded review_expired }
+            DLG->>PG: RunInTx { UPDATE status='ended' AND status='active' at record_version v, outbox DelegationEnded{review_expired} }
         else UP fail
-            DLG->>DLG: defer (DEL-6), retry next tick
+            DLG->>DLG: defer — increment iam_delegation_review_deferred_total, retry next tick (DEL-6)
         end
     end
     DLG-->>CR: {warned_3d, warned_2d, warned_1d, expired, deferred}
@@ -537,10 +548,11 @@ sequenceDiagram
     Note over Core,DLG: removal applied, ASYNC row-end here
     Core->>Core: RunInTx { remove membership }, then emit MembershipRevoked
     Core-->>DLG: MembershipRevoked (SQS delegation-cascade-q)
-    DLG->>PG: end all active/scheduled delegations where delegator_id=user OR delegate_id=user
-    loop per ended delegation
-        DLG->>UP: PUT /internal/users/:delegator_id/availability {delegate_id null} (DEL-6)
-        DLG->>PG: RunInTx { UPDATE status=ended, deleted_at set, then outbox DelegationEnded delegate_removed } (delegate-side, delegator-side silent per DLG-EVT-4)
+    DLG->>PG: UPDATE delegations SET status='ended', deleted_at=now() WHERE tenant_id=$1 AND (delegator_id=$2 OR delegate_id=$2) AND status IN ('active','scheduled') AND deleted_at IS NULL
+    Note over DLG,PG: status filter is mandatory — prevents re-ending terminal rows and corrupting deleted_at on historical records (GAP-02) — 'scheduled' included (DLG-D25) so a not-yet-activated delegation for a departed member is ended too, rather than stranded and later failing to activate against a member who no longer exists
+    Note over DLG,PG: the UPDATE runs in one RunInTx with one outbox DelegationEnded{delegate_removed} per delegate-side row and the processed_events insert (IDEMP-2, DLG-D38) — delegator-side rows are silent, no UP call and no event (DLG-EVT-4 asymmetry)
+    loop per ended delegate-side row, after commit
+        DLG->>UP: DELETE /internal/users/:delegator_id/availability/delegate (DEL-6, best-effort — the row is already inert)
     end
 ```
 
@@ -562,7 +574,7 @@ sequenceDiagram
 
     Note over UP: PatchIdentity(status=disabled): clears the delegate pointer on every<br/>delegator's user_availability row (ClearInboundDelegates) AND publishes<br/>UserUpdated{status:disabled} atomically in the same transaction (LLD §8.8.16 K1, iam-user-profile)
     UP-->>DLG: UserUpdated{user_id, changed_fields:[status], status:"disabled"} (iam.user.events)
-    DLG->>DLG: decode payload — status != disabled: ack, no dispatch (most deliveries)
+    DLG->>DLG: decode payload — status != "disabled" → ack + record processed_events, no dispatch (most deliveries)
     DLG->>PG: UPDATE delegations SET status='ended' WHERE tenant_id=$1 AND delegate_id=$2<br/>AND status IN ('active','scheduled') AND deleted_at IS NULL<br/>RETURNING *
     Note over DLG,PG: deleted_at is NOT set (disabled ≠ removed) — unlike EndForUser's hard soft-delete
     loop per ended delegation (every row is delegate-side by construction)
@@ -590,6 +602,7 @@ sequenceDiagram
     participant DLG as Delegation Service
     participant V as Valkey (del:)
     participant PG as Delegation Postgres
+    participant UP as User Profile
 
     Note over C,PG: DLG-1 GET /delegations (list, self)
     C->>DLG: GET /api/v1/delegations
@@ -602,7 +615,7 @@ sequenceDiagram
     end
     DLG-->>C: 200 {items}
 
-    Note over C,PG: DLG-4 POST /delegations/:id/extend (open-ended only, no UP call ordering the same as Create)
+    Note over C,PG: DLG-4 POST /delegations/:id/extend (open-ended only)
     C->>DLG: POST /delegations/:id/extend {extend_days?}
     DLG->>PG: FindByID (RLS-scoped)
     alt fixed ends_at (review_due_at IS NULL)
@@ -611,14 +624,14 @@ sequenceDiagram
         DLG-->>C: 422 extend_days_out_of_range
     else ok
         DLG->>PG: RunInTx { ExtendReview push review_due_at, reset review_last_warned_bucket=NULL at record_version N }
-        DLG->>DLG: re-sync ooo_until in User Profile, fail-open (DLG-D29)
+        DLG->>UP: PUT /internal/users/:delegator_id/availability {status ooo, ooo_until: new review_due_at} (best-effort re-sync, DLG-D29)
         DLG-->>C: 200 {review_due_at, review_last_warned_bucket=null}
     end
 
     Note over C,PG: DLG-5 POST /delegations/:id/reassign (end old, create new)
     C->>DLG: POST /delegations/:id/reassign {new_delegate_id?, scope?, ...}
-    DLG->>DLG: Cancel(old) flow — emits DelegationEnded cancelled
-    DLG->>DLG: Create(new) flow — membership checks + UP + DelegationStarted
+    DLG->>DLG: Cancel(old) flow (§11.2) — emits DelegationEnded reassigned
+    DLG->>DLG: Create(new) flow (§11.1) — membership checks + UP + DelegationStarted
     Note over DLG: if the new create fails after the old ended, old is NOT resurrected (DLG-D11)
     DLG-->>C: 201 {new delegation}
 
@@ -736,6 +749,19 @@ cross-service IAM permission, only encoding does. `platform-events` only invokes
 when the inbound envelope's `SchemaID` is non-empty, so a NoopCodec-published message never
 triggers it — safe in every environment.
 
+**Consumer-side schema validation (DLG-D51):** after decode and before dispatch, `CascadeConsumer`
+validates each of the three payloads against its embedded consumed schema (`eventschema.Consumed`,
+extracted from `api/asyncapi.yaml` like the produced ones) via `eventbus.ConsumedValidator`,
+injected from `cmd/server` as a `PayloadValidator` func so the inbound adapter never imports an
+outbound one. The schemas require exactly what the producers require (`actor_id` is optional —
+Core omits it on system-driven removals) and deliberately omit `changed_fields`' enum, so a
+valid or additively-widened upstream event is never rejected. A violation is permanent but never
+acked: it is logged, counted on `iam_delegation_cascade_dlq_total`, not marked processed, and
+returned so redrive moves it to `delegation-cascade-q-dlq` for inspection — acking would lose a
+cascade silently. The check matters because Go's decoding is laxer than the contract: a dash-less
+32-hex `user_id` parses with `google/uuid` and would otherwise end that user's delegations (e2e
+scenario `ConsumedSchemaViolationNotCascaded`).
+
 ### Wire format — AWS Glue Schema Registry `iam-delegation-events`
 
 **No runtime name translation, unlike `iam-user-profile`'s `domain.GlueSchemaName` switch:** this
@@ -745,11 +771,14 @@ schema names — `DelegationStarted`, `DelegationEnded`, `DelegationReviewReques
 `SchemaName`.
 
 18-byte header, identical to every sibling service: `byte 0 = 0x03` (header version), `byte 1 =
-0x00` (no compression), `bytes 2-17` = schema version UUID (big-endian). `GlueCodec` pre-fetches
-each schema's latest version ID from Glue at startup (`StartRefresher` keeps it current on a
-ticker); `events.NoopCodec` is the SNS pass-through when `GLUE_REGISTRY_NAME` is unset. The local
-dev compose stack sets `GLUE_REGISTRY_NAME=iam-delegation-events` (Floci includes Glue Schema
-Registry for free, so `GlueCodec` runs locally by default with no Pro token required).
+0x00` (no compression), `bytes 2-17` = schema version UUID (big-endian). `GlueCodec` resolves
+each schema's version ID once at startup **by definition** (`GetSchemaByDefinition` with this
+binary's embedded `eventschema.ByEventType` file, compact + ASCII-escaped exactly as `schema-gov
+register` uploads it, `AVAILABLE` required) — no background refresh, so it stamps the version it
+actually produces, never merely the registry's latest; an unregistered definition fails startup
+(CrashLoop until `schema-registry.yml` registers it, DLG-D50). `events.NoopCodec` is the SNS
+pass-through when `GLUE_REGISTRY_NAME` is unset (local dev sets it by default — floci serves Glue
+Schema Registry for free).
 
 ### Consumer conformance checklist
 
@@ -850,8 +879,8 @@ same groups into the Helm-rendered `PrometheusRule` — the standalone file exis
 ### Background workers — six, not three
 
 `cmd/server/main.go` runs **six** real background goroutines under one `errgroup` (plus a
-graceful-shutdown goroutine and `GlueCodec.StartRefresher`'s internal ticker, neither counted among
-the six): the outbox runner, the `delegation-cascade-q` SQS consumer, the
+graceful-shutdown goroutine, not counted among the six — `GlueCodec` has no background refresher
+since DLG-D50): the outbox runner, the `delegation-cascade-q` SQS consumer, the
 `iam_delegation_active_gauge` exporter (above), a daily outbox-prune sweep
 (`outboxRunner.PrunePublished`, `OUTBOX_PRUNE_INTERVAL`/`_RETENTION`/`_LIMIT`, DLG-D24 — without it
 `outbox_events` grows unbounded, since published rows are never deleted automatically), the HTTP API
@@ -1228,6 +1257,8 @@ this build had to make its own call ahead of any of these existing, it is called
 | DLG-D47 | **New CI gate, ported from `iam-org-membership`'s identical `check-outbox-access.sh`.** Rejects hand-rolled SQL against `outbox_events` (a raw Go backtick literal matching `from\|into\|update outbox_events`) anywhere in `internal/`/`cmd/`/`pkg/` outside `internal/adapter/outbound/eventbus` — every mutation must go through `outbox.Enqueue`/`outbox.Runner.PrunePublished`. The sibling repo's script exists because that exact bypass happened there once (a hand-rolled batched `DELETE` duplicating `PrunePublished`, since removed); this service has no history of the violation (confirmed: every `outbox_events` reference in this repo's `.go` files is a prose comment, not a SQL literal — the migration's `GRANT` on the table is DDL/DCL, not a data-access bypass, and is a `.sql` file outside this script's scope anyway), but the same architectural gap — nothing currently prevents one — applies equally here. Wired into `validate-quality.yml` alongside DLG-D46's `check-forbidden-events-bypass.sh`. |
 | DLG-D48 | **GAP-020 — `scope=department` scope_id validation against Catalog Admin (cross-service compatibility audit, 2026-09-22).** The compatibility audit between `iam-delegation` and `iam-catalog-admin` found that `DelegationService.Create` accepted any UUID as a `scope_id` for `scope=department` delegations without verifying it against the global department catalog. A delegation could be created for a retired or non-existent department. Added: `port.CatalogAdminClient` interface; `internal/adapter/outbound/catalogadmin/` HTTP adapter calling `GET /api/v1/departments/:id` (CAT-7); department scope_id check in `DelegationService.Create` between `validateCreateInput` and `checkBothMemberships` — fail-closed on 5xx (`503 catalog_admin_unavailable`), `422 invalid_scope_id` on 404 or `is_active=false`; `WithCatalogAdmin()` optional setter on `DelegationService` (nil = presence-only fallback, matching `TenderScopeClient`'s unwired pattern); `ErrCatalogAdminUnavailable` sentinel + 503 mapping; `CATALOG_ADMIN_BASE_URL`/`CATALOG_ADMIN_TIMEOUT_MS` env vars in `config.go`, `.env.example`, and Helm `values.yaml`; `catalogadmin` added to `.go-arch-lint.yml` `adapters_outbound`; 15 tests in `catalogadmin/http_client_test.go` (all paths: active, retired, 404, 5xx, timeout, network error, malformed JSON, nil metrics). |
 | DLG-D49 | **Enterprise Platform Observability Standard — three-tier metrics taxonomy fully implemented (2026-09-22).** `platform_dependency_request_seconds` and `platform_dependency_errors_total` (Registry-Proposed, same rationale as `iam-org-membership`) added to `metrics.go`. All three outbound HTTP clients (`orgmembership`, `userprofile`, `catalogadmin`) dual-emit Tier-1 latency/error counters via `ObserveDependencyLatency`/`IncDependencyError`/`DependencyOutcome` package-level helpers alongside existing Tier-3 legacy metrics during the compatibility period. Four new CI enforcement scripts wired into `validate-quality.yml`: `check-metric-namespacing.sh` (pre-existing, now actually wired), `check-observability-compliance.sh` (9 rules — logs/metrics/traces via gincommon), `check-platform-events-compliance.sh` (11 rules — events/outbox/dedup via platform-events), `check-pgcommon-compliance.sh` (11 rules — DB via pgcommon). The three legacy Tier-3 metrics (`iam_delegation_cascade_processed_total`, `iam_delegation_cascade_dlq_total`, `iam_delegation_processed_events_duplicates_total`) and the two new Tier-3 legacy predecessors (`iam_delegation_dependency_call_duration_seconds`, `iam_delegation_dependency_call_failures_total`) remain during the compatibility period, to be removed once dashboards and on-call runbooks have migrated to the platform_* equivalents. |
+| DLG-D50 | **Glue schema-version resolution by definition** (LLD rev 2.19), applied identically across the IAM services. `GlueCodec` resolves each schema's version once at startup via `GetSchemaByDefinition` over this binary's embedded `eventschema.ByEventType` file (serialized exactly as `schema-gov register` uploads it — compact, `\uXXXX`-escaped; pinned by a Python-parity test), `AVAILABLE` required; `StartRefresher`/`WithLogger` and the 5-minute ticker are removed. The old `LatestVersion` prefetch stamped the registry's newest version, which is wrong whenever registration and deploy are out of step (register-ahead, rollback, deploy racing CI). Unregistered definition → startup failure → CrashLoop until registration lands (outbox buffers, nothing lost); `make schema-verify` performs the same lookup pre-deploy. Found and fixed alongside: CI/`make schema-register` registered the snake_case files under their file-stem names, which the codec never looks up — now a PascalCase copy staged by `.github/scripts/stage-produced-event-schemas.sh` is registered. Consumer side unchanged (DLG-D21 already decodes Glue frames). |
+| DLG-D51 | **`api/asyncapi.yaml` is the single source of the event schemas, and consumed payloads are validated** (LLD rev 2.20) — reverses DLG-D20's "both hand-maintained" model, which had let asyncapi (envelope-`allOf` payloads) and the JSON files (payload-only) drift with no check. asyncapi now uses `iam-org-membership`'s `<Name>Envelope` → `data: <Name>Payload` form; `make extract-schemas` generates all seven JSON files (4 produced + 3 consumed); every `schema-registry.yml` job runs `extract --check`. That also fixes validate's Pass 7, which had failed on every run for want of the 3 consumed files. The consumed schemas back a new pre-dispatch validation on `delegation-cascade-q` (`eventbus.ConsumedValidator` → `CascadeConsumer.WithPayloadValidator`); violations are left for redrive to the DLQ, never acked. They match the producers' contracts, checked field-by-field — which corrected asyncapi's wrong `actor_id: required`. CI: `usage-check` had named events after snake_case file stems, so usage→lifecycle enforcement never matched a message; it, `diff` and `register` now share one PascalCase produced-only staged copy per job, and `SCHEMA_NAME_MAP` is gone. |
 
 **Known deviations from a literal reading of the LLD:**
 

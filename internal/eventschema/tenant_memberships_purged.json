@@ -1,23 +1,19 @@
 {
   "$schema": "http://json-schema.org/draft-07/schema#",
   "title": "TenantMembershipsPurgedPayload",
-  "description": "Payload of the TenantMembershipsPurged event produced by Core / Org & Membership on iam.membership.events when a tenant transitions to offboarded. Consumed by this service on delegation-cascade-q to drive CascadeService.ScrubTenant (LLD §11.6). Mirrors internal/core/domain/event_payloads.go TenantMembershipsPurgedPayload exactly.",
   "type": "object",
   "required": [
-    "tenant_id",
-    "actor_id"
+    "tenant_id"
   ],
   "additionalProperties": true,
   "properties": {
     "tenant_id": {
       "type": "string",
-      "format": "uuid",
-      "description": "The tenant being offboarded."
+      "format": "uuid"
     },
     "actor_id": {
       "type": "string",
-      "format": "uuid",
-      "description": "Who performed the offboarding."
+      "format": "uuid"
     }
   }
 }

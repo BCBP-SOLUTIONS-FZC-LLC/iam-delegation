@@ -3,6 +3,7 @@ sequenceDiagram
     actor DR as Delegator (or admin)
     participant DLG as Delegation Service
     participant Core as Core (Org and Membership)
+    participant TN as Tender
     participant UP as User Profile
     participant PG as Delegation Postgres
 
@@ -12,19 +13,27 @@ sequenceDiagram
         DLG->>Core: GET /internal/tenants/:id/members/:delegator_id/exists
         DLG->>Core: GET /internal/tenants/:id/members/:delegate_id/exists
     end
+    opt scope = 'tender' (§7.6.7)
+        DLG->>TN: GET /internal/tenants/:id/tenders/:scope_id/exists
+        alt Tender unreachable
+            DLG-->>DR: 503 tender_unavailable
+        else scope_id not a live tender in this tenant
+            DLG-->>DR: 422 tender_scope_not_found
+        end
+    end
     alt either Core unreachable
         DLG-->>DR: 503 org_membership_unavailable
     else either not active
         Core-->>DLG: {active false}
         DLG-->>DR: 422 invalid_delegate
     else both active (each returns tenant_membership_id), starts_at within skewTolerance of now or omitted
-        DLG->>UP: PUT /internal/users/:delegator_id/availability {status ooo, delegate_id, note, ends_at}
+        DLG->>UP: PUT /internal/users/:delegator_id/availability {status ooo, delegate_id, note, ooo_until: ends_at or review_due_at}
         alt UP 5xx/timeout
             DLG-->>DR: 503 user_profile_unavailable
         else UP 200
             DLG->>PG: RunInTx { INSERT delegations status=active (incl. review_window_days from tenant settings), outbox DelegationStarted }
             alt RunInTx fails (DB error, pool exhaustion, etc.)
-                DLG->>UP: PUT /internal/users/:delegator_id/availability {delegate_id null} (best-effort compensating clear — BUG-05)
+                DLG->>UP: DELETE /internal/users/:delegator_id/availability/delegate (best-effort compensating clear — BUG-05)
                 DLG-->>DR: 500 / appropriate error
             else RunInTx ok
                 DLG->>DLG: SET del:idem, INVALIDATE del:list cache

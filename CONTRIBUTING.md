@@ -50,9 +50,9 @@ internal/
     eventbus/            ← ValidatingCodec + GlueCodec/GlueDecodeCodec (events.Codec; events.NoopCodec from the library)
     valkey/               ← del: cache + idempotency store
     metrics/              ← Prometheus instruments
-internal/eventschema/    ← Hand-maintained JSON Schemas for the four published events
+internal/eventschema/    ← JSON Schemas generated from api/asyncapi.yaml (make extract-schemas) — 4 published + 3 consumed
 pkg/requestctx/          ← Gateway-identity / tenant-actor extraction helpers
-api/                     ← asyncapi.yaml (hand-maintained) + embed.go
+api/                     ← asyncapi.yaml (single source of the event schemas) + embed.go
 docs/                    ← lld/, architecture/ (mermaid diagrams), runbook-schema-registry.md, swagger/
 ```
 
@@ -91,14 +91,14 @@ Tests are colocated with the code they cover (`*_test.go` next to the source fil
 
 ### Adding a new domain event type
 
-This repo's event contract is entirely hand-maintained — unlike `iam-user-profile`, there is **no** `make extract-schemas` step deriving `internal/eventschema/*.json` from `api/asyncapi.yaml`; both are authored and kept in sync by hand (DLG-D20).
+`api/asyncapi.yaml` is the single source of the event contract: `make extract-schemas` generates `internal/eventschema/*.json` from its `<Name>Payload` schemas, and CI fails on drift (DLG-D51) — never hand-edit the JSON.
 
 1. Add the payload struct and event-type constant to `internal/core/domain/event.go` — the constant value IS the Glue schema name (PascalCase, no translation table).
-2. Add the JSON schema file to `internal/eventschema/` using the snake_case filename convention (e.g. `delegation_transferred.json`), with `"additionalProperties": true`.
-3. Add the schema to `eventschema.ByEventType` in `internal/eventschema/schemas.go` (ValidatingCodec compiles this map at startup; SchemaValidator uses the same map).
-4. Extend `SCHEMA_NAME_MAP` in `.github/workflows/schema-registry.yml` (all three job blocks: `staging`, `production`, `pr-check`) and add a `register_schema` call in `scripts/init-floci.sh`.
-5. Add the message to `api/asyncapi.yaml` with `x-lifecycle: {status: active}` and `x-owner` annotations.
-6. Run `make schema-validate` locally, then `make schema-register` in every environment before the first pod that would publish the new event starts.
+2. Add the message to `api/asyncapi.yaml` (`x-lifecycle: {status: active}` + `x-owner`), a `<Name>Envelope` schema and a flat `<Name>Payload` schema with `additionalProperties: true`.
+3. Run `make extract-schemas` (writes the snake_case JSON file, e.g. `delegation_transferred.json`).
+4. Embed it in `internal/eventschema/schemas.go` and add it to `eventschema.ByEventType` (ValidatingCodec compiles this map at startup) and to the `NewGlueCodec` name list in `cmd/server/main.go`.
+5. Map its stem in `name_for` in `.github/scripts/stage-produced-event-schemas.sh` (the PascalCase copy CI usage-checks, diffs and registers) and add a `register_schema` call in `scripts/init-floci.sh`.
+6. Run `make schema-validate` and `make schema-sync-check` locally; once merged, the definition must be registered (`schema-registry.yml`, or `make schema-register`) before a pod running it starts — `GlueCodec` resolves every schema **by definition** at startup and fails fast otherwise. This applies to any edit of an existing produced schema too.
 7. Update the event table in `README.md`.
 
 The full checklist (with rationale) lives in `docs/runbook-schema-registry.md` § "Adding a new event type" — this is the condensed version.
@@ -157,7 +157,7 @@ When your change touches a public contract or internal data flow, update the fol
 | What changed | Documents to update |
 |---|---|
 | New HTTP endpoint | README.md API overview table · run `make swag` |
-| New domain event type | `api/asyncapi.yaml` · `internal/eventschema/` · `SCHEMA_NAME_MAP` in `schema-registry.yml` · `docs/runbook-schema-registry.md` · README.md event table |
+| New domain event type | `api/asyncapi.yaml` (then `make extract-schemas`) · `internal/eventschema/schemas.go` · `stage-produced-event-schemas.sh` · `docs/runbook-schema-registry.md` · README.md event table |
 | Changed request/cron/cascade flow | `ARCHITECTURE.md` § Key request flows + the matching `docs/architecture/mermaid/*.mmd` source file · `docs/lld/iam-lld-delegation-service.md` if it's a design-level change |
 | New or renamed package | `ARCHITECTURE.md` § Layer model + `docs/architecture/mermaid/layer-model.mmd` |
 | New environment variable | `.env.example` (inline comment) · README.md Environment variables table · `deploy/helm/iam-delegation/values.yaml` |

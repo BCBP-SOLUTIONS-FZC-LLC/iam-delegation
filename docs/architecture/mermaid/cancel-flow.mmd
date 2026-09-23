@@ -7,9 +7,9 @@ sequenceDiagram
 
     U->>DLG: DELETE /api/v1/delegations/:id?record_version=N
     DLG->>PG: FindByID (RLS-scoped)
-    DLG->>UP: PUT /internal/users/:delegator_id/availability {delegate_id null} (clear pointer only, never status available)
+    DLG->>UP: DELETE /internal/users/:delegator_id/availability/delegate (clear pointer only, never status available)
     Note over DLG,UP: fail-open — if UP is down, log and proceed, the expiry cron re-clears later
-    DLG->>PG: RunInTx { End status=cancelled at record_version N, then outbox DelegationEnded cancelled }
+    DLG->>PG: RunInTx { End status=cancelled at record_version N (WHERE status IN (active, scheduled) — DLG-D25), then outbox DelegationEnded cancelled }
     alt version mismatch
         DLG-->>U: 409 optimistic_lock_conflict
     else terminal already

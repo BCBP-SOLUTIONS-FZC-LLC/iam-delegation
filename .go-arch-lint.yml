@@ -47,7 +47,8 @@ components:
   eventschema:
     in: internal/eventschema
 
-  # api/asyncapi.yaml + embed.go — the hand-authored AsyncAPI contract,
+  # api/asyncapi.yaml + embed.go — the hand-authored AsyncAPI contract (the
+  # single source internal/eventschema is extracted from, DLG-D51),
   # embedded so it can be served (e.g. a docs route) or read at startup.
   # Declared as its own component (rather than folded into eventschema)
   # because it is a design-time contract artifact, not a runtime payload

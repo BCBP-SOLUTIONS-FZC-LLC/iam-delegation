@@ -19,8 +19,9 @@ sequenceDiagram
     Note over Core,DLG: removal applied, ASYNC row-end here
     Core->>Core: RunInTx { remove membership }, then emit MembershipRevoked
     Core-->>DLG: MembershipRevoked (SQS delegation-cascade-q)
-    DLG->>PG: end all active delegations where delegator_id=user OR delegate_id=user
-    loop per ended delegation
-        DLG->>UP: PUT /internal/users/:delegator_id/availability {delegate_id null} (DEL-6)
-        DLG->>PG: RunInTx { UPDATE status=ended, then outbox DelegationEnded delegate_removed } (delegate-side, delegator-side silent per DLG-EVT-4)
+    DLG->>PG: UPDATE delegations SET status='ended', deleted_at=now() WHERE tenant_id=$1 AND (delegator_id=$2 OR delegate_id=$2) AND status IN ('active','scheduled') AND deleted_at IS NULL
+    Note over DLG,PG: status filter is mandatory — prevents re-ending terminal rows and corrupting deleted_at on historical records (GAP-02) — 'scheduled' included (DLG-D25) so a not-yet-activated delegation for a departed member is ended too, rather than stranded and later failing to activate against a member who no longer exists
+    Note over DLG,PG: the UPDATE runs in one RunInTx with one outbox DelegationEnded{delegate_removed} per delegate-side row and the processed_events insert (IDEMP-2, DLG-D38) — delegator-side rows are silent, no UP call and no event (DLG-EVT-4 asymmetry)
+    loop per ended delegate-side row, after commit
+        DLG->>UP: DELETE /internal/users/:delegator_id/availability/delegate (DEL-6, best-effort — the row is already inert)
     end

@@ -67,11 +67,47 @@ index into those, not a duplicate of them.
 
 ### Changed
 
+- **`api/asyncapi.yaml` is the single source of the event schemas (DLG-D51):** payloads now use
+  the `<Name>Envelope` → `data: <Name>Payload` form, `make extract-schemas` generates
+  `internal/eventschema/*.json`, and CI's new "Event schema sync check" (`extract --check`,
+  `make schema-sync-check` locally) fails on drift. The produced schemas lose their top-level
+  descriptions (no field change), so they register as new Glue versions.
+- **Consumed payloads are validated before dispatch (DLG-D51):** `delegation-cascade-q` checks
+  `MembershipRevoked`/`TenantMembershipsPurged`/`UserUpdated` against embedded consumed schemas
+  (`eventbus.ConsumedValidator`); a violation is logged, counted on
+  `iam_delegation_cascade_dlq_total` and left for redrive to the DLQ, never acked.
+
+- **Glue schema-version resolution by definition (DLG-D50):** `GlueCodec` resolves each
+  schema's version once at startup with `GetSchemaByDefinition` over the binary's own embedded
+  schema (must be `AVAILABLE`) instead of `GetSchemaVersion(LatestVersion)` plus a 5-minute
+  refresher, so events carry the version the binary actually produces. `StartRefresher` and
+  `GlueCodec.WithLogger` are removed. An unregistered definition now fails startup;
+  `make schema-verify` checks all four schemas by definition + `AVAILABLE` pre-deploy.
+
 - Default AWS region is now `ap-south-1` (`cmd/server` fallback, Helm `values.yaml`,
   docker-compose, LocalStack, `.env.example`).
 - Dependabot disabled — `.github/dependabot.yml` renamed to `.github/dependabot.yml.disabled`.
 
 ### Fixed
+
+- **Architecture diagrams re-synced:** 8 of 10 LLD-derived diagrams had drifted between the LLD,
+  `docs/architecture/mermaid/*.mmd` and ARCHITECTURE.md. All were corrected against the code
+  (`ooo_until`, the `delegate_disable` bucket, cascade commit order, Extend's UP re-sync,
+  Reassign's `reassigned` reason) and made identical in all three places.
+
+- **Schema governance (DLG-D51):** `schema-gov validate` Pass 7 failed on every run — the three
+  consumed messages in `api/asyncapi.yaml` had no schema files (now extracted). asyncapi's
+  `actor_id` was wrongly *required* on `MembershipRevoked`/`TenantMembershipsPurged` (Core omits
+  it on system-driven removals). `usage-check` used snake_case file stems as event names, so
+  usage→lifecycle enforcement never matched a message; it now reads the PascalCase staged copy
+  shared with `diff`/`register`.
+
+- **Glue registration names (DLG-D50):** `schema-registry.yml`'s register steps and
+  `make schema-register` registered `internal/eventschema/*.json` under their snake_case file
+  stems (`delegation_started`), but the service looks up `DelegationStarted` — every pod would
+  have failed startup in a CI-provisioned environment. Both now register a PascalCase copy
+  staged by `.github/scripts/stage-produced-event-schemas.sh`. `make schema-verify` also no
+  longer skips `DelegationEscalationRequested`.
 
 - **New CI gate ported from `iam-org-membership` (DLG-D47):**
   `.github/scripts/check-outbox-access.sh` rejects any hand-rolled SQL against

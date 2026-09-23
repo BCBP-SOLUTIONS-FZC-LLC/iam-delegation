@@ -565,6 +565,9 @@ func TestE2E(t *testing.T) {
 	t.Run("UserRemovalCascade", func(t *testing.T) {
 		testUserRemovalCascade(ctx, t, pg, broker)
 	})
+	t.Run("ConsumedSchemaViolationNotCascaded", func(t *testing.T) {
+		testConsumedSchemaViolationNotCascaded(ctx, t, pg, broker)
+	})
 }
 
 func waitHealthy(t *testing.T, baseURL string) {
@@ -789,6 +792,45 @@ func testUserRemovalCascade(ctx context.Context, t *testing.T, pg *e2ePostgres, 
 	matchesDelegatorSide := func(env envEnvelope) bool { return env.Subject == delegatorSideID.String() }
 	assertNoMatch(ctx, t, broker.sqs, broker.notificationQueueURL, 5*time.Second, matchesDelegatorSide)
 	assertNoMatch(ctx, t, broker.sqs, broker.workflowQueueURL, 5*time.Second, matchesDelegatorSide)
+}
+
+// ── Scenario 5: consumed-schema violation is never cascaded (DLG-D51) ────
+//
+// user_id in 32-hex form (no dashes) decodes fine with google/uuid, so
+// without consumed-schema validation this MembershipRevoked WOULD end the
+// delegation. The consumed schema requires a canonical uuid, so the consumer
+// must reject it: the delegation stays active, nothing is recorded in
+// processed_events, and the message stays on the queue for SQS's redrive
+// policy to move to the DLQ (this e2e queue has none, so it just redelivers).
+// Runs last: the rejected message keeps redelivering until teardown.
+func testConsumedSchemaViolationNotCascaded(ctx context.Context, t *testing.T, pg *e2ePostgres, broker *e2ebroker) {
+	tenantID, delegateID := uuid.New(), uuid.New()
+	delegationID := uuid.New()
+	now := time.Now()
+	pg.seed(ctx, t, seedDelegation{
+		ID: delegationID, TenantID: tenantID, DelegatorID: uuid.New(), DelegateID: delegateID,
+		StartsAt: now.Add(-time.Hour), EndsAt: timePtr(now.Add(30 * 24 * time.Hour)), Status: "active",
+	})
+
+	eventID := uuid.New().String()
+	msg := fmt.Sprintf(`{
+		"id":%q, "type":"MembershipRevoked", "source":"iam-org-membership",
+		"specversion":"1.0", "tenant_id":%q, "time":%q,
+		"data": {"tenant_id":%q, "user_id":%q}
+	}`, eventID, tenantID.String(), now.UTC().Format(time.RFC3339),
+		tenantID.String(), strings.ReplaceAll(delegateID.String(), "-", ""))
+	_, err := broker.sqs.SendMessage(ctx, &sqs.SendMessageInput{QueueUrl: &broker.cascadeQueueURL, MessageBody: strPtr(msg)})
+	require.NoError(t, err)
+
+	require.Never(t, func() bool {
+		var status string
+		pg.queryRow(ctx, t, `SELECT status::text FROM public.delegations WHERE id = $1`, []any{delegationID}, &status)
+		return status != "active"
+	}, 12*time.Second, 500*time.Millisecond, "a schema-violating MembershipRevoked must not cascade")
+
+	var processed int
+	pg.queryRow(ctx, t, `SELECT count(*) FROM public.processed_events WHERE event_id = $1`, []any{eventID}, &processed)
+	require.Zero(t, processed, "a rejected message must not be marked processed")
 }
 
 func timePtr(t time.Time) *time.Time { return &t }

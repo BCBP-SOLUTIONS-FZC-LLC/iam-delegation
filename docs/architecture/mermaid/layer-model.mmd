@@ -11,16 +11,16 @@ graph TD
     end
 
     subgraph adapters_out["Outbound Adapters — internal/adapter/outbound/"]
-        postgres["postgres/\nDelegationRepository · SettingsRepository\nTxRunner (injects port.EventPublisher) · migrations/\nWithTenantGUC · SystemDSNFromEnv (LLD §4.4-equivalent)"]
+        postgres["postgres/\nDelegationRepository · SettingsRepository · GaugeRepository\nTxRunner (injects port.EventPublisher) · migrations/\nWithTenantGUC · SystemDSNFromEnv (LLD §4.4-equivalent)"]
         userprofile["userprofile/\nHTTPClient — UserProfileClient impl\n(DEL-6 availability-first pointer set/clear)"]
         orgmembership["orgmembership/\nHTTPChecker — MembershipCheckClient impl\n(DLG-D3 grant-time membership-existence checks)"]
-        eventbus["eventbus/\nPublisher + ValidatingCodec (enqueue-time)\nGlueCodec · events.NoopCodec (SNS-publish time — iam-delegation-events)"]
+        eventbus["eventbus/\nPublisher + ValidatingCodec (enqueue-time)\nGlueCodec · GlueDecodeCodec + ConsumedValidator (consume-side)\nevents.NoopCodec"]
         valkey["valkey/\ndel: cache — del:list: (60s) · del:idem: (24h)"]
         metrics["metrics/\niam_delegation_* Prometheus instruments\n(RecordCreated/Ended/ReviewWarned/CascadeProcessed/...)"]
     end
 
     subgraph eventschema_grp["Generated Schemas — internal/eventschema/"]
-        eventschema["eventschema/\nEmbedded JSON Schemas for the four published events\nDelegationStarted · DelegationEnded · DelegationReviewRequested · DelegationEscalationRequested"]
+        eventschema["eventschema/\n7 JSON Schemas generated from asyncapi.yaml (4 published + 3 consumed)\nDelegationStarted · DelegationEnded · DelegationReviewRequested · DelegationEscalationRequested\n+ MembershipRevoked · TenantMembershipsPurged · UserUpdated"]
     end
 
     subgraph core["Core — internal/core/"]
@@ -34,7 +34,7 @@ graph TD
     end
 
     subgraph apidir["Design-time Contract — api/"]
-        api["asyncapi.yaml (hand-maintained) + embed.go\nvalidated by platform-schemagov against a live\nGlue registry (iam-delegation-events, DLG-D20)"]
+        api["asyncapi.yaml (single source) + embed.go\nvalidated by platform-schemagov, JSON schemas\nderived from it (extract --check, DLG-D51)"]
     end
 
     main        --> http_h
@@ -67,4 +67,4 @@ graph TD
     valkey      --> port
     metrics     --> domain
     port        --> domain
-    api         -.->|"make extract-schemas (n/a — hand-maintained\nboth sides here, DLG-D20)"| eventschema
+    api         -.->|"make extract-schemas\n(CI extract --check, DLG-D51)"| eventschema

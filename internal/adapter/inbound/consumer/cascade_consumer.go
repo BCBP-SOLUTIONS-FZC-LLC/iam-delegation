@@ -79,6 +79,13 @@ type idempotencyStore interface {
 // also what must gate the RLS check.
 type GUCBinder func(ctx context.Context, tenantID uuid.UUID, userID string) context.Context
 
+// PayloadValidator checks a decoded inbound payload against its consumed
+// schema (DLG-D51) — wired in cmd/server to eventbus.ConsumedValidator's
+// Validate, injected as a function (like GUCBinder) so this package never
+// imports an outbound adapter. It returns nil for an event type it has no
+// schema for.
+type PayloadValidator func(eventType string, payload json.RawMessage) error
+
 // CascadeConsumer handles delegation-cascade-q. As of Bug 2, this queue
 // carries TWO SNS subscriptions: Core's iam.membership.events
 // (MembershipRevoked, TenantMembershipsPurged — the original LLD §10.1
@@ -102,6 +109,7 @@ type CascadeConsumer struct {
 	bindGUC     GUCBinder
 	tx          port.TxRunner
 	logger      port.Logger
+	validate    PayloadValidator // optional — see WithPayloadValidator
 }
 
 // NewCascadeConsumer builds a CascadeConsumer.
@@ -115,6 +123,15 @@ type CascadeConsumer struct {
 // directly (tests).
 func NewCascadeConsumer(cascade cascadeService, idempotency idempotencyStore, bindGUC GUCBinder, tx port.TxRunner, logger port.Logger) *CascadeConsumer {
 	return &CascadeConsumer{cascade: cascade, idempotency: idempotency, bindGUC: bindGUC, tx: tx, logger: logger}
+}
+
+// WithPayloadValidator makes Handle validate every MembershipRevoked /
+// TenantMembershipsPurged / UserUpdated payload against its consumed
+// schema before dispatch (DLG-D51). Production always sets it; nil (the
+// default, most unit tests) skips validation.
+func (c *CascadeConsumer) WithPayloadValidator(v PayloadValidator) *CascadeConsumer {
+	c.validate = v
+	return c
 }
 
 // Handle implements the events.Handler function signature.
@@ -157,6 +174,10 @@ func (c *CascadeConsumer) Handle(ctx context.Context, env events.Envelope[json.R
 			"event_id":   env.ID,
 		})
 		return nil //nolint:nilerr // deliberate: a malformed id can never be fixed by redelivery, so ack rather than loop
+	}
+
+	if err := c.validatePayload(env); err != nil {
+		return err
 	}
 
 	var consumerName string
@@ -234,6 +255,34 @@ func (c *CascadeConsumer) Handle(ctx context.Context, env events.Envelope[json.R
 		"event_id":   eventID.String(),
 		"consumer":   consumerName,
 	})
+	return nil
+}
+
+// validatePayload runs the consumed-schema check (DLG-D51) for the three
+// dispatched event types. A violation is permanent: it is logged, counted
+// on iam_delegation_cascade_dlq_total, and returned so SQS's redrive policy
+// moves the message to the DLQ for inspection — acking it would silently
+// lose a cascade. Unknown types skip validation (Handle acks them).
+func (c *CascadeConsumer) validatePayload(env events.Envelope[json.RawMessage]) error {
+	if c.validate == nil {
+		return nil
+	}
+	switch env.Type {
+	case domain.EventMembershipRevoked, domain.EventTenantMembershipsPurged, domain.EventUserUpdated:
+	default:
+		return nil
+	}
+	if err := c.validate(env.Type, env.Payload); err != nil {
+		c.logger.Error("inbound payload violates its consumed schema — leaving for SQS redrive to the DLQ", map[string]interface{}{
+			"event_type": env.Type,
+			"event_id":   env.ID,
+			"error":      err.Error(),
+		})
+		if metrics.Live != nil {
+			metrics.Live.RecordCascadeDLQ()
+		}
+		return fmt.Errorf("cascadeconsumer: event %s: %w", env.ID, err)
+	}
 	return nil
 }
 

@@ -13,7 +13,7 @@ graph TD
 
     subgraph path3["Path 3 — Reconciler jobs + cascade consumer"]
         p3a["jobs.Context.BindTenantGUC (cmd/reconciler/jobs)\nconsumer.GUCBinder (internal/adapter/inbound/consumer)\ninjected function params — no HTTP request to bridge"]
-        p3b["called explicitly per-row before each\nRunInTx (delegation_expiry.go, delegation_review.go,\ncascade_consumer.go)"]
+        p3b["called explicitly per-row before each\nRunInTx (delegation_activation.go, delegation_expiry.go,\ndelegation_review.go, cascade_consumer.go)"]
         p3a --> p3b
     end
 
@@ -29,5 +29,5 @@ graph TD
     setlocal["Next pool checkout issues:\nSET LOCAL app.tenant_id = '...'\n(transaction-scoped, never session-scoped —\nCI greps for the forbidden SET form,\n.github/scripts/check-forbidden-set-guc.sh)"]
     gucset --> setlocal
 
-    rls["Postgres RLS — FORCE ROW LEVEL SECURITY,\nfail-closed NULLIF policy on delegations\nand delegation_tenant_settings (LLD §7.3)"]
+    rls["Postgres RLS — FORCE ROW LEVEL SECURITY,\nfail-closed policy on delegations\nand delegation_tenant_settings (LLD §7.3)"]
     setlocal --> rls

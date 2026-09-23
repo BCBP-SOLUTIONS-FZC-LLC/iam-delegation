@@ -1,29 +1,24 @@
 {
   "$schema": "http://json-schema.org/draft-07/schema#",
   "title": "MembershipRevokedPayload",
-  "description": "Payload of the MembershipRevoked event produced by Core / Org & Membership on iam.membership.events. Consumed by this service on delegation-cascade-q to drive CascadeService.EndForUser (LLD §11.5). Mirrors internal/core/domain/event_payloads.go MembershipRevokedPayload exactly.",
   "type": "object",
   "required": [
     "tenant_id",
-    "user_id",
-    "actor_id"
+    "user_id"
   ],
   "additionalProperties": true,
   "properties": {
     "tenant_id": {
       "type": "string",
-      "format": "uuid",
-      "description": "The tenant from which the membership was revoked."
+      "format": "uuid"
     },
     "user_id": {
       "type": "string",
-      "format": "uuid",
-      "description": "The member whose tenant membership was revoked."
+      "format": "uuid"
     },
     "actor_id": {
       "type": "string",
-      "format": "uuid",
-      "description": "Who performed the revocation."
+      "format": "uuid"
     }
   }
 }

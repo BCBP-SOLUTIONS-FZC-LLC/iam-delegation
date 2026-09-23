@@ -1,7 +1,6 @@
 {
   "$schema": "http://json-schema.org/draft-07/schema#",
   "title": "DelegationEscalationRequestedPayload",
-  "description": "Payload of the DelegationEscalationRequested event (Bug 2a). Fired alongside DelegationEnded, in the same transaction, whenever a delegation ends because the delegate was disabled (reason=delegate_disabled) — this service owns no org-structure data, so it escalates to tenant_admin/tenant_owner rather than a supervisor/team-lead concept it doesn't have. Notify-only: this service never auto-creates a replacement delegation.",
   "type": "object",
   "required": [
     "delegation_id",
@@ -29,7 +28,11 @@
     },
     "scope": {
       "type": "string",
-      "enum": ["all", "department", "tender"]
+      "enum": [
+        "all",
+        "department",
+        "tender"
+      ]
     },
     "scope_id": {
       "type": "string",
@@ -37,7 +40,9 @@
     },
     "reason": {
       "type": "string",
-      "enum": ["delegate_disabled"]
+      "enum": [
+        "delegate_disabled"
+      ]
     },
     "actor_id": {
       "type": "string",

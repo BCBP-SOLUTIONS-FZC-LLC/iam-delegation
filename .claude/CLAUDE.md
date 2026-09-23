@@ -64,7 +64,9 @@ make schema-pull      # pull the schema-gov Docker image
 make schema-validate  # validate AsyncAPI + event schemas — 8 passes (no AWS required)
 make schema-diff      # diff two schema files: CURRENT=<path> PROPOSED=<path>
 make schema-register  # register event schemas to Glue (requires AWS/floci)
-make schema-verify    # pre-deploy check: fail if PascalCase schemas are missing (requires AWS)
+make extract-schemas  # regenerate internal/eventschema/*.json from api/asyncapi.yaml (never hand-edit the JSON)
+make schema-sync-check # fail if internal/eventschema/*.json drifted from api/asyncapi.yaml (same as CI)
+make schema-verify    # pre-deploy check: fail unless each schema definition is registered + AVAILABLE (requires AWS + python3)
 make schema-prune     # dry-run: list orphaned Glue schemas (requires AWS)
 ```
 
@@ -135,7 +137,7 @@ iam-delegation/
 │           ├── eventbus/              # publisher.go + validating_codec.go (enqueue) · codec.go (GlueCodec encode + GlueDecodeCodec consume-side decode, DLG-D21) · validator.go (SchemaValidator, tests)
 │           ├── valkey/                # cache.go · client.go · idempotency.go — del: cache + idempotency store
 │           └── metrics/               # metrics.go — three-tier taxonomy: Tier 1 platform_messages_* + platform_dependency_* (Registry-Proposed, dual-emitted with legacy Tier 3 during compat period); Tier 3 iam_delegation_* service-specific; DLG-D19 closed — every instrument has a real call site
-├── internal/eventschema/              # 7 hand-maintained JSON Schemas + schemas.go (//go:embed): 4 published (delegation_{started,ended,review_requested,escalation_requested}.json) + 3 consumed (membership_revoked.json, tenant_memberships_purged.json, user_updated.json); no extract-schemas step (DLG-D20)
+├── internal/eventschema/              # 4 produced (delegation_*.json → ByEventType) + 3 consumed (membership_revoked, tenant_memberships_purged, user_updated → Consumed) schemas + schemas.go (//go:embed) — GENERATED from api/asyncapi.yaml by `make extract-schemas`, CI extract --check (DLG-D51)
 ├── pkg/requestctx/                    # gateway-identity / tenant-actor extraction helpers
 ├── docs/
 │   ├── lld/iam-lld-delegation-service.md  # the full LLD, current rev 2.18 (design-time source of truth)
@@ -172,7 +174,7 @@ require (
 - `platform-pgcommon` — PostgreSQL pool (`pgx/v5`), RLS GUC injection (`GUCSetFromContext`/`WithGUCSet`), migrations
 - `platform-events` — transactional outbox, SNS publisher (`events.WithCodec`), SQS consumer
 
-Also notable: `github.com/aws/aws-sdk-go-v2/service/glue` (GlueCodec's schema-version lookups) and `github.com/santhosh-tekuri/jsonschema/v6` (SchemaValidator).
+Also notable: `github.com/aws/aws-sdk-go-v2/service/glue` (GlueCodec's startup `GetSchemaByDefinition` lookups — no refresher, DLG-D50) and `github.com/santhosh-tekuri/jsonschema/v6` (SchemaValidator).
 
 ### Dependency rules (enforced in CI via `go-arch-lint`, `.go-arch-lint.yml`)
 
@@ -191,7 +193,7 @@ Also notable: `github.com/aws/aws-sdk-go-v2/service/glue` (GlueCodec's schema-ve
 
 ## Key Files to Know
 
-- **`cmd/server/main.go`** — composition root. **Six** real background goroutines run under one `errgroup`: the outbox runner, the `delegation-cascade-q` SQS consumer, the `iam_delegation_active_gauge` exporter (`runActiveGaugeExporter` in `cmd/server/exporters.go` — a 5-minute BYPASSRLS `sysPool` snapshot via `pgadapter.NewGaugeRepository`, since no request or reconciler path can otherwise keep a point-in-time gauge current), a daily outbox-prune sweep (`outboxRunner.PrunePublished`, DLG-D24 — matching `iam-user-profile`'s `runMaintenanceSweep`; without it `outbox_events` grows unbounded, since published rows are never deleted automatically), the HTTP API server, and a dedicated `:METRICS_PORT` metrics server (split from the API listener so a NetworkPolicy can grant scrape access without also granting API access) — plus a graceful-shutdown goroutine and `GlueCodec.StartRefresher`'s internal ticker. DLG-D19's observability gap is closed: every registered `iam_delegation_*` instrument now has a real call site — the deferred/warned/expired reconciler counters (GAP-27/DLG-D25) via `cmd/reconciler/jobs.Context.Metrics`, the service-layer counters via `internal/core/service/metrics.go`'s injected `Metrics` port, and the previously-dead `active_gauge` via the exporter above.
+- **`cmd/server/main.go`** — composition root. **Six** real background goroutines run under one `errgroup`: the outbox runner, the `delegation-cascade-q` SQS consumer, the `iam_delegation_active_gauge` exporter (`runActiveGaugeExporter` in `cmd/server/exporters.go` — a 5-minute BYPASSRLS `sysPool` snapshot via `pgadapter.NewGaugeRepository`, since no request or reconciler path can otherwise keep a point-in-time gauge current), a daily outbox-prune sweep (`outboxRunner.PrunePublished`, DLG-D24 — matching `iam-user-profile`'s `runMaintenanceSweep`; without it `outbox_events` grows unbounded, since published rows are never deleted automatically), the HTTP API server, and a dedicated `:METRICS_PORT` metrics server (split from the API listener so a NetworkPolicy can grant scrape access without also granting API access) — plus a graceful-shutdown goroutine (`GlueCodec` resolves schema versions once at startup by definition — no refresher, DLG-D50). DLG-D19's observability gap is closed: every registered `iam_delegation_*` instrument now has a real call site — the deferred/warned/expired reconciler counters (GAP-27/DLG-D25) via `cmd/reconciler/jobs.Context.Metrics`, the service-layer counters via `internal/core/service/metrics.go`'s injected `Metrics` port, and the previously-dead `active_gauge` via the exporter above.
 - **`cmd/server/adapters.go`** — two adapters unique to this service's topology: `gucBoundReader` binds `app.tenant_id` per-call for the mesh-only DLG-I3/I4 reads (no per-request middleware on that route group); `reconcilerRunner` adapts `cmd/reconciler/jobs`' `Expiry`/`ReviewSweep` functions to the HTTP handler's injected runner interfaces so DLG-I1/I2's on-demand HTTP endpoints and the CronJob binary share one implementation (DLG-D17).
 - **`cmd/server/wiring.go`** (DLG-D44/D46) — `buildSNSPublisher` and `cascadeSQSEnv`, the two small helpers that adapt this service's own env-var names (`SNS_TOPIC_ARN`, `CASCADE_QUEUE_URL`, `CASCADE_SQS_CONCURRENCY`) onto `platform-events/pkg/config`'s `LoadSNS`/`LoadSQS` composition contract (the library's own env-var names, `SNS_TOPIC_ARN`/`SQS_QUEUE_URL`/`SQS_CONCURRENCY`, don't match this service's history, so `main.go` can't call `LoadSQS()` unmodified for the cascade queue). `main.go`'s outbox wiring additionally goes through `ensureOutboxEnv` (`config.go`) before `config.LoadOutbox()`, since that library's own defaults (`5s` poll, concurrency 1) differ from this service's historical ones.
 - **`cmd/server/e2e_test.go`** (`//go:build e2e`, DLG-D41) — the LLD §17.4 end-to-end suite. Boots the real `run(ctx, logger)` composition root against real Postgres/Valkey/floci (SNS/SQS-compatible) containers, with User Profile/Org Membership faked via local `httptest.Server`s. Excluded from `test-unit`/`test-ci`/`race` (none pass `-tags=e2e`) — see the Test layout note above.
@@ -202,7 +204,7 @@ Also notable: `github.com/aws/aws-sdk-go-v2/service/glue` (GlueCodec's schema-ve
 - **`internal/adapter/inbound/http/errors.go`** — `errorStatusByCode`, the map from every `domain.Err*` sentinel to its HTTP status (LLD §20 verbatim). A code missing from this map falls back to 500.
 - **`internal/adapter/outbound/eventbus/publisher.go`** — `Publisher` implements `port.EventPublisher` and takes `events.Codec`; `ValidatingCodec` wraps `events.NoopCodec` and validates at enqueue (missing schema = pass-through). Glue stays on the SNS `events.WithCodec` path. There is no local enqueue `Codec`/`NoopCodec`.
 - **`internal/adapter/outbound/postgres/db.go`** — `TxRunner` injects `port.EventPublisher` into ctx; `WithTenantGUC` binds the GUC for reconciler jobs/cascade consumer.
-- **`api/asyncapi.yaml`** — hand-maintained (no `extract-schemas` step, DLG-D20); carries the `x-lifecycle`/`x-owner`/`x-forward-compatibility`/`x-semantic-contract`/`x-version-governance`/`x-usage-override` governance annotations `schema-gov validate` requires.
+- **`api/asyncapi.yaml`** — the single source of the event schemas: each message payload is `<Name>Envelope` = `EventEnvelopeBase` + `data: <Name>Payload`, and `make extract-schemas` derives `internal/eventschema/*.json` from the payloads (CI `extract --check` fails on drift, `make schema-sync-check` locally, DLG-D51); carries the `x-lifecycle`/`x-owner`/`x-forward-compatibility`/`x-semantic-contract`/`x-version-governance`/`x-usage-override` governance annotations `schema-gov validate` requires.
 - **`api/embed.go`** — `//go:embed asyncapi.yaml` → `AsyncAPISpec []byte`, served by `GET /asyncapi`/`GET /asyncapi.yaml` without a disk read.
 
 ## See Also

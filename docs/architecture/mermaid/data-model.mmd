@@ -12,9 +12,9 @@ erDiagram
         timestamptz starts_at "NOT NULL DEFAULT now()"
         timestamptz ends_at "NULL = open-ended (DEL-8)"
         timestamptz review_due_at "open-ended only, starts_at + review window (DEL-13)"
-        int review_last_warned_bucket "7 or 3 or NULL, tracks which review notice fired (DLG-Q6)"
+        int review_last_warned_bucket "3, 2, 1, or NULL — last days_remaining value notified (DLG-Q6)"
         int review_window_days "per-delegation override, range 1..180 (DEL-14)"
-        delegation_status status "ENUM active-ended-cancelled (DEL-3)"
+        delegation_status status "ENUM scheduled-active-ended-cancelled (DEL-3, DLG-D25)"
         bigint record_version "optimistic lock"
         timestamptz created_at
         timestamptz updated_at
@@ -30,6 +30,6 @@ erDiagram
     }
     processed_events {
         text event_id PK "envelope id, SQS dedup"
-        text consumer PK "cascade or offboarding"
+        text consumer PK "cascade, offboarding, or delegate_disable (DLG-D26)"
         timestamptz processed_at
     }

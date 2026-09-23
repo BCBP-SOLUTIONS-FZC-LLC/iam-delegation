@@ -688,3 +688,75 @@ func TestHandle_UserUpdatedInvalidTenantID_ReturnsErrorForDLQ(t *testing.T) {
 		t.Fatalf("EndForDisabledDelegate must not be called when tenant_id fails to parse")
 	}
 }
+
+// ── consumed-schema validation (DLG-D51) ────────────────────────────────
+
+func TestHandle_PayloadValidator_ViolationReturnsErrorWithoutDispatch(t *testing.T) {
+	cascade := &fakeCascadeService{}
+	idem := newFakeIdempotencyStore()
+	violation := errors.New("schema says no")
+	var validatedTypes []string
+	c := newTestConsumer(cascade, idem, fakeGUCBinder(&[]gucBindCall{})).
+		WithPayloadValidator(func(eventType string, _ json.RawMessage) error {
+			validatedTypes = append(validatedTypes, eventType)
+			return violation
+		})
+
+	for _, eventType := range []string{domain.EventMembershipRevoked, domain.EventTenantMembershipsPurged, domain.EventUserUpdated} {
+		env := mustEnvelope(t, uuid.New().String(), eventType, map[string]any{"tenant_id": uuid.New(), "user_id": uuid.New()})
+		err := c.Handle(context.Background(), env)
+		require.ErrorIs(t, err, violation, eventType)
+	}
+	require.Equal(t, []string{domain.EventMembershipRevoked, domain.EventTenantMembershipsPurged, domain.EventUserUpdated}, validatedTypes)
+	require.Empty(t, cascade.endForUserCalls)
+	require.Empty(t, cascade.scrubTenantCalls)
+	require.Empty(t, cascade.endForDisabledDelegateCalls)
+	require.Empty(t, idem.markCalls, "a rejected payload must not be marked processed — it goes to the DLQ via redrive")
+}
+
+func TestHandle_PayloadValidator_PassDispatches(t *testing.T) {
+	cascade := &fakeCascadeService{}
+	c := newTestConsumer(cascade, newFakeIdempotencyStore(), fakeGUCBinder(&[]gucBindCall{})).
+		WithPayloadValidator(func(string, json.RawMessage) error { return nil })
+
+	env := mustEnvelope(t, uuid.New().String(), domain.EventMembershipRevoked, domain.MembershipRevokedPayload{
+		TenantID: uuid.New(), UserID: uuid.New(), ActorID: uuid.New(),
+	})
+	require.NoError(t, c.Handle(context.Background(), env))
+	require.Len(t, cascade.endForUserCalls, 1)
+}
+
+// Unknown types are acked without validation — forward compatibility.
+func TestHandle_PayloadValidator_SkipsUnknownTypes(t *testing.T) {
+	c := newTestConsumer(&fakeCascadeService{}, newFakeIdempotencyStore(), fakeGUCBinder(&[]gucBindCall{})).
+		WithPayloadValidator(func(string, json.RawMessage) error {
+			t.Error("unknown event types must not be validated")
+			return nil
+		})
+	require.NoError(t, c.Handle(context.Background(), mustEnvelope(t, uuid.New().String(), "SomethingNew", map[string]any{})))
+}
+
+func TestHandle_PayloadValidator_ViolationCountsDLQMetric(t *testing.T) {
+	reg := prometheus.NewRegistry()
+	m, err := metrics.RegisterOn(reg, metrics.RegisterConfig{})
+	require.NoError(t, err)
+	prev := metrics.Live
+	metrics.Live = m
+	t.Cleanup(func() { metrics.Live = prev })
+
+	c := newTestConsumer(&fakeCascadeService{}, newFakeIdempotencyStore(), fakeGUCBinder(&[]gucBindCall{})).
+		WithPayloadValidator(func(string, json.RawMessage) error { return errors.New("bad") })
+	require.Error(t, c.Handle(context.Background(), mustEnvelope(t, uuid.New().String(), domain.EventMembershipRevoked, map[string]any{})))
+
+	families, err := reg.Gather()
+	require.NoError(t, err)
+	got := map[string]float64{}
+	for _, f := range families {
+		switch f.GetName() {
+		case "iam_delegation_cascade_dlq_total", "platform_messages_failed_total":
+			got[f.GetName()] = f.GetMetric()[0].GetCounter().GetValue()
+		}
+	}
+	require.EqualValues(t, 1, got["iam_delegation_cascade_dlq_total"], "legacy Tier 3 (compat period)")
+	require.EqualValues(t, 1, got["platform_messages_failed_total"], "Tier 1 canonical")
+}

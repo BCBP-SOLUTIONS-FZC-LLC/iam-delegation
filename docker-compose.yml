@@ -83,7 +83,8 @@ services:
       # seconds into the script while Glue registration is still running,
       # so a shallow `sns list-topics` check would report "healthy" (and
       # unblock iam-delegation's depends_on) before GLUE_REGISTRY_NAME's
-      # schema actually exists, crashing GlueCodec's startup prefetch.
+      # schema actually exists, crashing GlueCodec's startup
+      # resolve-by-definition.
       test: ["CMD", "aws", "--region", "ap-south-1", "glue", "get-schema",
              "--schema-id", "RegistryName=iam-delegation-events,SchemaName=DelegationEscalationRequested"]
       interval: 5s

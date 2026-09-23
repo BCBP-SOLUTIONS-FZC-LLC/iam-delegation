@@ -1,27 +1,29 @@
 sequenceDiagram
     autonumber
-    participant CR as delegation-review CronJob
+    participant CR as delegation-review CronJob (hourly, 0 * * * *)
     participant DLG as Delegation Service
     participant UP as User Profile
     participant PG as Delegation Postgres
 
     CR->>DLG: POST /internal/delegations/review-sweep
-    DLG->>PG: Pass 1 (daily cascade warn) WHERE ends_at IS NULL AND status=active AND review_due_at in (now(), now()+3d]
+    Note over DLG: Pass 1 — daily cascade warn
+    DLG->>PG: SELECT WHERE ends_at IS NULL AND status='active' AND review_due_at > now() AND review_due_at <= now()+3d AND status='active' AND deleted_at IS NULL ORDER BY review_due_at LIMIT 100
     loop per target row
-        DLG->>DLG: days_remaining = CEIL((review_due_at - now()) / 1 day), clamped to [1,3]
+        DLG->>DLG: days_remaining = CEIL((review_due_at − now()) / 1 day) clamped to [1,3]
         alt review_last_warned_bucket IS DISTINCT FROM days_remaining
-            DLG->>PG: RunInTx { UPDATE review_last_warned_bucket=days_remaining AND status=active, then outbox DelegationReviewRequested{days_remaining} }
+            DLG->>PG: RunInTx { UPDATE review_last_warned_bucket=days_remaining AND status='active', outbox DelegationReviewRequested{days_remaining} }
         else already notified today
             DLG->>DLG: skip (idempotent)
         end
     end
-    DLG->>PG: Pass 2 (auto-end) WHERE ends_at IS NULL AND status=active AND review_due_at <= now()
+    Note over DLG: Pass 2 — auto-end
+    DLG->>PG: SELECT WHERE ends_at IS NULL AND status='active' AND review_due_at <= now() AND deleted_at IS NULL ORDER BY review_due_at LIMIT 100
     loop per end target
-        DLG->>UP: PUT /internal/users/:delegator_id/availability {delegate_id null}
+        DLG->>UP: DELETE /internal/users/:delegator_id/availability/delegate
         alt UP ok
-            DLG->>PG: RunInTx { UPDATE status=ended, then outbox DelegationEnded review_expired }
+            DLG->>PG: RunInTx { UPDATE status='ended' AND status='active' at record_version v, outbox DelegationEnded{review_expired} }
         else UP fail
-            DLG->>DLG: defer (DEL-6), retry next tick
+            DLG->>DLG: defer — increment iam_delegation_review_deferred_total, retry next tick (DEL-6)
         end
     end
     DLG-->>CR: {warned_3d, warned_2d, warned_1d, expired, deferred}

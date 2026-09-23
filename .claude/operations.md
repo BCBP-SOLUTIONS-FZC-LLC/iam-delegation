@@ -280,7 +280,7 @@ Do not add any new governance-related file to `scripts/`.
 - Add new `aws` CLI commands or `jq` pipelines inside workflow `run:` blocks beyond what
   `schema-registry.yml`'s existing `diff_schema` helper already does (the raw `aws glue get-schema`/
   `get-schema-version` calls there are a deliberate, documented exception — see that file's header
-  comment on `SCHEMA_NAME_MAP` — not a pattern to extend elsewhere).
+  comment on schema files and names — not a pattern to extend elsewhere).
 - Copy validation logic from one place to another — if it exists in `platform-schemagov`, call it
   from there.
 
@@ -326,9 +326,12 @@ docker run --rm \
 | `changelog --asyncapi F ...` | Yes | No |
 | `metrics --registry R --env E ...` | No (always exits 0) | Yes |
 
-This repo does **not** use `extract` (`make extract-schemas`) — unlike `iam-user-profile`,
-`api/asyncapi.yaml` and `internal/eventschema/*.json` are both hand-maintained independently here
-(DLG-D20); there is no generative step deriving one from the other.
+`extract` is the generative step (DLG-D51, reversing DLG-D20's hand-maintained model): `make
+extract-schemas` derives `internal/eventschema/*.json` (4 produced + 3 consumed) from
+`api/asyncapi.yaml`'s `<Name>Payload` schemas, and every `schema-registry.yml` job runs
+`extract --check` ("Event schema sync check"; `make schema-sync-check` locally), failing on drift.
+`usage-check`, `diff` and `register` read the PascalCase produced-only copy in `.tmp/glue-schemas`
+(`stage-produced-event-schemas.sh`) because schema-gov names schemas after their file stems.
 
 `usage-check` source selection: set `vars.PROMETHEUS_URL` to use Prometheus (no AWS credentials
 needed); leave it unset to use `--source disabled` (lifecycle enforcement is skipped).

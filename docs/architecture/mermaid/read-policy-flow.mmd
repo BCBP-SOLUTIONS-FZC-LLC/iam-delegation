@@ -4,6 +4,7 @@ sequenceDiagram
     participant DLG as Delegation Service
     participant V as Valkey (del:)
     participant PG as Delegation Postgres
+    participant UP as User Profile
 
     Note over C,PG: DLG-1 GET /delegations (list, self)
     C->>DLG: GET /api/v1/delegations
@@ -16,7 +17,7 @@ sequenceDiagram
     end
     DLG-->>C: 200 {items}
 
-    Note over C,PG: DLG-4 POST /delegations/:id/extend (open-ended only, no UP call)
+    Note over C,PG: DLG-4 POST /delegations/:id/extend (open-ended only)
     C->>DLG: POST /delegations/:id/extend {extend_days?}
     DLG->>PG: FindByID (RLS-scoped)
     alt fixed ends_at (review_due_at IS NULL)
@@ -25,12 +26,13 @@ sequenceDiagram
         DLG-->>C: 422 extend_days_out_of_range
     else ok
         DLG->>PG: RunInTx { ExtendReview push review_due_at, reset review_last_warned_bucket=NULL at record_version N }
+        DLG->>UP: PUT /internal/users/:delegator_id/availability {status ooo, ooo_until: new review_due_at} (best-effort re-sync, DLG-D29)
         DLG-->>C: 200 {review_due_at, review_last_warned_bucket=null}
     end
 
     Note over C,PG: DLG-5 POST /delegations/:id/reassign (end old, create new)
     C->>DLG: POST /delegations/:id/reassign {new_delegate_id?, scope?, ...}
-    DLG->>DLG: Cancel(old) flow (§11.2) — emits DelegationEnded cancelled
+    DLG->>DLG: Cancel(old) flow (§11.2) — emits DelegationEnded reassigned
     DLG->>DLG: Create(new) flow (§11.1) — membership checks + UP + DelegationStarted
     Note over DLG: if the new create fails after the old ended, old is NOT resurrected (DLG-D11)
     DLG-->>C: 201 {new delegation}

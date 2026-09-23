@@ -28,7 +28,7 @@ by every pod this chart creates).
 | `sns:Publish` | Outbox → SNS `iam-delegation-events` topic (DLG-D5) | §10.4 |
 | `sqs:ReceiveMessage` / `DeleteMessage` / `GetQueueAttributes` / `ChangeMessageVisibility` | Cascade consumer on `delegation-cascade-q` (Core's `MembershipRevoked`/`TenantMembershipsPurged`) | §10.1/§11.5/§11.6 |
 | `sqs:GetQueueAttributes` / `ReceiveMessage` on the DLQ | Ops visibility into `delegation-cascade-q-dlq` depth (`iam_delegation_cascade_dlq_total`) — not a consume-and-delete grant, read-only for triage | §10.1 |
-| `glue:GetSchemaVersion` (+ read-only siblings) | `GlueCodec` pre-fetches schema version IDs at startup, refreshed every 5 min | §10.3.1 |
+| `glue:GetSchemaByDefinition` (+ read-only siblings) | `GlueCodec` resolves each schema's version ID once at startup by this binary's embedded definition (no refresh) | §10.3.1 |
 | `logs:CreateLogStream` / `PutLogEvents` | Container stdout to CloudWatch (if not using an OTel collector for logs) | — |
 
 No S3/KMS grants — this service has no object-storage or GDPR-erasure

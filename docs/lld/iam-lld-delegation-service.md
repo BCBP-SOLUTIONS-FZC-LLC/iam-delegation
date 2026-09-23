@@ -9,7 +9,7 @@
 | Parent decision | **ADR-0008** (`02-hld-delta-delegation.md`, v2 / Option C) — the fourth O&M extraction, authorised by ADR-0007's explicit deferral of `delegations` |
 | Subsystem | Identity & Access Management |
 | Wave | 4 of 4 (the deferred hot-path table; resolved by removing delegations from I-8 entirely) |
-| Version | 2.15 |
+| Version | 2.20 |
 | Date | 2026-09-18 |
 | Status | Approved for implementation |
 | Audience | IAM platform engineering (owner), Core Org & Membership engineering (drops `delegations`; membership-existence + dept-delegate callee; removal-signal producer), Workflow Service (delegation-event consumer), User Profile (availability callee), AuthZ Enrichment (drops `active_delegations[]`), SRE |
@@ -40,6 +40,8 @@
 | 2.16 | 2026-09-18 | **CF-1 resolved to Option A — Option B scaffolding removed.** IAM and Tender confirmed Tender's OOO/delegate-status screens read `iam-user-profile`'s `GET /users/:id` directly (Option A, §7.6.7-adjacent, zero new IAM code); Tender will not subscribe to `iam.delegation.events`. The rev 2.15 local-dev-only scaffolding for Option B is removed: §10.4's outbound fan-out table drops the `delegation-tender-q` row, and `scripts/init-floci.sh` no longer provisions `delegation-tender-q`/`-dlq` or its SNS subscription. No schema, API, or published-event *content* changed — this revision only removes now-unneeded local-dev infrastructure and closes CF-1. |
 | 2.17 | 2026-09-20 | **Production-readiness sweep (DLG-D40), prompted by a direct "is this production ready" review with a follow-up "fix all."** One genuinely LLD-visible fix, one implementation-hardening-only fix. **LLD-visible (DLG-D40):** `registerDocsRoutes` only puts `docsAuthMiddleware` in front of `/swagger` and `/asyncapi` when `Environment=="production"` AND `AuthToken!=""` — `loadConfig` had no corresponding fail-fast, so a deploy with `DOCS_ENABLED=true` and `DOCS_AUTH_TOKEN` left unset in production would silently serve both docs surfaces with no auth check at all. §15 updated with the new startup guard. **Implementation-hardening only (documented in `ARCHITECTURE.md`'s decision register and `CHANGELOG.md`, per this doc's existing convention, cf. 2.1/2.4's precedent):** removed `Metrics.SetActiveGauge`, a public method with no call site outside its own unit test — `ReplaceActiveGauges` (the real call site, wired to the active-gauge exporter) already sets the same gauge inline. No schema, API route, or published-event *content* changed in this revision; the rest of the production-readiness review (full `make ci`, real coverage at 99.0%, RLS/config fail-fast re-verification, security spot-check) found no other code-level gaps — the two remaining open items (DLG-D26's `iam.user.events` subscription still unprovisioned; DLG-D13's `TenderScopeClient` still unwired pending Tender's endpoint) are cross-team/infra actions outside this repo, already tracked as such, not new findings. |
 | 2.18 | 2026-09-20 | **§17.4 E2E suite implemented (DLG-D41) — closes the gap where `make test-e2e` silently re-ran the untagged unit suite (no file anywhere declared `//go:build e2e`).** `cmd/server/e2e_test.go` now boots the real composition root (`run`, refactored to take a caller-supplied `context.Context` so a test can drive its exact graceful-shutdown path deterministically instead of only via an OS signal) against real Postgres, real Valkey, and a real SNS/SQS-compatible emulator (floci, matching `docker-compose.yml`'s image and topology) — User Profile and Org Membership are faked with local `httptest.Server`s, since those are this service's own outbound dependencies, not infrastructure this repo owns. Covers §17.4 verbatim as four subtests: create → Workflow/Notification fan-out (`DelegationStarted`) → cancel → fan-out (`DelegationEnded{cancelled}`) plus the User Profile set/clear calls; expiry (seeded past-`ends_at` row → `POST /internal/delegations/expire` → `ended`/fan-out/UP-clear); the review daily cascade (days_remaining 3→2→1 → `review_expired` auto-end), driven by mutating `review_due_at` directly between `POST /internal/delegations/review-sweep` calls; and the user-removal cascade (a raw `MembershipRevoked` sent straight to `delegation-cascade-q`, asserting the delegate-side row ends with a fan-out event and the delegator-side row ends silently, DLG-EVT-4). `.github/workflows/validate-test.yml`'s existing "End-to-end tests" step (`make test-e2e`) needed no change — it already called the right target; only the missing test file was the gap. `make test-unit`/`test-ci` (no `-tags=e2e`) are unaffected — confirmed the coverage gate stays at the same 99.0% this revision measured for 2.17. No schema, API, or published-event *content* changed. |
+| 2.19 | 2026-09-23 | **Glue schema-version resolution by definition (DLG-D50), matching the same change across `iam-org-membership`/`iam-realm-provisioner`/`iam-token-service`/`iam-group-mapping`/`iam-tender-acl`/`iam-user-profile`.** §10.3.1: `GlueCodec` now resolves each schema's version once at startup with `GetSchemaByDefinition` over this binary's embedded schema (compact + ASCII-escaped exactly like `schema-gov register`, `AVAILABLE` required) instead of `GetSchemaVersion(LatestVersion)` + a 5-minute refresher — events are stamped with the version the binary produces, never merely the latest. Also fixes a latent, pre-existing registration bug: CI's two `register` steps and `make schema-register` registered `internal/eventschema/` directly, and `schema-gov register` names schemas after the file stem, so Glue would have received `delegation_started` etc. while the codec looks up `DelegationStarted` — every pod would have failed startup in any CI-provisioned environment (local dev was unaffected: `init-floci.sh` registers PascalCase names explicitly). They now register a PascalCase-renamed copy staged by the new `.github/scripts/stage-produced-event-schemas.sh`. `make schema-verify` now checks all four schemas (it omitted `DelegationEscalationRequested`) by definition + `AVAILABLE` rather than mere existence. §10.3.1's subject table gains the missing fourth row. Verified end to end against floci: real `schema-gov:0.4 register` of the staged copy → `NewGlueCodec` resolves all four → `make schema-verify` passes; new floci-backed tests cover own-version-not-latest, all-schemas-resolve, and unregistered/snake_case-only definitions failing startup. No consumer-side change: the `delegation-cascade-q` consumer already decodes Glue-framed payloads (`events.WithConsumerCodec(GlueDecodeCodec{})`, DLG-D21). |
+| 2.20 | 2026-09-23 | **`api/asyncapi.yaml` becomes the single source of the event schemas; consumed payloads validated (DLG-D51).** (1) §10.3: asyncapi's payloads were envelope-`allOf` schemas while `internal/eventschema/*.json` were separately hand-written payload-only schemas, with no CI check tying them together. asyncapi now follows `iam-org-membership`'s form — `<Name>Envelope` = `EventEnvelopeBase` + `data: <Name>Payload`, flat `additionalProperties: true` payloads — and `make extract-schemas` generates the JSON from it; CI's new "Event schema sync check" (`extract --check`, all three `schema-registry.yml` jobs; `make schema-sync-check` locally) fails on drift. The produced definitions change only by dropped `title`-level descriptions (no field change), so they are new Glue versions. (2) Fixes a pre-existing CI failure: `schema-gov validate` Pass 7 failed on every run (3 errors) because asyncapi lists the three consumed messages but no schema files existed for them; they are now extracted too, and annotated `x-lifecycle`/`x-owner` with the producer's own values like `iam-org-membership` does. (3) §10.1: `delegation-cascade-q` validates each consumed payload against those schemas before dispatch (`eventbus.ConsumedValidator`, injected into `CascadeConsumer` as a `PayloadValidator`); violations go to the DLQ via redrive, never acked. The consumed schemas fix a latent contract bug too — asyncapi had `actor_id` *required* on `MembershipRevoked`/`TenantMembershipsPurged`, but Core marks it optional (absent on system-driven removals); enforcing that would have dead-lettered real events. They were checked field-by-field against the producers' committed schemas (none stricter). (4) CI: `usage-check` named events after the snake_case file stems, which never matched an asyncapi message name or the `EventType` metric label, so usage→lifecycle enforcement silently no-op'd; usage-check, diff and register now all read the PascalCase produced-only copy staged once per job (`stage-produced-event-schemas.sh`, which also skips the consumed files), and the diff steps' `SCHEMA_NAME_MAP` is gone. Verified locally against the pinned `schema-gov:0.4` image and floci: all 8 validate passes, `extract --check`, enforce-lifecycle matching `DelegationStarted` (the old names were skipped), register of exactly the 4 produced schemas, diff, and `make schema-verify`; e2e scenario proves a malformed `MembershipRevoked` is not cascaded (and that it *is* without validation). (5) Diagram reconciliation: `docs/architecture/mermaid/*.mmd` are meant to be verbatim extracts of this LLD's diagrams (docs/architecture/README.md), but 8 of the 10 had drifted between this LLD, the `.mmd` sources and ARCHITECTURE.md's embedded copies, each side stale in different places. Each was re-checked against the code and corrected here, then re-copied to both: §7 data model — `processed_events.consumer` includes `delegate_disable`. §11.1/§11.1a — User Profile gets `ooo_until: ends_at or review_due_at`. §11.5 — the UPDATE and the delegate-side `DelegationEnded` outbox rows commit in one tx, and the best-effort UP pointer-clears run after commit (the diagram had them interleaved). §11.7 — DLG-4 Extend re-syncs `ooo_until` in UP (DLG-D29), and DLG-5 Reassign ends the old delegation with `reassigned`, not `cancelled`. All pointer-clears now show upstream Gap 3's dedicated `DELETE /internal/users/:id/availability/delegate` (ClearDelegatePointer) and the OOO body field is `note`, matching the code. ARCHITECTURE's copies had also lost the tender-scope check (§7.6.7) and the DLG-D25 status filters, and misstated `review_last_warned_bucket` as "7 or 3". |
 
 ---
 
@@ -204,7 +206,7 @@ iam-delegation/
 │           └── metrics/                     -- iam_delegation_* Prometheus instruments
 ├── internal/eventschema/                    -- embedded JSON Schemas for the four published events
 ├── pkg/requestctx/                          -- gateway-identity / tenant-actor extraction helpers
-├── api/                                     -- asyncapi.yaml (hand-maintained) + embed.go
+├── api/                                     -- asyncapi.yaml (single source of internal/eventschema) + embed.go
 └── deploy/helm/iam-delegation/              -- this service's independent Helm chart
 ```
 
@@ -269,7 +271,7 @@ erDiagram
     }
     processed_events {
         text event_id PK "envelope id, SQS dedup"
-        text consumer PK "cascade or offboarding"
+        text consumer PK "cascade, offboarding, or delegate_disable (DLG-D26)"
         timestamptz processed_at
     }
 ```
@@ -600,7 +602,7 @@ Public routes `/api/v1/delegations*`, Envoy-fronted (`jwt_authn` + `ext_authz`),
 }
 ```
 
-Ordering (§7.6.4): a single `now` timestamp is captured at the start of the request and reused for all time comparisons (skew check, future-start check, span check) — this guarantees the deterministic 5-second skew contract (GAP-03). Flow: pre-flight → two concurrent membership checks → UP availability (on `200`) → `RunInTx{ INSERT delegations (including review_window_days from tenant settings), outbox DelegationStarted }` → SET del:idem, INVALIDATE del:list cache. **If `RunInTx` fails after UP.SetAvailability succeeded**, a best-effort compensating `PUT /internal/users/:delegator_id/availability {delegate_id null}` is issued to clear the stale OOO pointer — failure is logged but does not change the error returned to the caller (BUG-05). Bounds from **local** `delegation_tenant_settings` (DEL-14): span ≤ `max_duration_days` (`422 delegation_window_too_long` — response body includes `details.max_duration_days`); `starts_at` within `(now()−5s skew, now()+1yr]`; `ends_at > starts_at`. The wire field for the note is **`ooo_note`** (stored in `delegations.reason`; forwarded to UP as the display note — DEL-10); sending a `reason` key is silently ignored. `reason` ≤ 500 **Unicode characters** (rune count). **Idempotency (DLG-Q3):** a repeated `Idempotency-Key` within 24 h returns the original delegation without creating a second row. Notification: `DelegationStarted` → Notification Service notifies **delegate (B)** ("You have been assigned as delegate") and **delegator (A)** (confirmation).
+Ordering (§7.6.4): a single `now` timestamp is captured at the start of the request and reused for all time comparisons (skew check, future-start check, span check) — this guarantees the deterministic 5-second skew contract (GAP-03). Flow: pre-flight → two concurrent membership checks → UP availability (on `200`) → `RunInTx{ INSERT delegations (including review_window_days from tenant settings), outbox DelegationStarted }` → SET del:idem, INVALIDATE del:list cache. **If `RunInTx` fails after UP.SetAvailability succeeded**, a best-effort compensating `DELETE /internal/users/:delegator_id/availability/delegate` is issued to clear the stale OOO pointer — failure is logged but does not change the error returned to the caller (BUG-05). Bounds from **local** `delegation_tenant_settings` (DEL-14): span ≤ `max_duration_days` (`422 delegation_window_too_long` — response body includes `details.max_duration_days`); `starts_at` within `(now()−5s skew, now()+1yr]`; `ends_at > starts_at`. The wire field for the note is **`ooo_note`** (stored in `delegations.reason`; forwarded to UP as the display note — DEL-10); sending a `reason` key is silently ignored. `reason` ≤ 500 **Unicode characters** (rune count). **Idempotency (DLG-Q3):** a repeated `Idempotency-Key` within 24 h returns the original delegation without creating a second row. Notification: `DelegationStarted` → Notification Service notifies **delegate (B)** ("You have been assigned as delegate") and **delegator (A)** (confirmation).
 
 #### DLG-4 — extend (old P-32)
 
@@ -721,7 +723,7 @@ The service has **two** active inbound subscriptions, both landing on the same `
 | `iam.membership.events` | `TenantMembershipsPurged` | `delegation-cascade-q` | `delegation-cascade-q-dlq` | 5 | `EventType IN [TenantMembershipsPurged]` | `CascadeService.ScrubTenant` (§11.6) |
 | `iam.user.events` | `UserUpdated` (dispatched only when the decoded payload's `status == "disabled"`; the filter policy admits every `UserUpdated`, since it can only match on `EventType`) | `delegation-cascade-q` | `delegation-cascade-q-dlq` | 5 | `EventType IN [UserUpdated]` | `CascadeService.EndForDisabledDelegate` (§11.5a, Bug 2/DLG-D26) |
 
-The queue takes the `lifecycle`-adjacent naming used by the sibling services (`delegation-cascade-q`, not the plain `<topic>-<consumer>-q`, mirroring `iam-group-mapping`'s and User Profile's `tenant-lifecycle-*-q`). Idempotency is via `processed_events` keyed on the envelope `id` (§7.2.3); a redelivery is a no-op. A message whose payload fails schema-decode is routed to the DLQ rather than retried indefinitely.
+The queue takes the `lifecycle`-adjacent naming used by the sibling services (`delegation-cascade-q`, not the plain `<topic>-<consumer>-q`, mirroring `iam-group-mapping`'s and User Profile's `tenant-lifecycle-*-q`). Idempotency is via `processed_events` keyed on the envelope `id` (§7.2.3); a redelivery is a no-op. Before dispatch, every `MembershipRevoked`/`TenantMembershipsPurged`/`UserUpdated` payload is validated against its embedded **consumed schema** (`eventschema.Consumed`, derived from `api/asyncapi.yaml`, rev 2.20/DLG-D51) — required fields and types matching the producer's own schema, never stricter, so a valid upstream event is never rejected, and no `changed_fields` enum so an additive User Profile change can't dead-letter the cascade. A violation, like a payload that fails to decode, is permanent: it is logged, counted on `iam_delegation_cascade_dlq_total`, never marked processed, and returned as an error so the queue's redrive policy (`maxReceiveCount=5`) moves it to the DLQ for inspection and redrive — never silently acked, which would lose a cascade. Validation matters because Go's decoder is more lenient than the contract: e.g. `google/uuid` accepts a dash-less 32-hex `user_id`, which would otherwise end delegations on a malformed event (covered by an e2e scenario).
 
 **Wire-format note (v2.3):** Core Glue-encodes both event types by default in its own committed deployment configuration (`GLUE_REGISTRY_MEMBERSHIP_NAME` set), independently of whether this service's own outbound publish path (§10.3.1) uses `GlueCodec` or `NoopCodec`. The SQS consumer must therefore always configure a decode-capable codec (`events.WithConsumerCodec`) regardless of its own publish-side Glue configuration — the as-built fix is a registry-agnostic decode-only codec, since the Glue wire header is self-describing and needs no schema-registry lookup to strip (`ARCHITECTURE.md`'s "Session-specific decisions" DLG-D21).
 
@@ -733,7 +735,7 @@ Event payloads are serialized as **JSON** (UTF-8) — the format registered in t
 
 The JSON envelope carries `id` (UUID v7, consumer dedup key), `type` (PascalCase event name, e.g. `DelegationStarted`), `source` (`iam-delegation`), `specversion` (`"1"` — `events.WithSchemaVersion("1")`, matching `iam-user-profile`'s/`iam-org-membership`'s identical convention, DLG-D24), `time` (RFC 3339), `data` (the payload), `tenant_id`, `trace_id`, plus optional `subject`, `actor` (who caused it — audit), `dataschema` (Glue schema-version UUID), and `ip_address`/`user_agent` (system sentinels on cron-origin events). SNS `MessageAttributes`: `EventType` (PascalCase, used by consumer filter policies), `TenantID`, `Source`, `EventID`, `Subject`.
 
-Full `api/asyncapi.yaml` (hand-authored; the CI gate `schema-gov validate --asyncapi api/asyncapi.yaml` runs the pinned `platform-schemagov` image and fails the PR on any drift between this file and the Glue registry):
+Full `api/asyncapi.yaml` — the single source of the event contract (rev 2.20, DLG-D51). Each message's payload is a `<Name>Envelope` (`EventEnvelopeBase` + `data`), and its `data` is a flat `<Name>Payload` schema; `make extract-schemas` (`schema-gov extract`) derives `internal/eventschema/*.json` — the four produced and three consumed payload schemas — from those, and CI's `extract --check` fails on any drift, so the JSON is never hand-edited. CI's `schema-gov validate` (all 8 passes) gates the pair:
 
 > Current file: [`api/asyncapi.yaml`](../../api/asyncapi.yaml)
 
@@ -741,13 +743,18 @@ The payload field shapes are byte-identical to the O&M §7.4 definitions except 
 
 #### 10.3.1 AWS Glue Schema Registry and `platform-schemagov`
 
-The three subjects register under a new Glue registry `iam-delegation-events` (Core's registry drops them — they no longer originate there):
+The four subjects register under a new Glue registry `iam-delegation-events` (Core's registry drops them — they no longer originate there):
 
 | Glue registry | Glue schema name | Glue data format | Version |
 |---|---|---|---|
 | `iam-delegation-events` | `DelegationStarted` | JSON | 1 |
 | `iam-delegation-events` | `DelegationEnded` | JSON | 1 |
 | `iam-delegation-events` | `DelegationReviewRequested` | JSON | 1 |
+| `iam-delegation-events` | `DelegationEscalationRequested` | JSON | 1 |
+
+The source files in `internal/eventschema/` are snake_case (`delegation_started.json`, …); `schema-gov register` names each Glue schema after the file stem, so CI's register steps and `make schema-register` upload a PascalCase-renamed copy staged by `.github/scripts/stage-produced-event-schemas.sh` (rev 2.19, DLG-D50).
+
+**Version resolution (rev 2.19, DLG-D50).** `GlueCodec` resolves each subject's schema-version UUID **once, at startup, by definition**: `GetSchemaByDefinition` with this binary's embedded `eventschema.ByEventType` file, serialized exactly as `schema-gov register` uploads it (`json.dumps(schema, separators=(",", ":"))` — compact, key order preserved, non-ASCII `\uXXXX`-escaped; these schemas carry `§`/`—`), and the matched version must be `AVAILABLE`. The IDs are cached for the process lifetime — there is no refresher. This replaces the rev ≤ 2.18 `GetSchemaVersion(LatestVersion)` prefetch plus 5-minute `StartRefresher`, which stamped the registry's *latest* version: wrong whenever a registration ran ahead of the running binary (register-before-deploy, rollback) or behind it (a deploy racing `schema-registry.yml`). An unregistered definition fails `NewGlueCodec`, so the pod CrashLoops until registration lands (self-healing, the outbox buffers meanwhile); `make schema-verify` runs the identical lookup pre-deploy. Consequence: *any* edit to a schema file — even a description — must be registered before a binary carrying it starts.
 
 Schema-evolution rules (identical discipline to User Profile §7.3.1):
 
@@ -883,13 +890,13 @@ sequenceDiagram
         Core-->>DLG: {active false}
         DLG-->>DR: 422 invalid_delegate
     else both active (each returns tenant_membership_id), starts_at within skewTolerance of now or omitted
-        DLG->>UP: PUT /internal/users/:delegator_id/availability {status ooo, delegate_id, ooo_note, ends_at}
+        DLG->>UP: PUT /internal/users/:delegator_id/availability {status ooo, delegate_id, note, ooo_until: ends_at or review_due_at}
         alt UP 5xx/timeout
             DLG-->>DR: 503 user_profile_unavailable
         else UP 200
             DLG->>PG: RunInTx { INSERT delegations status=active (incl. review_window_days from tenant settings), outbox DelegationStarted }
             alt RunInTx fails (DB error, pool exhaustion, etc.)
-                DLG->>UP: PUT /internal/users/:delegator_id/availability {delegate_id null} (best-effort compensating clear — BUG-05)
+                DLG->>UP: DELETE /internal/users/:delegator_id/availability/delegate (best-effort compensating clear — BUG-05)
                 DLG-->>DR: 500 / appropriate error
             else RunInTx ok
                 DLG->>DLG: SET del:idem, INVALIDATE del:list cache
@@ -922,7 +929,7 @@ sequenceDiagram
     CR->>DLG: (in-process job call, mirrors DLG-I1/I2's reconciler topology — §16.1)
     DLG->>PG: ListScheduledBefore: SELECT ... WHERE status='scheduled' AND starts_at <= now() AND deleted_at IS NULL ORDER BY starts_at LIMIT 100
     loop per due delegation
-        DLG->>UP: PUT /internal/users/:delegator_id/availability {status ooo, delegate_id, ooo_note, ends_at}
+        DLG->>UP: PUT /internal/users/:delegator_id/availability {status ooo, delegate_id, note, ooo_until: ends_at or review_due_at}
         alt UP fail
             DLG->>DLG: leave scheduled, increment iam_delegation_activation_deferred_total, retry next tick
         else UP 200
@@ -945,7 +952,7 @@ sequenceDiagram
 
     U->>DLG: DELETE /api/v1/delegations/:id?record_version=N
     DLG->>PG: FindByID (RLS-scoped)
-    DLG->>UP: PUT /internal/users/:delegator_id/availability {delegate_id null} (clear pointer only, never status available)
+    DLG->>UP: DELETE /internal/users/:delegator_id/availability/delegate (clear pointer only, never status available)
     Note over DLG,UP: fail-open — if UP is down, log and proceed, the expiry cron re-clears later
     DLG->>PG: RunInTx { End status=cancelled at record_version N (WHERE status IN (active, scheduled) — DLG-D25), then outbox DelegationEnded cancelled }
     alt version mismatch
@@ -972,7 +979,7 @@ sequenceDiagram
     CR->>DLG: POST /internal/delegations/expire
     DLG->>PG: SELECT ... WHERE status=active AND deleted_at IS NULL AND ends_at IS NOT NULL AND ends_at < now() LIMIT 50
     loop per expired delegation
-        DLG->>UP: PUT /internal/users/:delegator_id/availability {delegate_id null}
+        DLG->>UP: DELETE /internal/users/:delegator_id/availability/delegate
         alt UP fail
             DLG->>DLG: leave active, defer (DEL-6), retry next tick
         else UP 200
@@ -1019,7 +1026,7 @@ sequenceDiagram
     Note over DLG: Pass 2 — auto-end
     DLG->>PG: SELECT WHERE ends_at IS NULL AND status='active' AND review_due_at <= now() AND deleted_at IS NULL ORDER BY review_due_at LIMIT 100
     loop per end target
-        DLG->>UP: PUT /internal/users/:delegator_id/availability {delegate_id null}
+        DLG->>UP: DELETE /internal/users/:delegator_id/availability/delegate
         alt UP ok
             DLG->>PG: RunInTx { UPDATE status='ended' AND status='active' at record_version v, outbox DelegationEnded{review_expired} }
         else UP fail
@@ -1063,13 +1070,9 @@ sequenceDiagram
     Core-->>DLG: MembershipRevoked (SQS delegation-cascade-q)
     DLG->>PG: UPDATE delegations SET status='ended', deleted_at=now() WHERE tenant_id=$1 AND (delegator_id=$2 OR delegate_id=$2) AND status IN ('active','scheduled') AND deleted_at IS NULL
     Note over DLG,PG: status filter is mandatory — prevents re-ending terminal rows and corrupting deleted_at on historical records (GAP-02) — 'scheduled' included (DLG-D25) so a not-yet-activated delegation for a departed member is ended too, rather than stranded and later failing to activate against a member who no longer exists
-    loop per ended delegation
-        alt d.delegator_id == removedUser (delegator-side row)
-            DLG->>DLG: silent — no UP call, no event (delegator's OOO state is on their own UP record, handled by UP's user-removal flow) — DLG-EVT-4 asymmetry
-        else d.delegate_id == removedUser (delegate-side row)
-            DLG->>UP: PUT /internal/users/:delegator_id/availability {delegate_id null} (DEL-6 — clear delegator's OOO pointer)
-            DLG->>PG: RunInTx { outbox DelegationEnded{delegate_removed} }
-        end
+    Note over DLG,PG: the UPDATE runs in one RunInTx with one outbox DelegationEnded{delegate_removed} per delegate-side row and the processed_events insert (IDEMP-2, DLG-D38) — delegator-side rows are silent, no UP call and no event (DLG-EVT-4 asymmetry)
+    loop per ended delegate-side row, after commit
+        DLG->>UP: DELETE /internal/users/:delegator_id/availability/delegate (DEL-6, best-effort — the row is already inert)
     end
 ```
 
@@ -1131,6 +1134,7 @@ sequenceDiagram
     participant DLG as Delegation Service
     participant V as Valkey (del:)
     participant PG as Delegation Postgres
+    participant UP as User Profile
 
     Note over C,PG: DLG-1 GET /delegations (list, self)
     C->>DLG: GET /api/v1/delegations
@@ -1143,7 +1147,7 @@ sequenceDiagram
     end
     DLG-->>C: 200 {items}
 
-    Note over C,PG: DLG-4 POST /delegations/:id/extend (open-ended only, no UP call)
+    Note over C,PG: DLG-4 POST /delegations/:id/extend (open-ended only)
     C->>DLG: POST /delegations/:id/extend {extend_days?}
     DLG->>PG: FindByID (RLS-scoped)
     alt fixed ends_at (review_due_at IS NULL)
@@ -1152,12 +1156,13 @@ sequenceDiagram
         DLG-->>C: 422 extend_days_out_of_range
     else ok
         DLG->>PG: RunInTx { ExtendReview push review_due_at, reset review_last_warned_bucket=NULL at record_version N }
+        DLG->>UP: PUT /internal/users/:delegator_id/availability {status ooo, ooo_until: new review_due_at} (best-effort re-sync, DLG-D29)
         DLG-->>C: 200 {review_due_at, review_last_warned_bucket=null}
     end
 
     Note over C,PG: DLG-5 POST /delegations/:id/reassign (end old, create new)
     C->>DLG: POST /delegations/:id/reassign {new_delegate_id?, scope?, ...}
-    DLG->>DLG: Cancel(old) flow (§11.2) — emits DelegationEnded cancelled
+    DLG->>DLG: Cancel(old) flow (§11.2) — emits DelegationEnded reassigned
     DLG->>DLG: Create(new) flow (§11.1) — membership checks + UP + DelegationStarted
     Note over DLG: if the new create fails after the old ended, old is NOT resurrected (DLG-D11)
     DLG-->>C: 201 {new delegation}

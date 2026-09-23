@@ -231,6 +231,10 @@ func run(ctx context.Context, logger port.Logger) error {
 				o.BaseEndpoint = &cfg.AWSEndpointURL
 			}
 		})
+		// Resolves each schema's version BY DEFINITION (this binary's embedded
+		// eventschema file) once, here — no background refresh. An
+		// unregistered definition fails startup until schema-registry.yml
+		// registers it.
 		gc, err := eventbus.NewGlueCodec(baseCtx, glueClient, cfg.GlueRegistryName, []string{
 			domain.EventDelegationStarted, domain.EventDelegationEnded, domain.EventDelegationReviewRequested,
 			domain.EventDelegationEscalationRequested,
@@ -238,7 +242,6 @@ func run(ctx context.Context, logger port.Logger) error {
 		if err != nil {
 			return fmt.Errorf("build Glue codec: %w", err)
 		}
-		gc.WithLogger(logger).StartRefresher(baseCtx, 5*time.Minute)
 		codec = gc
 	}
 	snsPublisher, err := buildSNSPublisher(codec, logger, cfg.AWSRegion, cfg.AWSEndpointURL)
@@ -371,7 +374,15 @@ func run(ctx context.Context, logger port.Logger) error {
 	// Cascade consumer — Core's MembershipRevoked/TenantMembershipsPurged on
 	// delegation-cascade-q (LLD §10.1/§11.5/§11.6).
 	processedEvents := pgadapter.NewProcessedEventsRepository(sysPool)
-	cascadeConsumer := consumer.NewCascadeConsumer(cascadeService, processedEvents, pgadapter.WithTenantGUC, txRunner, logger)
+	// Inbound payloads are validated against the embedded consumed schemas
+	// (eventschema.Consumed, derived from api/asyncapi.yaml) before
+	// dispatch — DLG-D51.
+	consumedValidator, err := eventbus.NewConsumedValidator()
+	if err != nil {
+		return fmt.Errorf("build consumed-schema validator: %w", err)
+	}
+	cascadeConsumer := consumer.NewCascadeConsumer(cascadeService, processedEvents, pgadapter.WithTenantGUC, txRunner, logger).
+		WithPayloadValidator(consumedValidator.Validate)
 	awsCfg, err := awsconfig.LoadDefaultConfig(baseCtx, awsconfig.WithRegion(cfg.AWSRegion))
 	if err != nil {
 		return fmt.Errorf("load AWS config: %w", err)

@@ -12,6 +12,7 @@ graph LR
     postgres["adapter/outbound/postgres\n(imports domain, port)"]
     userprofile["adapter/outbound/userprofile\n(imports port only)"]
     orgmembership["adapter/outbound/orgmembership\n(imports port only)"]
+    catalogadmin["adapter/outbound/catalogadmin\n(imports port only — GAP-020)"]
     eventbus["adapter/outbound/eventbus\n(imports domain, eventschema)"]
     valkey["adapter/outbound/valkey\n(imports domain, port)"]
     metrics["adapter/outbound/metrics\n(no internal imports —\npure prometheus/client_golang)"]

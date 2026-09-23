@@ -4,9 +4,9 @@
 #
 # Source of truth for schemas
 # ────────────────────────────
-# api/asyncapi.yaml and internal/eventschema/*.json are BOTH hand-maintained
-# here (unlike iam-user-profile, where the JSON is generated FROM
-# asyncapi.yaml via `make extract-schemas`) — keep them in sync by hand.
+# api/asyncapi.yaml is the single source: internal/eventschema/*.json is
+# generated FROM it via `make extract-schemas` (like iam-org-membership /
+# iam-user-profile) and CI fails on drift (DLG-D51).
 #
 # Triggers:
 #   pull_request → main/master (schema files changed)  → pr-check  (validate + diff; read-only)
@@ -18,30 +18,39 @@
 #   1. Validate schemas        — 8 passes: JSON syntax, draft-07 meta-schema, enum semantic
 #                                drift, lifecycle annotations, open-schema guard, strict-mode scan,
 #                                AsyncAPI↔schema coverage, AsyncAPI structure
+#      + Event schema sync check (extract --check) and PascalCase produced-only staging
 #   2. Check schema freeze     — blocks AWS steps when SCHEMA_FREEZE=true
 #   3. Configure credentials   — AWS IAM credentials for Glue
 #   4. Detect orphaned schemas — warn on Glue schemas without a repo file (never deletes)
 #   5. Assess event usage      — Prometheus per-event activity (or skipped if PROMETHEUS_URL unset); classify ACTIVE/COLD/NEVER_SEEN
 #   6. Enforce usage→lifecycle — Rule 1: NEVER_SEEN+active→deprecated; Rule 2: NEVER_SEEN+deprecated→retired
 #   7. Diff vs. registry       — fail on breaking changes before any upload
-#   8. Register schemas        — idempotent create/update (registry ensured inside this step)
+#   8. Register schemas        — idempotent create/update of the PascalCase-staged copy (registry ensured inside this step)
 #   9. Update schema changelog — prepend dated entry; commit + push
 #  10. Emit metrics            — Pushgateway + logs (always runs)
 #
 # Step order — pr-check job (read-only):
-#   1. Validate schemas
+#   1. Validate schemas (+ sync check, staging)
 #   2. Configure credentials   — read-only access to staging registry
 #   3. Diff vs. staging registry
 #   4. Emit metrics
 #
-# NOTE on schema-name resolution (diff step only): the three schema files
-# under internal/eventschema/ are snake_case (delegation_started.json, ...)
-# but the registered Glue schema names are the PascalCase event-type
-# constants (DelegationStarted, ...) — see codec.go. The hand-rolled `aws
-# glue get-schema`/`get-schema-version` calls below need the *actual*
-# registered name, so SCHEMA_NAME_MAP translates the file stem explicitly
-# (a fixed 3-entry table, not a mechanical transform) rather than passing
-# the raw file basename as iam-user-profile's equivalent step does.
+# NOTE on schema files and names (DLG-D50/D49):
+#   internal/eventschema/*.json is DERIVED from api/asyncapi.yaml's
+#   <Name>Payload schemas via `make extract-schemas`; the "Event schema sync
+#   check" step fails on drift. It holds the four PRODUCED schemas plus the
+#   three CONSUMED ones (MembershipRevoked, TenantMembershipsPurged,
+#   UserUpdated — required for validate's Pass 7 coverage, and embedded for
+#   consumer-side validation). Files are snake_case (Pass 7's convention),
+#   but schema-gov takes a schema's NAME from its file stem, while Glue
+#   names, the asyncapi message names and the EventType metric label are
+#   PascalCase. So every name-bearing step — usage-check, diff, register —
+#   reads .tmp/glue-schemas, a PascalCase, produced-only copy staged by
+#   .github/scripts/stage-produced-event-schemas.sh. That also keeps the
+#   consumed schemas out of this service's registry and usage enforcement.
+#   (Before DLG-D50 register used the snake_case stems — schemas GlueCodec
+#   never looks up — and before DLG-D51 usage-check's snake_case names never
+#   matched an asyncapi message, so lifecycle enforcement silently no-op'd.)
 #
 # Required GitHub environment secrets (per environment: staging / production):
 #   AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY
@@ -132,6 +141,29 @@ jobs:
             --asyncapi   api/asyncapi.yaml \
             --schema-dir internal/eventschema
 
+      # internal/eventschema/*.json is DERIVED from api/asyncapi.yaml's
+      # <Name>Payload schemas (make extract-schemas) — fail on a hand edit
+      # of either side that leaves them out of sync (DLG-D51).
+      - name: Event schema sync check (AsyncAPI → JSON)
+        run: |
+          docker run --rm \
+            -v "${{ github.workspace }}":/workspace \
+            -e GITHUB_ACTIONS \
+            "${{ env.SCHEMA_GOV_IMAGE }}" extract \
+            --asyncapi   api/asyncapi.yaml \
+            --schema-dir internal/eventschema \
+            --check
+
+      # Everything below that names a schema (usage-check, diff, register)
+      # reads this PascalCase, produced-only copy: schema-gov takes each
+      # schema's name from its FILE STEM, the committed files are snake_case,
+      # and the consumed schemas (other services' events) must never be
+      # usage-classified, diffed or registered here (DLG-D50/D49).
+      - name: Stage produced schemas under their Glue names
+        run: |
+          rm -rf .tmp/glue-schemas
+          bash .github/scripts/stage-produced-event-schemas.sh .tmp/glue-schemas
+
       # Runs before AWS credentials are configured so frozen environments skip
       # credential setup entirely. Override with force=true on workflow_dispatch.
       - name: Check schema freeze
@@ -188,7 +220,7 @@ jobs:
             -e AWS_REGION="${{ vars.AWS_REGION }}" \
             -e GITHUB_ACTIONS \
             "${{ env.SCHEMA_GOV_IMAGE }}" usage-check \
-            --schema-dir  internal/eventschema \
+            --schema-dir  .tmp/glue-schemas \
             ${SOURCE_FLAGS} \
             --metric-name "${{ vars.USAGE_METRIC_NAME || 'EventsPublished' }}" \
             --dimension   "${{ vars.USAGE_METRIC_DIMENSION || 'EventType' }}" \
@@ -215,13 +247,6 @@ jobs:
           AWS_REGION: ${{ vars.AWS_REGION }}
           ENVIRONMENT: staging
         run: |
-          declare -A SCHEMA_NAME_MAP=(
-            [delegation_started]=DelegationStarted
-            [delegation_ended]=DelegationEnded
-            [delegation_review_requested]=DelegationReviewRequested
-            [delegation_escalation_requested]=DelegationEscalationRequested
-          )
-
           TEMP_DIR=$(mktemp -d)
           trap 'rm -rf "$TEMP_DIR"' EXIT
 
@@ -264,10 +289,9 @@ jobs:
 
           MAX_PARALLEL="${MAX_PARALLEL:-5}"
           PIDS=(); NAMES=(); _active=0
-          for FILE in internal/eventschema/*.json; do
+          for FILE in .tmp/glue-schemas/*.json; do
             [ -f "$FILE" ] || continue
-            STEM=$(basename "$FILE" .json)
-            SCHEMA_NAME="${SCHEMA_NAME_MAP[$STEM]:-$STEM}"
+            SCHEMA_NAME=$(basename "$FILE" .json)  # staged under its PascalCase Glue name
             NAMES+=("$SCHEMA_NAME")
             [ "${_active}" -ge "${MAX_PARALLEL}" ] && { wait -n || true; _active=$((_active - 1)); }
             diff_schema "$SCHEMA_NAME" "$FILE" &
@@ -302,6 +326,8 @@ jobs:
         run: |
           FORCE_FLAG=""
           [ "${{ inputs.force }}" = "true" ] && FORCE_FLAG="--force"
+          # .tmp/glue-schemas: staged above — the PascalCase copy GlueCodec
+          # resolves (schema-gov names each schema after its file stem).
           docker run --rm \
             -v "${{ github.workspace }}":/workspace \
             -v "${{ runner.temp }}":/tmp \
@@ -312,7 +338,7 @@ jobs:
             -e GITHUB_ACTIONS \
             "${{ env.SCHEMA_GOV_IMAGE }}" register \
             --registry    "${{ vars.GLUE_REGISTRY_NAME }}" \
-            --schema-dir  internal/eventschema \
+            --schema-dir  .tmp/glue-schemas \
             --output      /tmp/schema-versions.json \
             $FORCE_FLAG
 
@@ -406,6 +432,29 @@ jobs:
             --asyncapi   api/asyncapi.yaml \
             --schema-dir internal/eventschema
 
+      # internal/eventschema/*.json is DERIVED from api/asyncapi.yaml's
+      # <Name>Payload schemas (make extract-schemas) — fail on a hand edit
+      # of either side that leaves them out of sync (DLG-D51).
+      - name: Event schema sync check (AsyncAPI → JSON)
+        run: |
+          docker run --rm \
+            -v "${{ github.workspace }}":/workspace \
+            -e GITHUB_ACTIONS \
+            "${{ env.SCHEMA_GOV_IMAGE }}" extract \
+            --asyncapi   api/asyncapi.yaml \
+            --schema-dir internal/eventschema \
+            --check
+
+      # Everything below that names a schema (usage-check, diff, register)
+      # reads this PascalCase, produced-only copy: schema-gov takes each
+      # schema's name from its FILE STEM, the committed files are snake_case,
+      # and the consumed schemas (other services' events) must never be
+      # usage-classified, diffed or registered here (DLG-D50/D49).
+      - name: Stage produced schemas under their Glue names
+        run: |
+          rm -rf .tmp/glue-schemas
+          bash .github/scripts/stage-produced-event-schemas.sh .tmp/glue-schemas
+
       - name: Check schema freeze
         env:
           SCHEMA_FREEZE: ${{ vars.SCHEMA_FREEZE }}
@@ -458,7 +507,7 @@ jobs:
             -e AWS_REGION="${{ vars.AWS_REGION }}" \
             -e GITHUB_ACTIONS \
             "${{ env.SCHEMA_GOV_IMAGE }}" usage-check \
-            --schema-dir  internal/eventschema \
+            --schema-dir  .tmp/glue-schemas \
             ${SOURCE_FLAGS} \
             --metric-name "${{ vars.USAGE_METRIC_NAME || 'EventsPublished' }}" \
             --dimension   "${{ vars.USAGE_METRIC_DIMENSION || 'EventType' }}" \
@@ -482,13 +531,6 @@ jobs:
           AWS_REGION: ${{ vars.AWS_REGION }}
           ENVIRONMENT: production
         run: |
-          declare -A SCHEMA_NAME_MAP=(
-            [delegation_started]=DelegationStarted
-            [delegation_ended]=DelegationEnded
-            [delegation_review_requested]=DelegationReviewRequested
-            [delegation_escalation_requested]=DelegationEscalationRequested
-          )
-
           TEMP_DIR=$(mktemp -d)
           trap 'rm -rf "$TEMP_DIR"' EXIT
 
@@ -531,10 +573,9 @@ jobs:
 
           MAX_PARALLEL="${MAX_PARALLEL:-5}"
           PIDS=(); NAMES=(); _active=0
-          for FILE in internal/eventschema/*.json; do
+          for FILE in .tmp/glue-schemas/*.json; do
             [ -f "$FILE" ] || continue
-            STEM=$(basename "$FILE" .json)
-            SCHEMA_NAME="${SCHEMA_NAME_MAP[$STEM]:-$STEM}"
+            SCHEMA_NAME=$(basename "$FILE" .json)  # staged under its PascalCase Glue name
             NAMES+=("$SCHEMA_NAME")
             [ "${_active}" -ge "${MAX_PARALLEL}" ] && { wait -n || true; _active=$((_active - 1)); }
             diff_schema "$SCHEMA_NAME" "$FILE" &
@@ -568,6 +609,8 @@ jobs:
         run: |
           FORCE_FLAG=""
           [ "${{ inputs.force }}" = "true" ] && FORCE_FLAG="--force"
+          # .tmp/glue-schemas: staged above — the PascalCase copy GlueCodec
+          # resolves (schema-gov names each schema after its file stem).
           docker run --rm \
             -v "${{ github.workspace }}":/workspace \
             -v "${{ runner.temp }}":/tmp \
@@ -578,7 +621,7 @@ jobs:
             -e GITHUB_ACTIONS \
             "${{ env.SCHEMA_GOV_IMAGE }}" register \
             --registry    "${{ vars.GLUE_REGISTRY_NAME }}" \
-            --schema-dir  internal/eventschema \
+            --schema-dir  .tmp/glue-schemas \
             --output      /tmp/schema-versions.json \
             $FORCE_FLAG
 
@@ -677,6 +720,29 @@ jobs:
             --asyncapi   api/asyncapi.yaml \
             --schema-dir internal/eventschema
 
+      # internal/eventschema/*.json is DERIVED from api/asyncapi.yaml's
+      # <Name>Payload schemas (make extract-schemas) — fail on a hand edit
+      # of either side that leaves them out of sync (DLG-D51).
+      - name: Event schema sync check (AsyncAPI → JSON)
+        run: |
+          docker run --rm \
+            -v "${{ github.workspace }}":/workspace \
+            -e GITHUB_ACTIONS \
+            "${{ env.SCHEMA_GOV_IMAGE }}" extract \
+            --asyncapi   api/asyncapi.yaml \
+            --schema-dir internal/eventschema \
+            --check
+
+      # Everything below that names a schema (usage-check, diff, register)
+      # reads this PascalCase, produced-only copy: schema-gov takes each
+      # schema's name from its FILE STEM, the committed files are snake_case,
+      # and the consumed schemas (other services' events) must never be
+      # usage-classified, diffed or registered here (DLG-D50/D49).
+      - name: Stage produced schemas under their Glue names
+        run: |
+          rm -rf .tmp/glue-schemas
+          bash .github/scripts/stage-produced-event-schemas.sh .tmp/glue-schemas
+
       # secrets.* cannot be referenced directly in `if:` conditions (GitHub Actions
       # restriction) — pipe them into env here so later steps can branch on it.
       - name: Check AWS credentials configured
@@ -707,13 +773,6 @@ jobs:
           AWS_REGION: ${{ vars.AWS_REGION }}
           ENVIRONMENT: staging
         run: |
-          declare -A SCHEMA_NAME_MAP=(
-            [delegation_started]=DelegationStarted
-            [delegation_ended]=DelegationEnded
-            [delegation_review_requested]=DelegationReviewRequested
-            [delegation_escalation_requested]=DelegationEscalationRequested
-          )
-
           TEMP_DIR=$(mktemp -d)
           trap 'rm -rf "$TEMP_DIR"' EXIT
 
@@ -756,10 +815,9 @@ jobs:
 
           MAX_PARALLEL="${MAX_PARALLEL:-5}"
           PIDS=(); NAMES=(); _active=0
-          for FILE in internal/eventschema/*.json; do
+          for FILE in .tmp/glue-schemas/*.json; do
             [ -f "$FILE" ] || continue
-            STEM=$(basename "$FILE" .json)
-            SCHEMA_NAME="${SCHEMA_NAME_MAP[$STEM]:-$STEM}"
+            SCHEMA_NAME=$(basename "$FILE" .json)  # staged under its PascalCase Glue name
             NAMES+=("$SCHEMA_NAME")
             [ "${_active}" -ge "${MAX_PARALLEL}" ] && { wait -n || true; _active=$((_active - 1)); }
             diff_schema "$SCHEMA_NAME" "$FILE" &

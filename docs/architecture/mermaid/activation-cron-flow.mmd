@@ -8,7 +8,7 @@ sequenceDiagram
     CR->>DLG: (in-process job call, mirrors DLG-I1/I2's reconciler topology — §16.1)
     DLG->>PG: ListScheduledBefore: SELECT ... WHERE status='scheduled' AND starts_at <= now() AND deleted_at IS NULL ORDER BY starts_at LIMIT 100
     loop per due delegation
-        DLG->>UP: PUT /internal/users/:delegator_id/availability {status ooo, delegate_id, note, ends_at}
+        DLG->>UP: PUT /internal/users/:delegator_id/availability {status ooo, delegate_id, note, ooo_until: ends_at or review_due_at}
         alt UP fail
             DLG->>DLG: leave scheduled, increment iam_delegation_activation_deferred_total, retry next tick
         else UP 200

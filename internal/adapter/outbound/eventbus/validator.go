@@ -38,8 +38,8 @@ type schemaEntry struct {
 
 // NewSchemaValidator compiles the published-event schemas from
 // eventschema.ByEventType. Consumed event types are intentionally NOT
-// registered — this service does not validate inbound cascade payloads
-// against these schemas.
+// registered here — inbound cascade payloads are validated by
+// ConsumedValidator against eventschema.Consumed instead.
 func NewSchemaValidator() (*SchemaValidator, error) {
 	entries := make([]schemaEntry, 0, len(eventschema.ByEventType))
 	for name, src := range eventschema.ByEventType {

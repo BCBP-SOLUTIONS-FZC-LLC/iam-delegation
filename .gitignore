@@ -39,3 +39,6 @@ go.work.sum
 # Editor/IDE
 # .idea/
 # .vscode/
+
+# schema-gov staging (make schema-register / schema-verify)
+/.tmp/
