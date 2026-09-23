@@ -3,7 +3,7 @@
 # -----------------------------
 -include .env
 
-APP_NAME      ?= iam-user-profile
+APP_NAME      ?= iam-delegation
 APP_ENV       ?= dev
 GO            ?= go
 BUILD_VERSION ?= $(shell git describe --tags --always --dirty 2>/dev/null || echo dev)
@@ -49,6 +49,25 @@ TEST_INTERNAL_PKGS := ./internal/adapter/inbound/consumer/... \
 # Uses tr+sed instead of paste -sd, because macOS BSD paste rejects combined flags.
 COVER_PKG_LIST := $(shell $(GO) list ./internal/... ./pkg/... | tr '\n' ',' | sed 's/,$$//')
 
+# Binaries, image and migrations. One image carries both binaries (single
+# Dockerfile — see its header comment); the Deployment runs it unmodified,
+# each CronJob overrides `command` to invoke /iam-delegation-reconciler.
+SERVER_BINARY      := iam-delegation-server
+SERVER_CMD_PKG     := ./cmd/server
+RECONCILER_BINARY  := iam-delegation-reconciler
+RECONCILER_CMD_PKG := ./cmd/reconciler
+BUILD_DIR          := bin
+GOFLAGS            ?=
+LDFLAGS            := -s -w -X main.buildVersion=$(BUILD_VERSION)
+IMAGE              ?= iam-delegation:latest
+
+# The migration role MAY have BYPASSRLS; in docker-compose that's simply the
+# postgres superuser. Production points this at a dedicated migration role
+# (delegation_migrator), never at the runtime app role (delegation_app).
+DATABASE_MIGRATION_URL ?= postgres://delegation:delegation@localhost:5432/delegation?sslmode=disable
+MIGRATIONS_DIR         := internal/adapter/outbound/postgres/migrations
+MIGRATE_IMAGE          := migrate/migrate:v4.17.1
+
 # -----------------------------
 # SETUP
 # -----------------------------
@@ -69,20 +88,31 @@ help:
 	@echo "  make fmt             - go fmt ./..."
 	@echo "  make vet             - go vet all packages"
 	@echo "  make lint            - run golangci-lint"
+	@echo "  make arch-lint       - run go-arch-lint against .go-arch-lint.yml (LLD §6/§6.2)"
 	@echo "  make test            - unit + postgres + integration tests (requires Docker)"
 	@echo "  make test-ci         - test with race detector + coverage (used in CI)"
 	@echo "  make test-unit       - unit tests only (no Docker required)"
 	@echo "  make test-postgres   - Postgres + RLS integration tests (requires Docker)"
+	@echo "  make test-integration - full colocated suite incl. Postgres/Valkey/floci Testcontainers (requires Docker)"
+	@echo "  make test-rls        - Postgres adapter suite incl. the §17.5 Row-Level-Security matrix (requires Docker)"
 	@echo "  make test-e2e        - end-to-end tests (requires Docker)"
-	@echo "  make test-smoke      - smoke tests against a running APP_URL (via .github/scripts/smoke-tests.sh)"
+	@echo "  make test-smoke      - build the image, then image-size + startup-gate checks for both binaries (smoke-tests.sh)"
 	@echo "  make race            - all tests with -race flag"
 	@echo "  make run             - run the server locally (go run)"
-	@echo "  make build           - compile server binary to bin/"
+	@echo "  make run-reconciler  - run the reconciler locally; pass JOB=delegation-activation|delegation-expiry|delegation-review|delegation-cleanup"
+	@echo "  make build           - compile both binaries (iam-delegation-server, iam-delegation-reconciler) to bin/"
+	@echo "  make build-server    - compile only cmd/server"
+	@echo "  make build-reconciler - compile only cmd/reconciler"
 	@echo "  make cover           - coverage profile + open HTML report"
 	@echo "  make cover-func      - coverage summary by function"
-	@echo "  make ci              - tidy + fmt-check + vet + lint + test-ci + build"
+	@echo "  make ci              - tidy + fmt-check + vet + lint + arch-lint + test-ci + build"
 	@echo "  make docker-up       - start local infra with floci (S3/SNS/SQS/Glue, no token needed)"
 	@echo "  make docker-down     - stop local containers"
+	@echo "  make compose-up      - start the full local dev stack (postgres, valkey, floci, floci-ui, server — self-migrates at startup)"
+	@echo "  make compose-down    - stop and remove the full local dev stack, including volumes"
+	@echo "  make docker-build    - build the container image (IMAGE to override, carries both binaries)"
+	@echo "  make docker-push     - push the container image"
+	@echo "  make migrate-up      - apply pending migrations against DATABASE_MIGRATION_URL (the server also self-migrates at startup)"
 	@echo "  make fmt-check       - verify gofmt formatting (no changes applied)"
 	@echo "  make mod-verify      - go mod verify (check module download integrity)"
 	@echo "  make vuln-check      - govulncheck on internal and pkg packages"
@@ -128,6 +158,12 @@ vet:
 lint:
 	@echo "Running linter..."
 	$(GO) tool golangci-lint run
+
+# arch-lint: enforce .go-arch-lint.yml component boundaries (LLD §6/§6.2) —
+# the same script CI's validate-test.yml runs, matching iam-realm-provisioner.
+.PHONY: arch-lint
+arch-lint:
+	bash .github/scripts/arch-lint.sh
 
 # -----------------------------
 # TESTS
@@ -199,13 +235,26 @@ test-unit:
 test-postgres:
 	$(GO) test $(TEST_POSTGRES_PKGS) -tags=integration -count=1 -timeout 300s -v
 
+# test-integration / test-rls: every test here is colocated white-box with no
+# integration/rls build tags (see TEST_UNIT_PKGS above), so these select by
+# package: the full colocated suite (Postgres/Valkey/floci via
+# Testcontainers), and the Postgres adapter package that holds the §17.5 RLS
+# matrix (rls_test.go) plus the repository tests. Both need Docker.
+.PHONY: test-integration
+test-integration:
+	$(GO) test $(TEST_INTERNAL_PKGS) -count=1 -timeout 300s -v
+
+.PHONY: test-rls
+test-rls:
+	$(GO) test ./internal/adapter/outbound/postgres/... -count=1 -timeout 300s -v
+
 .PHONY: test-e2e
 test-e2e:
 	$(GO) test $(TEST_E2E_PKGS) -tags=e2e -count=1 -timeout 300s -v
 
 # test-smoke: image size + startup gate checks against the CI-built image.
 # Uses .github/scripts/smoke-tests.sh (same script the CI 'smoke' job runs). CI's
-# 'smoke' job builds iam-user-profile-ci-test via docker/build-push-action before
+# 'smoke' job builds iam-delegation-ci-test via docker/build-push-action before
 # invoking the script; this target does the equivalent build locally first since
 # the script itself only inspects/runs an already-loaded image — it never makes
 # an HTTP request, so no running deployment or APP_URL is required.
@@ -217,11 +266,13 @@ test-smoke:
 	fi
 	docker buildx build \
 	  --load \
-	  --tag iam-user-profile-ci-test \
+	  --tag iam-delegation-ci-test \
 	  --build-arg BUILD_VERSION=smoke-local \
 	  --secret id=go_private_token,env=GO_PRIVATE_TOKEN \
 	  .
-	bash .github/scripts/smoke-tests.sh
+	IMAGE_TAG=iam-delegation-ci-test BINARY=server bash .github/scripts/smoke-tests.sh
+	IMAGE_TAG=iam-delegation-ci-test BINARY=reconciler ENTRYPOINT=/iam-delegation-reconciler \
+	  bash .github/scripts/smoke-tests.sh
 
 # -----------------------------
 # RUN
@@ -232,17 +283,33 @@ run:
 	@-lsof -ti :$${APP_PORT:-8080} | xargs kill -9 2>/dev/null; true
 	bash -c 'set -a && source .env && set +a && BUILD_VERSION=$(BUILD_VERSION) $(GO) run ./cmd/server'
 
+# run-reconciler: one CronJob pass locally. JOB=delegation-activation |
+# delegation-expiry (default) | delegation-review | delegation-cleanup.
+.PHONY: run-reconciler
+run-reconciler:
+	@if [ -f .env ]; then set -a && . ./.env && set +a && $(GO) run $(RECONCILER_CMD_PKG) --job=$${JOB:-delegation-expiry}; else $(GO) run $(RECONCILER_CMD_PKG) --job=$${JOB:-delegation-expiry}; fi
+
 # -----------------------------
 # BUILD
 # -----------------------------
 
+# build: both binaries (the image ships both — server + reconciler). The
+# server's version is stamped via -X main.buildVersion; the reconciler reads
+# BUILD_VERSION from its environment (the -X is a harmless no-op there).
 .PHONY: build
-build:
-	@echo "Building binary..."
-	@mkdir -p bin
-	$(GO) build -ldflags "-X main.version=$(BUILD_VERSION)" -o bin/$(APP_NAME) ./cmd/server
+build: build-server build-reconciler
 	@echo "Verifying library packages compile..."
 	$(GO) build ./internal/... ./pkg/...
+
+.PHONY: build-server
+build-server:
+	@mkdir -p $(BUILD_DIR)
+	CGO_ENABLED=0 $(GO) build $(GOFLAGS) -trimpath -ldflags="$(LDFLAGS)" -o $(BUILD_DIR)/$(SERVER_BINARY) $(SERVER_CMD_PKG)
+
+.PHONY: build-reconciler
+build-reconciler:
+	@mkdir -p $(BUILD_DIR)
+	CGO_ENABLED=0 $(GO) build $(GOFLAGS) -trimpath -ldflags="$(LDFLAGS)" -o $(BUILD_DIR)/$(RECONCILER_BINARY) $(RECONCILER_CMD_PKG)
 
 # -----------------------------
 # DOCKER (LOCAL POSTGRES + VALKEY)
@@ -257,6 +324,30 @@ docker-up:
 docker-down:
 	@echo "Stopping local containers..."
 	docker compose down
+
+# compose-up / compose-down: the FULL stack, including the server container
+# (docker-up starts only the infra, for `make run` against it).
+.PHONY: compose-up
+compose-up:
+	docker compose up --build -d
+
+.PHONY: compose-down
+compose-down:
+	docker compose down -v
+
+.PHONY: docker-build
+docker-build:
+	docker build -t $(IMAGE) .
+
+.PHONY: docker-push
+docker-push: docker-build
+	docker push $(IMAGE)
+
+# migrate-up: manual/CI use — the server binary also self-migrates at startup.
+.PHONY: migrate-up
+migrate-up:
+	docker run --rm -v $(CURDIR)/$(MIGRATIONS_DIR):/migrations --network host \
+		$(MIGRATE_IMAGE) -path=/migrations -database="$(DATABASE_MIGRATION_URL)" up
 
 .PHONY: pin-base-images
 pin-base-images:
@@ -276,7 +367,7 @@ pin-base-images:
 # -----------------------------
 
 .PHONY: ci
-ci: tidy fmt-check vet lint test-ci build
+ci: tidy fmt-check vet lint arch-lint test-ci build
 
 # -----------------------------
 # COVERAGE
