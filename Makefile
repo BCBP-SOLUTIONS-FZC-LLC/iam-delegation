@@ -68,6 +68,12 @@ DATABASE_MIGRATION_URL ?= postgres://delegation:delegation@localhost:5432/delega
 MIGRATIONS_DIR         := internal/adapter/outbound/postgres/migrations
 MIGRATE_IMAGE          := migrate/migrate:v4.17.1
 
+# Every build tag a test file here may declare (today only cmd/server's
+# e2e_test.go uses one, `e2e`). vet and lint run a second pass with all of
+# them so tagged files are checked too — CI's quality gate calls `make vet`
+# and `make lint`, so without it the e2e suite was never vetted or linted.
+ALL_TEST_TAGS := integration,rls,e2e
+
 # -----------------------------
 # SETUP
 # -----------------------------
@@ -86,8 +92,8 @@ help:
 	@echo "  make setup           - copy .env-example to .env if missing; install .githooks/pre-commit"
 	@echo "  make tidy            - go mod tidy"
 	@echo "  make fmt             - go fmt ./..."
-	@echo "  make vet             - go vet all packages"
-	@echo "  make lint            - run golangci-lint"
+	@echo "  make vet             - go vet (default build + every test build tag)"
+	@echo "  make lint            - run golangci-lint (default build + every test build tag)"
 	@echo "  make arch-lint       - run go-arch-lint against .go-arch-lint.yml (LLD §6/§6.2)"
 	@echo "  make test            - unit + postgres + integration tests (requires Docker)"
 	@echo "  make test-ci         - test with race detector + coverage (used in CI)"
@@ -99,7 +105,10 @@ help:
 	@echo "  make test-smoke      - build the image, then image-size + startup-gate checks for both binaries (smoke-tests.sh)"
 	@echo "  make race            - all tests with -race flag"
 	@echo "  make run             - run the server locally (go run)"
+	@echo "  make run-server      - alias for 'make run'"
 	@echo "  make run-reconciler  - run the reconciler locally; pass JOB=delegation-activation|delegation-expiry|delegation-review|delegation-cleanup"
+	@echo "  make all             - alias for 'make build'"
+	@echo "  make generate        - run any go:generate directives (currently none)"
 	@echo "  make build           - compile both binaries (iam-delegation-server, iam-delegation-reconciler) to bin/"
 	@echo "  make build-server    - compile only cmd/server"
 	@echo "  make build-reconciler - compile only cmd/reconciler"
@@ -113,6 +122,8 @@ help:
 	@echo "  make docker-build    - build the container image (IMAGE to override, carries both binaries)"
 	@echo "  make docker-push     - push the container image"
 	@echo "  make migrate-up      - apply pending migrations against DATABASE_MIGRATION_URL (the server also self-migrates at startup)"
+	@echo "  make migrate-down    - roll back one migration against DATABASE_MIGRATION_URL"
+	@echo "  make migrate-create  - create a new migration pair (NAME=add_foo_table)"
 	@echo "  make fmt-check       - verify gofmt formatting (no changes applied)"
 	@echo "  make mod-verify      - go mod verify (check module download integrity)"
 	@echo "  make vuln-check      - govulncheck on internal and pkg packages"
@@ -149,6 +160,7 @@ fmt:
 .PHONY: vet
 vet:
 	$(GO) vet ./...
+	$(GO) vet -tags=$(ALL_TEST_TAGS) ./...
 
 # -----------------------------
 # LINT
@@ -157,7 +169,8 @@ vet:
 .PHONY: lint
 lint:
 	@echo "Running linter..."
-	$(GO) tool golangci-lint run
+	$(GO) tool golangci-lint run ./...
+	$(GO) tool golangci-lint run --build-tags=$(ALL_TEST_TAGS) ./...
 
 # arch-lint: enforce .go-arch-lint.yml component boundaries (LLD §6/§6.2) —
 # the same script CI's validate-test.yml runs, matching iam-realm-provisioner.
@@ -283,6 +296,10 @@ run:
 	@-lsof -ti :$${APP_PORT:-8080} | xargs kill -9 2>/dev/null; true
 	bash -c 'set -a && source .env && set +a && BUILD_VERSION=$(BUILD_VERSION) $(GO) run ./cmd/server'
 
+# run-server: alias for `run`, kept for the paired run-server/run-reconciler names.
+.PHONY: run-server
+run-server: run
+
 # run-reconciler: one CronJob pass locally. JOB=delegation-activation |
 # delegation-expiry (default) | delegation-review | delegation-cleanup.
 .PHONY: run-reconciler
@@ -296,6 +313,15 @@ run-reconciler:
 # build: both binaries (the image ships both — server + reconciler). The
 # server's version is stamped via -X main.buildVersion; the reconciler reads
 # BUILD_VERSION from its environment (the -X is a harmless no-op there).
+.PHONY: all
+all: build
+
+# generate: run any go:generate directives (none today — kept so adding one
+# needs no Makefile change).
+.PHONY: generate
+generate:
+	$(GO) generate ./...
+
 .PHONY: build
 build: build-server build-reconciler
 	@echo "Verifying library packages compile..."
@@ -348,6 +374,20 @@ docker-push: docker-build
 migrate-up:
 	docker run --rm -v $(CURDIR)/$(MIGRATIONS_DIR):/migrations --network host \
 		$(MIGRATE_IMAGE) -path=/migrations -database="$(DATABASE_MIGRATION_URL)" up
+
+.PHONY: migrate-down
+migrate-down:
+	docker run --rm -v $(CURDIR)/$(MIGRATIONS_DIR):/migrations --network host \
+		$(MIGRATE_IMAGE) -path=/migrations -database="$(DATABASE_MIGRATION_URL)" down 1
+
+# migrate-create: NAME=add_foo_table. Note this service currently folds
+# schema fixes into the single 000001_schema migration until first deploy
+# (see CHANGELOG), so only use this once that policy ends.
+.PHONY: migrate-create
+migrate-create:
+	@test -n "$(NAME)" || { echo "NAME is required, e.g. make migrate-create NAME=add_foo_table"; exit 1; }
+	docker run --rm -v $(CURDIR)/$(MIGRATIONS_DIR):/migrations \
+		$(MIGRATE_IMAGE) create -ext sql -dir /migrations -seq $(NAME)
 
 .PHONY: pin-base-images
 pin-base-images:
