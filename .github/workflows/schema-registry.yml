@@ -198,6 +198,7 @@ jobs:
             -e GITHUB_ACTIONS \
             "${{ env.SCHEMA_GOV_IMAGE }}" prune \
             --registry "${{ vars.GLUE_REGISTRY_NAME }}" \
+            --schema-dir .tmp/glue-schemas \
             --env      staging \
             --output   /tmp/schema-prune-metrics.json
 
@@ -485,6 +486,7 @@ jobs:
             -e GITHUB_ACTIONS \
             "${{ env.SCHEMA_GOV_IMAGE }}" prune \
             --registry "${{ vars.GLUE_REGISTRY_NAME }}" \
+            --schema-dir .tmp/glue-schemas \
             --env      production \
             --output   /tmp/schema-prune-metrics.json
 
